@@ -135,9 +135,9 @@ class Refacer:
         if self.force_cpu:
             self.providers = ['CPUExecutionProvider']
         else:
-            # Prefer faster execution providers in order - TensorRT first for NVIDIA T4 optimization
+            # Prefer faster execution providers in order
             self.providers = []
-            for p in ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider']:
+            for p in ['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider']:
                 if p in available_providers:
                     self.providers.append(p)
 
@@ -307,14 +307,16 @@ class Refacer:
                         break
         return frame
 
-    def reface_group(self, faces, frames, output):
-        with ThreadPoolExecutor(max_workers=self.use_num_cpus) as executor:
+    def reface_group(self, faces, frames):
+        # In GPU mode, use fewer workers to keep GPU queue full without CPU overhead
+        # Stream-like processing: 2 workers is optimal for GPU T4
+        workers = 2 if self.mode == RefacerMode.CUDA else self.use_num_cpus
+        with ThreadPoolExecutor(max_workers=workers) as executor:
             if self.first_face:
                 results = list(tqdm(executor.map(self.process_first_face, frames), total=len(frames), desc="Processing frames"))
             else:
                 results = list(tqdm(executor.map(self.process_faces, frames), total=len(frames), desc="Processing frames"))
-            for result in results:
-                output.write(result)
+            return results
 
     def __check_video_has_audio(self, video_path):
         self.video_has_audio = False
@@ -330,26 +332,39 @@ class Refacer:
     
         self.__check_video_has_audio(video_path)
     
-        # Trim video if start_time or end_time is specified
-        if start_time is not None or end_time is not None:
-            trimmed_path = os.path.join("tmp", f"trimmed_{original_name}_{timestamp}.mp4")
-            os.makedirs("tmp", exist_ok=True)
+        # Trim video if start_time or end_time is specified and valid
+        # Skip trim if both are None, both are 0, or start >= end
+        if (start_time is not None or end_time is not None):
+            # Validate trim parameters
+            if start_time is None:
+                start_time = 0
+            if end_time is None:
+                end_time = 0
             
-            # Build FFmpeg command for trimming
-            ffmpeg_cmd = ['ffmpeg', '-i', video_path]
-            if start_time is not None:
-                ffmpeg_cmd.extend(['-ss', str(start_time)])
-            if end_time is not None:
-                ffmpeg_cmd.extend(['-to', str(end_time)])
-            ffmpeg_cmd.extend(['-c', 'copy', trimmed_path, '-y'])
-            
-            try:
-                subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
-                video_path = trimmed_path
-                print(f"Video trimmed from {start_time}s to {end_time}s")
-            except subprocess.CalledProcessError as e:
-                print(f"Failed to trim video: {e}")
-                # Continue with original video if trim fails
+            # Skip trim if values are invalid (both 0 or start >= end)
+            if start_time == 0 and end_time == 0:
+                print("Skipping trim: both start and end time are 0")
+            elif start_time >= end_time and end_time > 0:
+                print(f"Skipping trim: start_time ({start_time}s) >= end_time ({end_time}s)")
+            else:
+                trimmed_path = os.path.join("tmp", f"trimmed_{original_name}_{timestamp}.mp4")
+                os.makedirs("tmp", exist_ok=True)
+                
+                # Build FFmpeg command for trimming
+                ffmpeg_cmd = ['ffmpeg', '-i', video_path]
+                if start_time > 0:
+                    ffmpeg_cmd.extend(['-ss', str(start_time)])
+                if end_time > 0:
+                    ffmpeg_cmd.extend(['-to', str(end_time)])
+                ffmpeg_cmd.extend(['-c', 'copy', trimmed_path, '-y'])
+                
+                try:
+                    subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+                    video_path = trimmed_path
+                    print(f"Video trimmed from {start_time}s to {end_time}s")
+                except subprocess.CalledProcessError as e:
+                    print(f"Failed to trim video: {e}")
+                    # Continue with original video if trim fails
     
         if preview:
             os.makedirs("output/preview", exist_ok=True)
@@ -368,12 +383,41 @@ class Refacer:
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        output = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+        # Use FFmpeg with h264_nvenc for GPU encoding instead of CPU-bound cv2.VideoWriter
+        ffmpeg_cmd = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{frame_width}x{frame_height}',
+            '-r', str(fps),
+            '-i', '-',
+            '-c:v', 'h264_nvenc',
+            '-preset', 'p6',  # Slow but better quality for T4
+            '-rc', 'constqp',
+            '-qp', '28',  # Quality balance
+            '-pix_fmt', 'yuv420p',
+            '-f', 'mp4',
+            output_video_path
+        ]
+        
+        try:
+            ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
+        except Exception as e:
+            print(f"Failed to start FFmpeg with h264_nvenc, falling back to cv2.VideoWriter: {e}")
+            # Fallback to cv2.VideoWriter if h264_nvenc is not available
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            output = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+            use_ffmpeg_output = False
+        else:
+            output = ffmpeg_process
+            use_ffmpeg_output = True
     
         frames = []
         frame_index = 0
         skip_rate = 10 if preview else 1
+        # Reduced buffer size for smoother streaming and less memory pressure
+        buffer_size = 50  # Reduced from 100 to reduce latency and memory usage
     
         with tqdm(total=total_frames, desc="Extracting frames") as pbar:
             while cap.isOpened():
@@ -382,17 +426,31 @@ class Refacer:
                     break
                 if frame_index % skip_rate == 0:
                     frames.append(frame)
-                    if len(frames) > 100:
-                        self.reface_group(faces, frames, output)
-                        frames = []
-                        gc.collect()
+                    if len(frames) >= buffer_size:
+                        processed_frames = self.reface_group(faces, frames)
+                        for processed_frame in processed_frames:
+                            if use_ffmpeg_output:
+                                output.stdin.write(processed_frame.tobytes())
+                            else:
+                                output.write(processed_frame)
+                        frames.clear()  # More efficient than creating new list
                 frame_index += 1
                 pbar.update()
     
         cap.release()
         if frames:
-            self.reface_group(faces, frames, output)
-        output.release()
+            processed_frames = self.reface_group(faces, frames)
+            for processed_frame in processed_frames:
+                if use_ffmpeg_output:
+                    output.stdin.write(processed_frame.tobytes())
+                else:
+                    output.write(processed_frame)
+        
+        if use_ffmpeg_output:
+            output.stdin.close()
+            output.wait()
+        else:
+            output.release()
     
         # Skip FFmpeg conversion if no audio track (optimization for videos without audio)
         if self.video_has_audio and not preview:
