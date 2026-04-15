@@ -57,6 +57,12 @@ class Refacer:
         self.total_mem = psutil.virtual_memory().total
         self.__init_apps()
         
+        # Face tracking for performance - detect faces every N frames
+        self.face_tracking_enabled = not force_cpu
+        self.face_tracking_interval = 5  # Detect faces every 5 frames
+        self.last_detected_faces = None  # Cache of last detected faces
+        self.frame_counter = 0  # Counter for tracking frames
+        
     def _partial_face_blend(self, original_frame, swapped_frame, face):
         h_frame, w_frame = original_frame.shape[:2]
     
@@ -74,45 +80,28 @@ class Refacer:
         h = y2 - y1
         cutoff = int(h * (1.0 - self.blend_height_ratio))
     
-        # Avoid unnecessary copies - work with views when possible
-        swap_crop = swapped_frame[y1:y2, x1:x2]
-        orig_crop = original_frame[y1:y2, x1:x2]
+        # Use cv2 operations for better performance
+        swap_crop = swapped_frame[y1:y2, x1:x2].copy()
+        orig_crop = original_frame[y1:y2, x1:x2].copy()
     
-        mask = np.ones((h, w, 3), dtype=np.float32)
-        
-        # Vertical transition (smoother with larger transition area)
-        transition = 60  # Increased from 40 for smoother blend
-        
-        if cutoff < h:
-            blend_start = max(cutoff - transition // 2, 0)
-            blend_end = min(cutoff + transition // 2, h)
+        # Create alpha mask using cv2 for better performance
+        mask = np.zeros((h, w), dtype=np.uint8)
+        mask[cutoff:, :] = 255
     
-            if blend_end > blend_start:
-                # Use sigmoid-like curve for smoother transition instead of linear
-                t = np.linspace(0, 1, blend_end - blend_start)
-                alpha = 1.0 / (1.0 + np.exp(10 * (t - 0.5)))  # Sigmoid curve
-                alpha = alpha / alpha[0]  # Normalize to start at 1.0
-                mask[blend_start:blend_end, :, :] = alpha[:, np.newaxis, np.newaxis]
-            mask[blend_end:, :, :] = 0.0
-        
-        # Horizontal feathering on edges to reduce visible borders
-        feather_width = 15
-        if w > feather_width * 2:
-            # Left edge feather
-            left_feather = np.linspace(0, 1, feather_width)
-            mask[:, :feather_width, :] *= left_feather[np.newaxis, :, np.newaxis]
-            # Right edge feather
-            right_feather = np.linspace(1, 0, feather_width)
-            mask[:, -feather_width:, :] *= right_feather[np.newaxis, :, np.newaxis]
+        # Apply Gaussian blur to mask for smooth transition (feathering)
+        blur_size = 60
+        mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
+        mask = mask.astype(np.float32) / 255.0
+        mask = cv2.merge([mask, mask, mask])
     
-        # Blend in-place to avoid extra copy
-        blended_crop = (swap_crop.astype(np.float32) * mask + orig_crop.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
+        # Blend using cv2.addWeighted for better performance
+        blended = cv2.addWeighted(swap_crop, 1.0, orig_crop, 0.0, 0)
+        blended = cv2.addWeighted(blended, mask, orig_crop, 1.0 - mask, 0)
     
-        # Direct assignment instead of copy
-        swapped_frame[y1:y2, x1:x2] = blended_crop
+        result = swapped_frame.copy()
+        result[y1:y2, x1:x2] = blended
     
-        return swapped_frame
-    
+        return result
 
     def __download_with_progress(self, url, output_path):
         response = requests.get(url, stream=True)
@@ -239,8 +228,26 @@ class Refacer:
                 self.replacement_faces.append((feat_original, _faces[0], face_threshold))
 
     def __get_faces(self, frame, max_num=0):
+        # Face tracking: detect only every N frames, reuse cached faces in between
+        if self.face_tracking_enabled and self.last_detected_faces is not None and self.frame_counter % self.face_tracking_interval != 0:
+            # Reuse last detected faces with updated embeddings
+            ret = []
+            for cached_face in self.last_detected_faces:
+                # Recalculate embedding for current frame
+                try:
+                    embedding = self.rec_app.get(frame, cached_face.kps)
+                    face = Face(bbox=cached_face.bbox, kps=cached_face.kps, det_score=cached_face.det_score)
+                    face.embedding = embedding
+                    ret.append(face)
+                except:
+                    # If embedding fails, skip this face
+                    continue
+            return ret
+        
+        # Full detection
         bboxes, kpss = self.face_detector.detect(frame, max_num=max_num, metric='default')
         if bboxes.shape[0] == 0:
+            self.last_detected_faces = None
             return []
         ret = []
         for i in range(bboxes.shape[0]):
@@ -250,6 +257,11 @@ class Refacer:
             face = Face(bbox=bbox, kps=kps, det_score=det_score)
             face.embedding = self.rec_app.get(frame, kps)
             ret.append(face)
+        
+        # Cache detected faces for tracking
+        if self.face_tracking_enabled:
+            self.last_detected_faces = ret
+        
         return ret
 
     def process_first_face(self, frame):
@@ -308,9 +320,8 @@ class Refacer:
         return frame
 
     def reface_group(self, faces, frames):
-        # In GPU mode, use fewer workers to keep GPU queue full without CPU overhead
-        # Stream-like processing: 2 workers is optimal for GPU T4
-        workers = 2 if self.mode == RefacerMode.CUDA else self.use_num_cpus
+        # In GPU mode, use 1 worker to avoid contention in GPU command queue and GIL issues
+        workers = 1 if self.mode == RefacerMode.CUDA else self.use_num_cpus
         with ThreadPoolExecutor(max_workers=workers) as executor:
             if self.first_face:
                 results = list(tqdm(executor.map(self.process_first_face, frames), total=len(frames), desc="Processing frames"))
@@ -416,8 +427,12 @@ class Refacer:
         frames = []
         frame_index = 0
         skip_rate = 10 if preview else 1
-        # Reduced buffer size for smoother streaming and less memory pressure
-        buffer_size = 50  # Reduced from 100 to reduce latency and memory usage
+        # Optimized batch size for PCIe efficiency - process in batches of 4
+        buffer_size = 4  # Reduced from 50 to 4 for better PCIe efficiency
+        
+        # Reset face tracking state for new video
+        self.frame_counter = 0
+        self.last_detected_faces = None
     
         with tqdm(total=total_frames, desc="Extracting frames") as pbar:
             while cap.isOpened():
@@ -434,6 +449,7 @@ class Refacer:
                             else:
                                 output.write(processed_frame)
                         frames.clear()  # More efficient than creating new list
+                        self.frame_counter += len(frames)  # Update frame counter for tracking
                 frame_index += 1
                 pbar.update()
     
