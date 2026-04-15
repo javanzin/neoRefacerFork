@@ -78,7 +78,9 @@ def run(*vars):
     video_path = vars[0]
     origins = vars[1:(num_faces+1)]
     destinations = vars[(num_faces+1):(num_faces*2)+1]
-    thresholds = vars[(num_faces*2)+1:-3]
+    thresholds = vars[(num_faces*2)+1:-5]
+    trim_start = vars[-5]
+    trim_end = vars[-4]
     preview = vars[-3]
     face_mode = vars[-2]
     partial_reface_ratio = vars[-1]
@@ -95,7 +97,7 @@ def run(*vars):
                 'threshold': thresholds[k] if not multiple_faces_mode else 0.0
             })
 
-    mp4_path, gif_path = refacer.reface(video_path, faces, preview=preview, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
+    mp4_path, gif_path = refacer.reface(video_path, faces, preview=preview, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio, start_time=trim_start, end_time=trim_end)
     return mp4_path, gif_path if gif_path else None
 
 def load_first_frame(filepath):
@@ -334,6 +336,11 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             video_btn = gr.Button("Reface Video", variant="primary")
 
         preview_checkbox_video = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
+        
+        # Manual trim controls
+        with gr.Row():
+            video_trim_start = gr.Number(label="Trim Start (seconds)", value=None, precision=2, placeholder="Leave empty to start from beginning")
+            video_trim_end = gr.Number(label="Trim End (seconds)", value=None, precision=2, placeholder="Leave empty to end at video end")
 
         origin_video, destination_video, thresholds_video, face_tabs_video = [], [], [], []
 
@@ -370,7 +377,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         video_btn.click(
             fn=lambda *args: run(*args),
-            inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video],
+            inputs=[video_input] + origin_video + destination_video + thresholds_video + [video_trim_start, video_trim_end, preview_checkbox_video, face_mode_video, partial_reface_ratio_video],
             outputs=[video_output, gr.File(visible=False)]
         )
 

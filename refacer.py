@@ -55,8 +55,6 @@ class Refacer:
         self.__check_providers()
         self.total_mem = psutil.virtual_memory().total
         self.__init_apps()
-        # Cache for face embeddings to avoid recomputing in consecutive frames
-        self.embedding_cache = {}
         
     def _partial_face_blend(self, original_frame, swapped_frame, face):
         h_frame, w_frame = original_frame.shape[:2]
@@ -232,17 +230,7 @@ class Refacer:
             det_score = bboxes[i, 4]
             kps = kpss[i] if kpss is not None else None
             face = Face(bbox=bbox, kps=kps, det_score=det_score)
-            
-            # Create cache key from bbox and keypoints for similar faces in consecutive frames
-            cache_key = (tuple(bbox.round(2).astype(int)), tuple(kps.round(2).astype(int).flatten()) if kps is not None else None)
-            
-            # Use cached embedding if available for similar face
-            if cache_key in self.embedding_cache:
-                face.embedding = self.embedding_cache[cache_key]
-            else:
-                face.embedding = self.rec_app.get(frame, kps)
-                self.embedding_cache[cache_key] = face.embedding
-            
+            face.embedding = self.rec_app.get(frame, kps)
             ret.append(face)
         return ret
 
@@ -317,15 +305,33 @@ class Refacer:
         if audio_stream is not None:
             self.video_has_audio = True
 
-    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0):
+    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, start_time=None, end_time=None):
         original_name = osp.splitext(osp.basename(video_path))[0]
         timestamp = str(int(time.time()))
         filename = f"{original_name}_preview.mp4" if preview else f"{original_name}_{timestamp}.mp4"
     
         self.__check_video_has_audio(video_path)
-        
-        # Clear embedding cache for each new video to avoid memory leaks
-        self.embedding_cache.clear()
+    
+        # Trim video if start_time or end_time is specified
+        if start_time is not None or end_time is not None:
+            trimmed_path = os.path.join("tmp", f"trimmed_{original_name}_{timestamp}.mp4")
+            os.makedirs("tmp", exist_ok=True)
+            
+            # Build FFmpeg command for trimming
+            ffmpeg_cmd = ['ffmpeg', '-i', video_path]
+            if start_time is not None:
+                ffmpeg_cmd.extend(['-ss', str(start_time)])
+            if end_time is not None:
+                ffmpeg_cmd.extend(['-to', str(end_time)])
+            ffmpeg_cmd.extend(['-c', 'copy', trimmed_path, '-y'])
+            
+            try:
+                subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
+                video_path = trimmed_path
+                print(f"Video trimmed from {start_time}s to {end_time}s")
+            except subprocess.CalledProcessError as e:
+                print(f"Failed to trim video: {e}")
+                # Continue with original video if trim fails
     
         if preview:
             os.makedirs("output/preview", exist_ok=True)
@@ -358,9 +364,7 @@ class Refacer:
                     break
                 if frame_index % skip_rate == 0:
                     frames.append(frame)
-                    # Reduced batch size from 300 to 16 for lower RAM usage and faster start
-                    # Optimized for GPU T4 with limited VRAM
-                    if len(frames) > 16:
+                    if len(frames) > 300:
                         self.reface_group(faces, frames, output)
                         frames = []
                         gc.collect()
