@@ -188,8 +188,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         for i in range(num_faces):
             with gr.Tab(f"Face #{i+1}") as tab:
                 with gr.Row():
-                    origin = gr.Image(label="Face to replace")
-                    destination = gr.Image(label="Destination face")
+                    origin = gr.Image(label="Face to replace", type="filepath")
+                    destination = gr.Image(label="Destination face", type="filepath")
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
             origin_image.append(origin)
             destination_image.append(destination)
@@ -222,8 +222,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         for i in range(num_faces):
             with gr.Tab(f"Face #{i+1}") as tab:
                 with gr.Row():
-                    origin = gr.Image(label="Face to replace")
-                    destination = gr.Image(label="Destination face")
+                    origin = gr.Image(label="Face to replace", type="filepath")
+                    destination = gr.Image(label="Destination face", type="filepath")
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
             origin_gif.append(origin)
             destination_gif.append(destination)
@@ -262,8 +262,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         for i in range(num_faces):
             with gr.Tab(f"Face #{i+1}") as tab:
                 with gr.Row():
-                    origin = gr.Image(label="Face to replace")
-                    destination = gr.Image(label="Destination face")
+                    origin = gr.Image(label="Face to replace", type="filepath")
+                    destination = gr.Image(label="Destination face", type="filepath")
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
             origin_tif.append(origin)
             destination_tif.append(destination)
@@ -347,8 +347,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         for i in range(num_faces):
             with gr.Tab(f"Face #{i+1}") as tab:
                 with gr.Row():
-                    origin = gr.Image(label="Face to replace")
-                    destination = gr.Image(label="Destination face")
+                    origin = gr.Image(label="Face to replace", type="filepath")
+                    destination = gr.Image(label="Destination face", type="filepath")
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
             origin_video.append(origin)
             destination_video.append(destination)
