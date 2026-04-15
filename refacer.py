@@ -50,7 +50,8 @@ class Refacer:
         self.first_face = False
         self.force_cpu = force_cpu
         self.colab_performance = colab_performance
-        self.use_num_cpus = mp.cpu_count()
+        # Limit workers to avoid overhead in GPU environment - too many workers can slow down GPU processing
+        self.use_num_cpus = min(4, mp.cpu_count()) if not force_cpu else mp.cpu_count()
         self.__check_encoders()
         self.__check_providers()
         self.total_mem = psutil.virtual_memory().total
@@ -77,16 +78,31 @@ class Refacer:
         orig_crop = original_frame[y1:y2, x1:x2].copy()
     
         mask = np.ones((h, w, 3), dtype=np.float32)
-        transition = 40
-    
+        
+        # Vertical transition (smoother with larger transition area)
+        transition = 60  # Increased from 40 for smoother blend
+        
         if cutoff < h:
             blend_start = max(cutoff - transition // 2, 0)
             blend_end = min(cutoff + transition // 2, h)
     
             if blend_end > blend_start:
-                alpha = np.linspace(1.0, 0.0, blend_end - blend_start)[:, np.newaxis, np.newaxis]
-                mask[blend_start:blend_end, :, :] = alpha
+                # Use sigmoid-like curve for smoother transition instead of linear
+                t = np.linspace(0, 1, blend_end - blend_start)
+                alpha = 1.0 / (1.0 + np.exp(10 * (t - 0.5)))  # Sigmoid curve
+                alpha = alpha / alpha[0]  # Normalize to start at 1.0
+                mask[blend_start:blend_end, :, :] = alpha[:, np.newaxis, np.newaxis]
             mask[blend_end:, :, :] = 0.0
+        
+        # Horizontal feathering on edges to reduce visible borders
+        feather_width = 15
+        if w > feather_width * 2:
+            # Left edge feather
+            left_feather = np.linspace(0, 1, feather_width)
+            mask[:, :feather_width, :] *= left_feather[np.newaxis, :, np.newaxis]
+            # Right edge feather
+            right_feather = np.linspace(1, 0, feather_width)
+            mask[:, -feather_width:, :] *= right_feather[np.newaxis, :, np.newaxis]
     
         blended_crop = (swap_crop.astype(np.float32) * mask + orig_crop.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
     
@@ -364,7 +380,7 @@ class Refacer:
                     break
                 if frame_index % skip_rate == 0:
                     frames.append(frame)
-                    if len(frames) > 300:
+                    if len(frames) > 100:
                         self.reface_group(faces, frames, output)
                         frames = []
                         gc.collect()

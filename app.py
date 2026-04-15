@@ -339,8 +339,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         
         # Manual trim controls
         with gr.Row():
-            video_trim_start = gr.Number(label="Trim Start (seconds)", value=None, precision=2, placeholder="Leave empty to start from beginning")
-            video_trim_end = gr.Number(label="Trim End (seconds)", value=None, precision=2, placeholder="Leave empty to end at video end")
+            video_trim_start = gr.Number(label="Trim Start (seconds)", value=None, precision=2)
+            video_trim_end = gr.Number(label="Trim End (seconds)", value=None, precision=2)
 
         origin_video, destination_video, thresholds_video, face_tabs_video = [], [], [], []
 
