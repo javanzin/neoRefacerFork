@@ -74,8 +74,9 @@ class Refacer:
         h = y2 - y1
         cutoff = int(h * (1.0 - self.blend_height_ratio))
     
-        swap_crop = swapped_frame[y1:y2, x1:x2].copy()
-        orig_crop = original_frame[y1:y2, x1:x2].copy()
+        # Avoid unnecessary copies - work with views when possible
+        swap_crop = swapped_frame[y1:y2, x1:x2]
+        orig_crop = original_frame[y1:y2, x1:x2]
     
         mask = np.ones((h, w, 3), dtype=np.float32)
         
@@ -104,12 +105,13 @@ class Refacer:
             right_feather = np.linspace(1, 0, feather_width)
             mask[:, -feather_width:, :] *= right_feather[np.newaxis, :, np.newaxis]
     
+        # Blend in-place to avoid extra copy
         blended_crop = (swap_crop.astype(np.float32) * mask + orig_crop.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
     
-        blended_frame = swapped_frame.copy()
-        blended_frame[y1:y2, x1:x2] = blended_crop
+        # Direct assignment instead of copy
+        swapped_frame[y1:y2, x1:x2] = blended_crop
     
-        return blended_frame
+        return swapped_frame
     
 
     def __download_with_progress(self, url, output_path):
@@ -133,9 +135,9 @@ class Refacer:
         if self.force_cpu:
             self.providers = ['CPUExecutionProvider']
         else:
-            # Prefer faster execution providers in order
+            # Prefer faster execution providers in order - TensorRT first for NVIDIA T4 optimization
             self.providers = []
-            for p in ['CoreMLExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']:
+            for p in ['TensorrtExecutionProvider', 'CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider']:
                 if p in available_providers:
                     self.providers.append(p)
 

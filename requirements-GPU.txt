@@ -4,10 +4,10 @@ imagecodecs==2025.3.30
 gradio==5.22.0
 insightface==0.7.3
 numpy==1.24.3
-onnx==1.14.0
-onnxruntime_gpu==1.21.0
-opencv_python==4.7.0.72
-opencv_python_headless==4.7.0.72
+onnx==1.16.0
+onnxruntime_gpu==1.22.0
+opencv_python==4.9.0.80
+opencv_python_headless==4.9.0.80
 scikit-image==0.20.0
 tqdm==4.67.1
 psutil==7.0.0
@@ -18,3 +18,5 @@ pyfiglet==1.0.2
 # torchvision==0.21.0
 gdown==5.2.0
 lpips==0.1.4
+# cupy-cuda12x (optional for GPU-accelerated NumPy operations)
+# cupy-cuda12x>=13.0.0
