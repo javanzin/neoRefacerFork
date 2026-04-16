@@ -2,6 +2,23 @@ import cv2
 import numpy as np
 from skimage import transform as trans
 
+# GPU preprocessing utilities for Tesla T4 optimization
+def gpu_warpAffine(img, M, dsize, flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0):
+    """
+    GPU-accelerated warpAffine using cv2.cuda if available, falls back to CPU.
+    Reduces CPU-GPU transfer overhead for face alignment.
+    """
+    try:
+        if cv2.cuda.getCudaEnabledDeviceCount() > 0:
+            gpu_img = cv2.cuda_GpuMat()
+            gpu_img.upload(img)
+            gpu_warped = cv2.cuda.warpAffine(gpu_img, M, dsize, flags=flags, borderMode=borderMode, borderValue=borderValue)
+            return gpu_warped.download()
+    except Exception:
+        # Fallback to CPU if CUDA operations fail
+        pass
+    return cv2.warpAffine(img, M, dsize, flags=flags, borderMode=borderMode, borderValue=borderValue)
+
 src1 = np.array([[51.642, 50.115], [57.617, 49.990], [35.740, 69.007],
                  [51.157, 89.050], [57.025, 89.702]],
                 dtype=np.float32)
@@ -69,7 +86,7 @@ def estimate_norm(lmk, image_size=112, mode='arcface'):
 
 def norm_crop(img, landmark, image_size=112, mode='arcface'):
     M, pose_index = estimate_norm(landmark, image_size, mode)
-    warped = cv2.warpAffine(img, M, (image_size, image_size), borderValue=0.0)
+    warped = gpu_warpAffine(img, M, (image_size, image_size), borderValue=0.0)
     return warped
 
 def square_crop(im, S):
