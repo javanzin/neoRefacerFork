@@ -50,18 +50,11 @@ class Refacer:
         self.first_face = False
         self.force_cpu = force_cpu
         self.colab_performance = colab_performance
-        # Limit workers to avoid overhead in GPU environment - too many workers can slow down GPU processing
-        self.use_num_cpus = min(4, mp.cpu_count()) if not force_cpu else mp.cpu_count()
+        self.use_num_cpus = mp.cpu_count()
         self.__check_encoders()
         self.__check_providers()
         self.total_mem = psutil.virtual_memory().total
         self.__init_apps()
-        
-        # Face tracking for performance - detect faces every N frames
-        self.face_tracking_enabled = not force_cpu
-        self.face_tracking_interval = 5  # Detect faces every 5 frames
-        self.last_detected_faces = None  # Cache of last detected faces
-        self.frame_counter = 0  # Counter for tracking frames
         
     def _partial_face_blend(self, original_frame, swapped_frame, face):
         h_frame, w_frame = original_frame.shape[:2]
@@ -80,28 +73,28 @@ class Refacer:
         h = y2 - y1
         cutoff = int(h * (1.0 - self.blend_height_ratio))
     
-        # Use cv2 operations for better performance
         swap_crop = swapped_frame[y1:y2, x1:x2].copy()
         orig_crop = original_frame[y1:y2, x1:x2].copy()
     
-        # Create alpha mask using cv2 for better performance
-        mask = np.zeros((h, w), dtype=np.uint8)
-        mask[cutoff:, :] = 255
+        mask = np.ones((h, w, 3), dtype=np.float32)
+        transition = 40
     
-        # Apply Gaussian blur to mask for smooth transition (feathering)
-        blur_size = 60
-        mask = cv2.GaussianBlur(mask, (blur_size, blur_size), 0)
-        mask = mask.astype(np.float32) / 255.0
-        mask = cv2.merge([mask, mask, mask])
+        if cutoff < h:
+            blend_start = max(cutoff - transition // 2, 0)
+            blend_end = min(cutoff + transition // 2, h)
     
-        # Blend using cv2.addWeighted for better performance
-        blended = cv2.addWeighted(swap_crop, 1.0, orig_crop, 0.0, 0)
-        blended = cv2.addWeighted(blended, mask, orig_crop, 1.0 - mask, 0)
+            if blend_end > blend_start:
+                alpha = np.linspace(1.0, 0.0, blend_end - blend_start)[:, np.newaxis, np.newaxis]
+                mask[blend_start:blend_end, :, :] = alpha
+            mask[blend_end:, :, :] = 0.0
     
-        result = swapped_frame.copy()
-        result[y1:y2, x1:x2] = blended
+        blended_crop = (swap_crop.astype(np.float32) * mask + orig_crop.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
     
-        return result
+        blended_frame = swapped_frame.copy()
+        blended_frame[y1:y2, x1:x2] = blended_crop
+    
+        return blended_frame
+    
 
     def __download_with_progress(self, url, output_path):
         response = requests.get(url, stream=True)
@@ -126,7 +119,7 @@ class Refacer:
         else:
             # Prefer faster execution providers in order
             self.providers = []
-            for p in ['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider']:
+            for p in ['CoreMLExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']:
                 if p in available_providers:
                     self.providers.append(p)
 
@@ -228,26 +221,8 @@ class Refacer:
                 self.replacement_faces.append((feat_original, _faces[0], face_threshold))
 
     def __get_faces(self, frame, max_num=0):
-        # Face tracking: detect only every N frames, reuse cached faces in between
-        if self.face_tracking_enabled and self.last_detected_faces is not None and self.frame_counter % self.face_tracking_interval != 0:
-            # Reuse last detected faces with updated embeddings
-            ret = []
-            for cached_face in self.last_detected_faces:
-                # Recalculate embedding for current frame
-                try:
-                    embedding = self.rec_app.get(frame, cached_face.kps)
-                    face = Face(bbox=cached_face.bbox, kps=cached_face.kps, det_score=cached_face.det_score)
-                    face.embedding = embedding
-                    ret.append(face)
-                except:
-                    # If embedding fails, skip this face
-                    continue
-            return ret
-        
-        # Full detection
         bboxes, kpss = self.face_detector.detect(frame, max_num=max_num, metric='default')
         if bboxes.shape[0] == 0:
-            self.last_detected_faces = None
             return []
         ret = []
         for i in range(bboxes.shape[0]):
@@ -257,11 +232,6 @@ class Refacer:
             face = Face(bbox=bbox, kps=kps, det_score=det_score)
             face.embedding = self.rec_app.get(frame, kps)
             ret.append(face)
-        
-        # Cache detected faces for tracking
-        if self.face_tracking_enabled:
-            self.last_detected_faces = ret
-        
         return ret
 
     def process_first_face(self, frame):
@@ -319,15 +289,14 @@ class Refacer:
                         break
         return frame
 
-    def reface_group(self, faces, frames):
-        # In GPU mode, use 1 worker to avoid contention in GPU command queue and GIL issues
-        workers = 1 if self.mode == RefacerMode.CUDA else self.use_num_cpus
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+    def reface_group(self, faces, frames, output):
+        with ThreadPoolExecutor(max_workers=self.use_num_cpus) as executor:
             if self.first_face:
                 results = list(tqdm(executor.map(self.process_first_face, frames), total=len(frames), desc="Processing frames"))
             else:
                 results = list(tqdm(executor.map(self.process_faces, frames), total=len(frames), desc="Processing frames"))
-            return results
+            for result in results:
+                output.write(result)
 
     def __check_video_has_audio(self, video_path):
         self.video_has_audio = False
@@ -336,46 +305,12 @@ class Refacer:
         if audio_stream is not None:
             self.video_has_audio = True
 
-    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, start_time=None, end_time=None):
+    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0):
         original_name = osp.splitext(osp.basename(video_path))[0]
         timestamp = str(int(time.time()))
         filename = f"{original_name}_preview.mp4" if preview else f"{original_name}_{timestamp}.mp4"
     
         self.__check_video_has_audio(video_path)
-    
-        # Trim video if start_time or end_time is specified and valid
-        # Skip trim if both are None, both are 0, or start >= end
-        if (start_time is not None or end_time is not None):
-            # Validate trim parameters
-            if start_time is None:
-                start_time = 0
-            if end_time is None:
-                end_time = 0
-            
-            # Skip trim if values are invalid (both 0 or start >= end)
-            if start_time == 0 and end_time == 0:
-                print("Skipping trim: both start and end time are 0")
-            elif start_time >= end_time and end_time > 0:
-                print(f"Skipping trim: start_time ({start_time}s) >= end_time ({end_time}s)")
-            else:
-                trimmed_path = os.path.join("tmp", f"trimmed_{original_name}_{timestamp}.mp4")
-                os.makedirs("tmp", exist_ok=True)
-                
-                # Build FFmpeg command for trimming
-                ffmpeg_cmd = ['ffmpeg', '-i', video_path]
-                if start_time > 0:
-                    ffmpeg_cmd.extend(['-ss', str(start_time)])
-                if end_time > 0:
-                    ffmpeg_cmd.extend(['-to', str(end_time)])
-                ffmpeg_cmd.extend(['-c', 'copy', trimmed_path, '-y'])
-                
-                try:
-                    subprocess.run(ffmpeg_cmd, check=True, capture_output=True)
-                    video_path = trimmed_path
-                    print(f"Video trimmed from {start_time}s to {end_time}s")
-                except subprocess.CalledProcessError as e:
-                    print(f"Failed to trim video: {e}")
-                    # Continue with original video if trim fails
     
         if preview:
             os.makedirs("output/preview", exist_ok=True)
@@ -394,45 +329,12 @@ class Refacer:
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     
-        # Use FFmpeg with h264_nvenc for GPU encoding instead of CPU-bound cv2.VideoWriter
-        ffmpeg_cmd = [
-            'ffmpeg', '-y',
-            '-f', 'rawvideo',
-            '-vcodec', 'rawvideo',
-            '-pix_fmt', 'bgr24',
-            '-s', f'{frame_width}x{frame_height}',
-            '-r', str(fps),
-            '-i', '-',
-            '-c:v', 'h264_nvenc',
-            '-preset', 'p6',  # Slow but better quality for T4
-            '-rc', 'constqp',
-            '-qp', '28',  # Quality balance
-            '-pix_fmt', 'yuv420p',
-            '-f', 'mp4',
-            output_video_path
-        ]
-        
-        try:
-            ffmpeg_process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE)
-        except Exception as e:
-            print(f"Failed to start FFmpeg with h264_nvenc, falling back to cv2.VideoWriter: {e}")
-            # Fallback to cv2.VideoWriter if h264_nvenc is not available
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            output = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
-            use_ffmpeg_output = False
-        else:
-            output = ffmpeg_process
-            use_ffmpeg_output = True
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        output = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
     
         frames = []
         frame_index = 0
         skip_rate = 10 if preview else 1
-        # Optimized batch size for PCIe efficiency - process in batches of 4
-        buffer_size = 4  # Reduced from 50 to 4 for better PCIe efficiency
-        
-        # Reset face tracking state for new video
-        self.frame_counter = 0
-        self.last_detected_faces = None
     
         with tqdm(total=total_frames, desc="Extracting frames") as pbar:
             while cap.isOpened():
@@ -441,38 +343,19 @@ class Refacer:
                     break
                 if frame_index % skip_rate == 0:
                     frames.append(frame)
-                    if len(frames) >= buffer_size:
-                        processed_frames = self.reface_group(faces, frames)
-                        for processed_frame in processed_frames:
-                            if use_ffmpeg_output:
-                                output.stdin.write(processed_frame.tobytes())
-                            else:
-                                output.write(processed_frame)
-                        frames.clear()  # More efficient than creating new list
-                        self.frame_counter += len(frames)  # Update frame counter for tracking
+                    if len(frames) > 300:
+                        self.reface_group(faces, frames, output)
+                        frames = []
+                        gc.collect()
                 frame_index += 1
                 pbar.update()
     
         cap.release()
         if frames:
-            processed_frames = self.reface_group(faces, frames)
-            for processed_frame in processed_frames:
-                if use_ffmpeg_output:
-                    output.stdin.write(processed_frame.tobytes())
-                else:
-                    output.write(processed_frame)
-        
-        if use_ffmpeg_output:
-            output.stdin.close()
-            output.wait()
-        else:
-            output.release()
+            self.reface_group(faces, frames, output)
+        output.release()
     
-        # Skip FFmpeg conversion if no audio track (optimization for videos without audio)
-        if self.video_has_audio and not preview:
-            converted_path = self.__convert_video(video_path, output_video_path, preview=preview)
-        else:
-            converted_path = output_video_path
+        converted_path = self.__convert_video(video_path, output_video_path, preview=preview)
     
         if video_path.lower().endswith(".gif"):
             if preview:

@@ -275,19 +275,20 @@ class SCRFD:
                 model_path = self.model_file
                 cpu_session = onnxruntime.InferenceSession(model_path, providers=["CPUExecutionProvider"])
                 self._cpu_fallback_detector = SCRFD(model_file=model_path, session=cpu_session)
-            if self._cpu_fallback_detector is not None and self._force_cpu_fallback:
-                detector = self._cpu_fallback_detector
-            else:
-                detector = self  # Use the original GPU/CoreML session
+                self._cpu_fallback_detector.prepare(0, input_size=(640, 640))
+            
+            detector = self._cpu_fallback_detector
         else:
             detector = self  # Use the original GPU/CoreML session
 
-        # Detection at multiple scales for better face detection
-        # 640x640 for typical faces, 128x128 for small/distant faces
-        det1, kpss1 = detector.detect(img, input_size=(640, 640), thresh=0.5)
-        det2, kpss2 = detector.detect(img, input_size=(128, 128), thresh=0.5)
-        det = np.concatenate((det1, det2), axis=0)
-        kpss = np.concatenate((kpss1, kpss2), axis=0)
+        bboxes, kpss = detector.detect(img, input_size=(640, 640), thresh=0.5)
+        bboxes2, kpss2 = detector.detect(img, input_size=(128, 128), thresh=0.5)
+        
+        bboxes_all = np.concatenate([bboxes, bboxes2], axis=0)
+        kpss_all = np.concatenate([kpss, kpss2], axis=0)
+        keep = self.nms(bboxes_all)
+        det = bboxes_all[keep, :]
+        kpss = kpss_all[keep, :]
 
         if max_num > 0 and det.shape[0] > max_num:
             area = (det[:, 2] - det[:, 0]) * (det[:, 3] - det[:, 1])
