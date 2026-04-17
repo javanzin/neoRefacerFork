@@ -411,7 +411,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         def handle_rotation_change(original_path, rotation):
             rotated_path = rotate_video(original_path, rotation)
-            return rotated_path, rotated_path
+            # Force Gradio to reload the video component by returning an update
+            return gr.update(value=rotated_path), rotated_path
 
         video_rotation.change(
             fn=handle_rotation_change,
