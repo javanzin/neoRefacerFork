@@ -56,12 +56,7 @@ class Refacer:
         self.total_mem = psutil.virtual_memory().total
         self.__init_apps()
 
-        # Face embedding cache for video processing
-        self.prev_faces = []  # List of (bbox, embedding) tuples
-        self.frame_count = 0
-        self.cache_reset_interval = 30  # Reset cache every 30 frames to avoid drift
-
-        # VRAM detection for dynamic batch sizing
+        # VRAM detection for dynamic batch sizing (currently disabled, using fixed batch size)
         self.vram_gb = self._detect_vram()
 
     def _detect_vram(self):
@@ -74,56 +69,6 @@ class Refacer:
             pass
         # Conservative estimate if detection fails
         return 8.0  # Assume 8GB if unable to detect
-
-    def _calculate_batch_size(self, frame_width, frame_height):
-        """Calculate optimal batch size based on VRAM and frame resolution."""
-        # Estimate memory per frame (rough calculation)
-        pixels = frame_width * frame_height
-        # Assume ~3 bytes per pixel for RGB + overhead for intermediate tensors
-        bytes_per_frame = pixels * 3 * 4  # 4x for intermediate tensors
-        mb_per_frame = bytes_per_frame / 1e6
-
-        # Use 60% of VRAM for batch processing
-        available_mb = (self.vram_gb * 1024) * 0.6
-        batch_size = int(available_mb / mb_per_frame)
-
-        # Clamp between 50 and 300
-        return max(50, min(300, batch_size))
-
-    def _compute_iou(self, bbox1, bbox2):
-        """Compute Intersection over Union (IoU) between two bounding boxes."""
-        x1, y1, x2, y2 = bbox1
-        x1_p, y1_p, x2_p, y2_p = bbox2
-
-        xi1 = max(x1, x1_p)
-        yi1 = max(y1, y1_p)
-        xi2 = min(x2, x2_p)
-        yi2 = min(y2, y2_p)
-
-        inter_area = max(0, xi2 - xi1) * max(0, yi2 - yi1)
-        bbox1_area = (x2 - x1) * (y2 - y1)
-        bbox2_area = (x2_p - x1_p) * (y2_p - y1_p)
-        union_area = bbox1_area + bbox2_area - inter_area
-
-        return inter_area / union_area if union_area > 0 else 0
-
-    def _find_cached_embedding(self, bbox):
-        """Find cached embedding for a face with similar bbox."""
-        if not self.prev_faces:
-            return None
-        for prev_bbox, prev_embedding in self.prev_faces:
-            iou = self._compute_iou(bbox, prev_bbox)
-            if iou > 0.7:  # Threshold for reusing embedding
-                return prev_embedding
-        return None
-
-    def _update_cache(self, faces):
-        """Update embedding cache with current frame's faces."""
-        self.prev_faces = [(face.bbox, face.embedding) for face in faces]
-        self.frame_count += 1
-        # Reset cache periodically to avoid drift from face changes
-        if self.frame_count % self.cache_reset_interval == 0:
-            self.prev_faces = []
 
     def _partial_face_blend(self, original_frame, swapped_frame, face):
         h_frame, w_frame = original_frame.shape[:2]
@@ -302,22 +247,11 @@ class Refacer:
             kps = kpss[i] if kpss is not None else None
             face = Face(bbox=bbox, kps=kps, det_score=det_score)
 
-            # Use cache only in single face mode to avoid issues with multiple faces
-            if not self.multiple_faces_mode and not self.disable_similarity:
-                cached_embedding = self._find_cached_embedding(bbox)
-                if cached_embedding is not None:
-                    face.embedding = cached_embedding
-                else:
-                    face.embedding = self.rec_app.get(frame, kps)
-            else:
-                # Always compute fresh embeddings in multiple faces mode
-                face.embedding = self.rec_app.get(frame, kps)
+            # Disable cache temporarily to investigate performance issue
+            face.embedding = self.rec_app.get(frame, kps)
 
             ret.append(face)
 
-        # Update cache only in single face mode
-        if not self.multiple_faces_mode and not self.disable_similarity:
-            self._update_cache(ret)
         return ret
 
     def process_first_face(self, frame):
@@ -376,11 +310,8 @@ class Refacer:
         return frame
 
     def reface_group(self, faces, frames, output):
-        # Adjust workers based on execution mode: fewer workers for GPU-bound tasks to reduce overhead
-        if self.mode == RefacerMode.CUDA:
-            max_workers = min(2, self.use_num_cpus)  # GPU-bound: minimize threading overhead
-        else:
-            max_workers = self.use_num_cpus  # CPU-bound: use all available threads
+        # Use all available CPUs - GPU-bound tasks still benefit from parallel preprocessing
+        max_workers = self.use_num_cpus
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             if self.first_face:
@@ -415,10 +346,6 @@ class Refacer:
         self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
         self.partial_reface_ratio = partial_reface_ratio
 
-        # Reset cache for new video processing
-        self.prev_faces = []
-        self.frame_count = 0
-
         cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)  # Increase buffer size for smoother I/O
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -429,9 +356,8 @@ class Refacer:
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         output = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
 
-        # Calculate dynamic batch size based on VRAM and resolution
-        batch_size = self._calculate_batch_size(frame_width, frame_height)
-        print(f"[INFO] Using dynamic batch size: {batch_size} (VRAM: {self.vram_gb:.1f}GB, Resolution: {frame_width}x{frame_height})")
+        # Use fixed batch size for now - dynamic batch size may be causing performance issues
+        batch_size = 300
 
         frames = []
         frame_index = 0
