@@ -155,26 +155,26 @@ def handle_tif_preview(filepath):
     Image.open(filepath).convert('RGB').save(preview_path)
     return preview_path
 
-def rotate_video(video_path, rotation):
-    if video_path is None or rotation == 0:
+def rotate_video(video_path, direction):
+    """Rotate video 90 degrees in specified direction ('left' or 'right')"""
+    if video_path is None:
         return video_path
-    
+
     rotation_filters = {
-        90: "transpose=1",
-        180: "transpose=1,transpose=1",
-        270: "transpose=2"
+        'left': "transpose=2",
+        'right': "transpose=1"
     }
-    
-    if rotation not in rotation_filters:
+
+    if direction not in rotation_filters:
         return video_path
-    
-    output_path = os.path.join("./tmp", f"rotated_{rotation}_{int(time.time() * 1000)}.mp4")
-    
+
+    output_path = os.path.join("./tmp", f"rotated_{direction}_{int(time.time() * 1000)}.mp4")
+
     try:
         (
             ffmpeg
             .input(video_path)
-            .output(output_path, vf=rotation_filters[rotation])
+            .output(output_path, vf=rotation_filters[direction])
             .overwrite_output()
             .run(quiet=True)
         )
@@ -354,11 +354,6 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             video_output = gr.Video(label="Refaced Video", interactive=False, format="mp4")
 
         with gr.Row():
-            video_rotation = gr.Radio(
-                choices=[0, 90, 180, 270],
-                value=0,
-                label="Rotation (degrees)"
-            )
             face_mode_video = gr.Radio(
                 choices=["Single Face", "Multiple Faces", "Faces By Match"],
                 value="Single Face",
@@ -367,9 +362,11 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             partial_reface_ratio_video = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
             video_btn = gr.Button("Reface Video", variant="primary")
 
+        with gr.Row():
+            rotate_left_btn = gr.Button("↺ Rotate Left", variant="secondary")
+            rotate_right_btn = gr.Button("↻ Rotate Right", variant="secondary")
+
         preview_checkbox_video = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
-        original_video_state = gr.State(value=None)
-        rotated_video_state = gr.State(value=None)
 
         origin_video, destination_video, thresholds_video, face_tabs_video = [], [], [], []
 
@@ -403,22 +400,25 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         )
         
         video_input.change(fn=lambda _: 0.0, inputs=video_input, outputs=partial_reface_ratio_video)
-        
-        video_input.change(
-            fn=lambda filepath: filepath,
+
+        def handle_rotate_left(video_path):
+            rotated = rotate_video(video_path, 'left')
+            return gr.update(value=rotated)
+
+        def handle_rotate_right(video_path):
+            rotated = rotate_video(video_path, 'right')
+            return gr.update(value=rotated)
+
+        rotate_left_btn.click(
+            fn=handle_rotate_left,
             inputs=video_input,
-            outputs=original_video_state
+            outputs=video_input
         )
 
-        def handle_rotation_change(original_path, rotation):
-            rotated_path = rotate_video(original_path, rotation)
-            # Force Gradio to reload the video component by returning an update
-            return gr.update(value=rotated_path), rotated_path
-
-        video_rotation.change(
-            fn=handle_rotation_change,
-            inputs=[original_video_state, video_rotation],
-            outputs=[video_input, rotated_video_state]
+        rotate_right_btn.click(
+            fn=handle_rotate_right,
+            inputs=video_input,
+            outputs=video_input
         )
 
         video_btn.click(

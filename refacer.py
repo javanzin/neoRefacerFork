@@ -278,8 +278,9 @@ class Refacer:
             else:
                 if "origin" in face and face["origin"] is not None and not disable_similarity:
                     face_threshold = face['threshold']
-                    # Use single-scale detection instead of dual-scale autodetect for better performance
-                    bboxes1, kpss1 = self.face_detector.detect(face['origin'], input_size=(640, 640), thresh=0.5, max_num=1)
+                    # Use autodetect for robust face detection in prepare phase (called once per video)
+                    # Single-scale optimization is only applied in __get_faces for video frame processing
+                    bboxes1, kpss1 = self.face_detector.autodetect(face['origin'], max_num=1)
                     if len(kpss1) < 1:
                         raise Exception('No face detected on "Face to replace" image')
                     feat_original = self.rec_app.get(face['origin'], kpss1[0])
