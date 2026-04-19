@@ -13,6 +13,7 @@ import base64
 import pyfiglet
 import shutil
 import time
+import ffmpeg
 
 print("\033[94m" + pyfiglet.Figlet(font='slant').renderText("NeoRefacer") + "\033[0m")
 
