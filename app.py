@@ -365,6 +365,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         with gr.Row():
             rotate_left_btn = gr.Button("↺ Rotate Left", variant="secondary")
             rotate_right_btn = gr.Button("↻ Rotate Right", variant="secondary")
+            redetect_btn = gr.Button("🔄 Re-detect Faces", variant="secondary", visible=False)
 
         preview_checkbox_video = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
 
@@ -409,6 +410,21 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             rotated = rotate_video(video_path, 'right')
             return gr.update(value=rotated)
 
+        def handle_redetect(video_path):
+            """Re-detect faces from the current (possibly rotated) video"""
+            faces = extract_faces_auto(video_path, refacer, max_faces=num_faces, isvideo=True)
+            return faces
+
+        def update_redetect_visibility(mode):
+            """Show Re-detect button only in Faces By Match mode"""
+            return gr.update(visible=(mode == "Faces By Match"))
+
+        face_mode_video.change(
+            fn=update_redetect_visibility,
+            inputs=face_mode_video,
+            outputs=redetect_btn
+        )
+
         rotate_left_btn.click(
             fn=handle_rotate_left,
             inputs=video_input,
@@ -419,6 +435,12 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             fn=handle_rotate_right,
             inputs=video_input,
             outputs=video_input
+        )
+
+        redetect_btn.click(
+            fn=handle_redetect,
+            inputs=video_input,
+            outputs=origin_video
         )
 
         video_btn.click(
