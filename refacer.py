@@ -301,17 +301,22 @@ class Refacer:
             kps = kpss[i] if kpss is not None else None
             face = Face(bbox=bbox, kps=kps, det_score=det_score)
 
-            # Try to reuse cached embedding for similar face
-            cached_embedding = self._find_cached_embedding(bbox)
-            if cached_embedding is not None:
-                face.embedding = cached_embedding
+            # Use cache only in single face mode to avoid issues with multiple faces
+            if not self.multiple_faces_mode and not self.disable_similarity:
+                cached_embedding = self._find_cached_embedding(bbox)
+                if cached_embedding is not None:
+                    face.embedding = cached_embedding
+                else:
+                    face.embedding = self.rec_app.get(frame, kps)
             else:
+                # Always compute fresh embeddings in multiple faces mode
                 face.embedding = self.rec_app.get(frame, kps)
 
             ret.append(face)
 
-        # Update cache with current frame's faces
-        self._update_cache(ret)
+        # Update cache only in single face mode
+        if not self.multiple_faces_mode and not self.disable_similarity:
+            self._update_cache(ret)
         return ret
 
     def process_first_face(self, frame):
