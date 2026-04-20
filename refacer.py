@@ -236,7 +236,8 @@ class Refacer:
 
                 self.replacement_faces.append((feat_original, _faces[0], face_threshold))
 
-    def __get_faces(self, frame, max_num=0):
+    def __get_faces(self, frame, max_num=8):
+        # Limit max_num to avoid detecting unnecessary faces (default 8 from app.py)
         bboxes, kpss = self.face_detector.detect(frame, max_num=max_num, metric='default')
         if bboxes.shape[0] == 0:
             return []
@@ -247,7 +248,6 @@ class Refacer:
             kps = kpss[i] if kpss is not None else None
             face = Face(bbox=bbox, kps=kps, det_score=det_score)
 
-            # Disable cache temporarily to investigate performance issue
             face.embedding = self.rec_app.get(frame, kps)
 
             ret.append(face)
@@ -255,10 +255,10 @@ class Refacer:
         return ret
 
     def process_first_face(self, frame):
-        faces = self.__get_faces(frame, max_num=0)
+        faces = self.__get_faces(frame, max_num=8)
         if not faces:
             return frame
-    
+
         if self.disable_similarity:
             for face in faces:
                 swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
@@ -270,7 +270,7 @@ class Refacer:
         return frame
 
     def process_faces(self, frame):
-        faces = self.__get_faces(frame, max_num=0)
+        faces = self.__get_faces(frame, max_num=8)
         if not faces:
             return frame
  
