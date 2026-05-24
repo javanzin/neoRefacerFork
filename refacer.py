@@ -274,8 +274,15 @@ class Refacer:
                 self.cache_dir.mkdir(exist_ok=True)
                 print("[CACHE] Cleared all cache...")
 
-    def analyze_target_video(self, video_path, max_num_faces=8, force_reanalyze=False):
-        """Analyze target video and cache face detection and embedding results."""
+    def analyze_target_video(self, video_path, max_num_faces=8, force_reanalyze=False, cache_embeddings=True):
+        """Analyze target video and cache face detection and embedding results.
+        
+        Args:
+            video_path: Path to video file
+            max_num_faces: Maximum number of faces to detect
+            force_reanalyze: Force re-analysis even if cache exists
+            cache_embeddings: If False, only cache detection (bboxes/kpss), not embeddings
+        """
         video_hash = self._compute_video_hash(video_path)
         cache_dir = self._get_cache_dir(video_hash)
         
@@ -283,7 +290,7 @@ class Refacer:
             print(f"[CACHE] Loading cached analysis for {video_hash[:8]}...")
             return self._load_cached_analysis(cache_dir)
         
-        print(f"[ANALYSIS] Analyzing target video...")
+        print(f"[ANALYSIS] Analyzing target video (cache_embeddings={cache_embeddings})...")
         
         cap = cv2.VideoCapture(video_path)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -297,12 +304,17 @@ class Refacer:
             "width": width,
             "height": height,
             "pipeline_version": self.pipeline_version,
-            "max_num_faces": max_num_faces
+            "max_num_faces": max_num_faces,
+            "cache_embeddings": cache_embeddings
         }
         
         cache_dir.mkdir(parents=True, exist_ok=True)
         frame_cache_dir = cache_dir / "frame_analysis"
         frame_cache_dir.mkdir(exist_ok=True)
+        
+        # Batch frames for more efficient I/O
+        batch_size = 100
+        batch_data = []
         
         # Analyze frames
         with tqdm(total=total_frames, desc="Analyzing frames") as pbar:
@@ -321,22 +333,36 @@ class Refacer:
                     "transforms": []
                 }
                 
-                # Compute embeddings and transforms
-                for i in range(len(bboxes)):
-                    kps = kpss[i] if kpss is not None else None
-                    embedding = self.rec_app.get(frame, kps)
-                    transform = face_align.estimate_norm(kps, image_size=112)[0]
-                    
-                    frame_data["embeddings"].append(embedding)
-                    frame_data["transforms"].append(transform)
+                # Only compute embeddings if requested (expensive operation)
+                if cache_embeddings:
+                    for i in range(len(bboxes)):
+                        kps = kpss[i] if kpss is not None else None
+                        embedding = self.rec_app.get(frame, kps)
+                        transform = face_align.estimate_norm(kps, image_size=112)[0]
+                        
+                        frame_data["embeddings"].append(embedding)
+                        frame_data["transforms"].append(transform)
                 
-                # Save per-frame
-                np.savez_compressed(
-                    frame_cache_dir / f"frame_{frame_idx:06d}.npz",
-                    **frame_data
-                )
+                batch_data.append((frame_idx, frame_data))
+                
+                # Save in batches to reduce I/O overhead
+                if len(batch_data) >= batch_size:
+                    for batch_idx, batch_frame_data in batch_data:
+                        np.savez_compressed(
+                            frame_cache_dir / f"frame_{batch_idx:06d}.npz",
+                            **batch_frame_data
+                        )
+                    batch_data = []
                 
                 pbar.update(1)
+        
+        # Save remaining frames in batch
+        if batch_data:
+            for batch_idx, batch_frame_data in batch_data:
+                np.savez_compressed(
+                    frame_cache_dir / f"frame_{batch_idx:06d}.npz",
+                    **batch_frame_data
+                )
         
         # Save metadata
         with open(cache_dir / "metadata.json", 'w') as f:
@@ -355,6 +381,100 @@ class Refacer:
         
         print(f"[ANALYSIS] Completed. Cached {total_frames} frames.")
         return metadata
+
+    def reface_lazy_cache(self, video_path, faces, output_path,
+                         preview=False, disable_similarity=False,
+                         multiple_faces_mode=False, partial_reface_ratio=0.0):
+        """Reface video with lazy in-memory caching (no eager preprocessing)."""
+        
+        # Prepare source faces
+        self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
+        self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
+        self.partial_reface_ratio = partial_reface_ratio
+        
+        # In-memory cache (no disk I/O)
+        frame_cache = {}
+        
+        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        output = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+        
+        batch_size = 300
+        frames = []
+        frame_index = 0
+        skip_rate = 10 if preview else 1
+        cache_hits = 0
+        cache_misses = 0
+        
+        with tqdm(total=total_frames, desc="Processing frames (lazy cache)") as pbar:
+            while cap.isOpened():
+                flag, frame = cap.read()
+                if not flag:
+                    break
+                
+                if frame_index % skip_rate != 0:
+                    frame_index += 1
+                    pbar.update()
+                    continue
+                
+                # Check in-memory cache
+                if frame_index in frame_cache:
+                    cached_data = frame_cache[frame_index]
+                    cache_hits += 1
+                    
+                    # Reconstruct Face objects from cache
+                    faces_in_frame = []
+                    for i in range(len(cached_data["bboxes"])):
+                        face = Face(
+                            bbox=cached_data["bboxes"][i],
+                            kps=cached_data["kpss"][i] if cached_data["kpss"] is not None and len(cached_data["kpss"]) > i else None,
+                            det_score=cached_data["bboxes"][i][4]
+                        )
+                        face.embedding = cached_data["embeddings"][i]
+                        faces_in_frame.append(face)
+                    
+                    processed_frame = self._process_faces_with_cached_data(frame, faces_in_frame)
+                else:
+                    cache_misses += 1
+                    # Process normally and cache result
+                    processed_frame = self.process_faces(frame) if not self.first_face else self.process_first_face(frame)
+                    
+                    # Cache the detection results for this frame
+                    detected_faces = self.__get_faces(frame, max_num=8)
+                    if detected_faces:
+                        frame_cache[frame_index] = {
+                            "bboxes": np.array([f.bbox for f in detected_faces]),
+                            "kpss": np.array([f.kps for f in detected_faces]) if detected_faces[0].kps is not None else None,
+                            "embeddings": [f.embedding for f in detected_faces]
+                        }
+                
+                frames.append(processed_frame)
+                
+                if len(frames) > batch_size:
+                    for f in frames:
+                        output.write(f)
+                    frames = []
+                    gc.collect()
+                
+                frame_index += 1
+                pbar.update()
+        
+        cap.release()
+        if frames:
+            for f in frames:
+                output.write(f)
+        output.release()
+        
+        print(f"[CACHE] Cache hits: {cache_hits}, misses: {cache_misses}")
+        
+        converted_path = self.__convert_video(video_path, output_path, preview=preview)
+        return converted_path
 
     def _process_faces_with_cached_data(self, frame, faces):
         """Process frame using pre-detected and pre-embedded faces (cached data)."""
@@ -398,8 +518,13 @@ class Refacer:
 
     def reface_with_cache(self, video_path, faces, output_path, 
                           preview=False, disable_similarity=False,
-                          multiple_faces_mode=False, partial_reface_ratio=0.0):
-        """Reface video using cached target analysis for faster processing."""
+                          multiple_faces_mode=False, partial_reface_ratio=0.0,
+                          cache_embeddings=True):
+        """Reface video using cached target analysis for faster processing.
+        
+        Args:
+            cache_embeddings: If True, cache embeddings (expensive). If False, only cache detection.
+        """
         
         # Prepare source faces (not cached - depends on source)
         self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
@@ -412,16 +537,16 @@ class Refacer:
         
         if not self._cache_valid(cache_dir):
             print("[CACHE] No valid cache found, analyzing target video...")
-            self.analyze_target_video(video_path, max_num_faces=8)
+            self.analyze_target_video(video_path, max_num_faces=8, cache_embeddings=cache_embeddings)
         
         # Load cached analysis
         metadata = json.load(open(cache_dir / "metadata.json"))
         frame_cache_dir = cache_dir / "frame_analysis"
         
-        # Check if max_num_faces matches
-        if metadata.get("max_num_faces", 8) != 8:
-            print("[CACHE] Cache was created with different max_num_faces, reanalyzing...")
-            self.analyze_target_video(video_path, max_num_faces=8, force_reanalyze=True)
+        # Check if max_num_faces matches and cache_embeddings matches
+        if metadata.get("max_num_faces", 8) != 8 or metadata.get("cache_embeddings", True) != cache_embeddings:
+            print("[CACHE] Cache was created with different settings, reanalyzing...")
+            self.analyze_target_video(video_path, max_num_faces=8, force_reanalyze=True, cache_embeddings=cache_embeddings)
             metadata = json.load(open(cache_dir / "metadata.json"))
         
         # Setup video writer
@@ -456,7 +581,7 @@ class Refacer:
                     cached_data = np.load(cache_file)
                     bboxes = cached_data["bboxes"]
                     kpss = cached_data["kpss"]
-                    embeddings = cached_data["embeddings"]
+                    cached_embeddings = cached_data["embeddings"] if "embeddings" in cached_data and len(cached_data["embeddings"]) > 0 else None
                 except (FileNotFoundError, KeyError):
                     # Cache miss for this frame, fall back to regular processing
                     print(f"[CACHE] Miss for frame {frame_idx}, falling back to regular processing...")
@@ -478,7 +603,15 @@ class Refacer:
                         kps=kpss[i] if len(kpss) > i else None,
                         det_score=bboxes[i][4]
                     )
-                    face.embedding = embeddings[i]
+                    
+                    # Use cached embeddings if available, otherwise compute on-the-fly
+                    if cached_embeddings is not None and i < len(cached_embeddings):
+                        face.embedding = cached_embeddings[i]
+                    else:
+                        # Compute embedding on-the-fly (detection was cached, but not embedding)
+                        kps = kpss[i] if kpss is not None and len(kpss) > i else None
+                        face.embedding = self.rec_app.get(frame, kps)
+                    
                     faces_in_frame.append(face)
                 
                 # Process faces using cached data (swap only, no detection/embedding)
@@ -629,7 +762,7 @@ class Refacer:
         if audio_stream is not None:
             self.video_has_audio = True
 
-    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, use_cache=True):
+    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, use_cache=False):
         """Reface video with optional caching for faster subsequent runs.
         
         Args:
@@ -639,7 +772,7 @@ class Refacer:
             disable_similarity: If True, disable face similarity matching
             multiple_faces_mode: If True, use multiple faces mode
             partial_reface_ratio: Ratio for partial face blending (0-0.5)
-            use_cache: If True, use cached target analysis for faster processing
+            use_cache: If True, use cached target analysis for faster processing (disabled by default)
         """
         original_name = osp.splitext(osp.basename(video_path))[0]
         timestamp = str(int(time.time()))
@@ -654,16 +787,51 @@ class Refacer:
             os.makedirs("output", exist_ok=True)
             output_video_path = os.path.join('output', filename)
         
-        # Route to cached implementation if enabled
+        # Check if cache should be used based on video duration
         if use_cache:
-            print("[CACHE] Using cached target analysis for faster processing...")
-            converted_path = self.reface_with_cache(
-                video_path, faces, output_video_path,
-                preview=preview,
-                disable_similarity=disable_similarity,
-                multiple_faces_mode=multiple_faces_mode,
-                partial_reface_ratio=partial_reface_ratio
-            )
+            # Get video duration
+            cap_check = cv2.VideoCapture(video_path)
+            total_frames_check = int(cap_check.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps_check = cap_check.get(cv2.CAP_PROP_FPS)
+            duration_seconds = total_frames_check / fps_check if fps_check > 0 else 0
+            cap_check.release()
+            
+            # Disable cache for short videos (< 15 seconds)
+            if duration_seconds < 15:
+                print(f"[INFO] Video too short ({duration_seconds:.1f}s), disabling cache")
+                use_cache = False
+            elif duration_seconds < 30:
+                # Medium videos: use lazy in-memory cache (no disk I/O)
+                print(f"[CACHE] Using lazy in-memory cache for medium video ({duration_seconds:.1f}s)")
+                converted_path = self.reface_lazy_cache(
+                    video_path, faces, output_video_path,
+                    preview=preview,
+                    disable_similarity=disable_similarity,
+                    multiple_faces_mode=multiple_faces_mode,
+                    partial_reface_ratio=partial_reface_ratio
+                )
+            elif duration_seconds < 60:
+                # Long videos: use selective disk cache (detection only, not embeddings)
+                print(f"[CACHE] Using selective disk cache (detection only) for long video ({duration_seconds:.1f}s)")
+                converted_path = self.reface_with_cache(
+                    video_path, faces, output_video_path,
+                    preview=preview,
+                    disable_similarity=disable_similarity,
+                    multiple_faces_mode=multiple_faces_mode,
+                    partial_reface_ratio=partial_reface_ratio,
+                    cache_embeddings=False
+                )
+            else:
+                # Very long videos: use full disk cache (detection + embeddings)
+                print(f"[CACHE] Using full disk cache for very long video ({duration_seconds:.1f}s)")
+                converted_path = self.reface_with_cache(
+                    video_path, faces, output_video_path,
+                    preview=preview,
+                    disable_similarity=disable_similarity,
+                    multiple_faces_mode=multiple_faces_mode,
+                    partial_reface_ratio=partial_reface_ratio,
+                    cache_embeddings=True
+                )
         else:
             # Use original non-cached implementation
             self.prepare_faces(faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode)
