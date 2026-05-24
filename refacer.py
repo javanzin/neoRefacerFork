@@ -218,10 +218,15 @@ class Refacer:
         """Fast video fingerprinting using first and last 1MB plus file size."""
         size = os.path.getsize(video_path)
         
-        # Read first and last 1MB
+        # Read first and last 1MB (handle small files)
         with open(video_path, 'rb') as f:
             first_mb = f.read(1024*1024)
-            f.seek(-1024*1024, 2)
+            
+            # For files smaller than 2MB, read from middle instead of end
+            if size < 2 * 1024 * 1024:
+                f.seek(max(0, size // 2 - 512 * 1024))
+            else:
+                f.seek(-1024*1024, 2)
             last_mb = f.read()
         
         hash_input = f"{size}-{first_mb}-{last_mb}".encode()
