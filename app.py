@@ -79,10 +79,11 @@ def run(*vars):
     video_path = vars[0]
     origins = vars[1:(num_faces+1)]
     destinations = vars[(num_faces+1):(num_faces*2)+1]
-    thresholds = vars[(num_faces*2)+1:-3]
-    preview = vars[-3]
-    face_mode = vars[-2]
-    partial_reface_ratio = vars[-1]
+    thresholds = vars[(num_faces*2)+1:-4]
+    preview = vars[-4]
+    face_mode = vars[-3]
+    partial_reface_ratio = vars[-2]
+    use_cache = vars[-1]
 
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
@@ -96,7 +97,7 @@ def run(*vars):
                 'threshold': thresholds[k] if not multiple_faces_mode else 0.0
             })
 
-    mp4_path, gif_path = refacer.reface(video_path, faces, preview=preview, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
+    mp4_path, gif_path = refacer.reface(video_path, faces, preview=preview, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio, use_cache=use_cache)
     return mp4_path, gif_path if gif_path else None
 
 def load_first_frame(filepath):
@@ -242,7 +243,9 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             face_mode_gif = gr.Radio(["Single Face", "Multiple Faces", "Faces By Match"], value="Single Face", label="Replacement Mode")
             partial_reface_ratio_gif = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
             gif_btn = gr.Button("Reface GIF", variant="primary")
-            preview_checkbox_gif = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
+            with gr.Column():
+                preview_checkbox_gif = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
+                use_cache_gif = gr.Checkbox(label="Enable Cache (Faster subsequent runs)", value=True)
 
         origin_gif, destination_gif, thresholds_gif, face_tabs_gif = [], [], [], []
 
@@ -260,7 +263,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         face_mode_gif.change(fn=lambda mode: toggle_tabs_and_faces(mode, face_tabs_gif, origin_gif), inputs=[face_mode_gif], outputs=face_tabs_gif + origin_gif)
         demo.load(fn=lambda: toggle_tabs_and_faces("Single Face", face_tabs_gif, origin_gif), inputs=None, outputs=face_tabs_gif + origin_gif)
 
-        gif_btn.click(fn=run, inputs=[gif_input] + origin_gif + destination_gif + thresholds_gif + [preview_checkbox_gif, face_mode_gif, partial_reface_ratio_gif], outputs=[gif_output, gif_file_output])
+        gif_btn.click(fn=run, inputs=[gif_input] + origin_gif + destination_gif + thresholds_gif + [preview_checkbox_gif, face_mode_gif, partial_reface_ratio_gif, use_cache_gif], outputs=[gif_output, gif_file_output])
 
         gif_input.change(fn=lambda filepath: extract_faces_auto(filepath, refacer, max_faces=num_faces), inputs=gif_input, outputs=origin_gif)
         gif_input.change(fn=lambda file: file, inputs=gif_input, outputs=[gif_preview])
@@ -367,7 +370,9 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             rotate_right_btn = gr.Button("↻ Rotate Right", variant="secondary")
             redetect_btn = gr.Button("🔄 Re-detect Faces", variant="secondary", visible=False)
 
-        preview_checkbox_video = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
+        with gr.Row():
+            preview_checkbox_video = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
+            use_cache_video = gr.Checkbox(label="Enable Cache (Faster subsequent runs)", value=True)
 
         origin_video, destination_video, thresholds_video, face_tabs_video = [], [], [], []
 
@@ -445,9 +450,24 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         video_btn.click(
             fn=lambda *args: run(*args),
-            inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video],
+            inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, use_cache_video],
             outputs=[video_output, gr.File(visible=False)]
         )
+
+    # --- System / Cache Settings (Global) ---
+    with gr.Accordion("⚙️ System Settings", open=False):
+        with gr.Row():
+            clear_cache_btn = gr.Button("🗑️ Clear Cache Directory", variant="secondary")
+            clear_cache_status = gr.Textbox(label="Status", interactive=False, placeholder="Click button to clear cache")
+            
+        def trigger_clear_cache():
+            try:
+                refacer.clear_cache()
+                return "Cache directory successfully cleared!"
+            except Exception as e:
+                return f"Error clearing cache: {e}"
+                
+        clear_cache_btn.click(fn=trigger_clear_cache, inputs=[], outputs=[clear_cache_status])
 
 # --- ngrok connect (optional) ---
 if args.ngrok:

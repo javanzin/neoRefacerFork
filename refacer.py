@@ -386,6 +386,7 @@ class Refacer:
             self.mode = RefacerMode.CUDA
             self.use_num_cpus = 2
             self.sess_options.intra_op_num_threads = 1
+            self.sess_options.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
         elif active_provider == 'CoreMLExecutionProvider':
             self.mode = RefacerMode.COREML
             self.use_num_cpus = max(mp.cpu_count() - 1, 1)
@@ -495,6 +496,25 @@ class Refacer:
                 shutil.rmtree(self.cache_dir)
                 self.cache_dir.mkdir(exist_ok=True)
                 print("[CACHE] Cleared all cache...")
+
+    def _cleanup_old_video_caches(self, current_hash):
+        """Remove any cache directories and in-memory caches that do not match the current video hash to save space."""
+        # Disk cleanup
+        video_analysis_dir = self.cache_dir / "video_analysis"
+        if video_analysis_dir.exists():
+            for path in video_analysis_dir.iterdir():
+                if path.is_dir() and path.name != current_hash:
+                    try:
+                        shutil.rmtree(path)
+                        print(f"[CACHE] Automatically cleaned up old cache folder: {path.name[:8]}...")
+                    except Exception as e:
+                        print(f"[CACHE] Warning: Failed to clean up old cache {path.name}: {e}")
+        
+        # In-memory cleanup
+        keys_to_remove = [k for k in self.light_cache if k != current_hash]
+        for k in keys_to_remove:
+            del self.light_cache[k]
+            print(f"[CACHE] Automatically cleaned up in-memory cache for video: {k[:8]}...")
 
     def analyze_target_video(self, video_path, max_num_faces=8, force_reanalyze=False, cache_embeddings=True):
         """Analyze target video and cache face detection and embedding results.
@@ -1020,6 +1040,10 @@ class Refacer:
         
         # Check if cache should be used based on video duration
         if use_cache:
+            # Clean up old caches to keep disk and RAM usage low
+            video_hash = self._compute_video_hash(video_path)
+            self._cleanup_old_video_caches(video_hash)
+
             # Get video duration
             cap_check = cv2.VideoCapture(video_path)
             total_frames_check = int(cap_check.get(cv2.CAP_PROP_FRAME_COUNT))
