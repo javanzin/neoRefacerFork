@@ -124,6 +124,15 @@ For NVIDIA GPU, make sure you have both NVIDIA GPU Computing Toolkit and NVIDIA 
 For more information on installing the CUDA necessary to use `onnxruntime-gpu`, please refer directly to the official [ONNX Runtime repository](https://github.com/microsoft/onnxruntime/).
 
 
+## Google Colab
+
+Para rodar o NeoRefacer no Google Colab de forma rápida e com aceleração por GPU gratuita, você pode usar o arquivo de notebook incluso neste repositório:
+
+1. Abra o arquivo [NeoRefacer_Colab.ipynb](file:///d:/dev/neoRefacerFork/NeoRefacer_Colab.ipynb) ou faça o upload dele diretamente no Google Colab.
+2. Certifique-se de ativar o acelerador de GPU em **Ambiente de Execução > Alterar tipo de ambiente de execução > GPU**.
+3. Execute as células em ordem. A instalação limpa de dependências (evitando conflitos com pacotes de CPU pré-instalados) e o link público do Gradio serão gerados automaticamente para você acessar a interface.
+
+
 ## Usage
 
 Once you have successfully installed NeoRefacer and its dependencies, you can run the application using the following command:

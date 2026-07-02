@@ -461,4 +461,15 @@ if args.ngrok:
     connect(args.ngrok, args.server_port, {'region': args.ngrok_region, 'authtoken_from_env': False})
 
 # --- Launch app ---
-demo.queue().launch(favicon_path="icon.png", show_error=True, share=args.share_gradio, server_name=args.server_name, server_port=args.server_port)
+is_colab = False
+try:
+    __import__('google.colab')
+    is_colab = True
+except ImportError:
+    pass
+
+share_app = args.share_gradio or is_colab
+if is_colab:
+    print("[INFO] Google Colab environment detected. Automatically enabling Gradio sharing link.")
+
+demo.queue().launch(favicon_path="icon.png", show_error=True, share=share_app, server_name=args.server_name, server_port=args.server_port)

@@ -367,6 +367,13 @@ class Refacer:
         self.sess_options.execution_mode = rt.ExecutionMode.ORT_PARALLEL
         self.sess_options.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
 
+        # Ensure buffalo_l model directory and det_10g.onnx are downloaded/available
+        # before attempting to create the test session.
+        try:
+            ensure_available('models', 'buffalo_l', root='~/.insightface')
+        except Exception as e:
+            print(f"[WARNING] Failed to ensure buffalo_l models are downloaded during provider check: {e}")
+
         test_model = os.path.expanduser("~/.insightface/models/buffalo_l/det_10g.onnx")
         try:
             test_session = rt.InferenceSession(test_model, self.sess_options, providers=self.providers)
