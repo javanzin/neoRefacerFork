@@ -77,7 +77,10 @@ class Refacer:
         
         # Ultra-lightweight in-memory cache for short videos
         self.light_cache = {}  # {video_hash: {frame_idx: {"bboxes": ..., "kpss": ...}}}
-        self.light_cache_max_videos = 5  # Keep cache for last 5 videos
+        self.light_cache_max_videos = 1  # Keep cache for current video only
+        self.light_cache_max_memory_mb = 500  # Max 500MB for light cache
+        self.light_cache_max_frames_per_video = 1000  # Max frames per video in cache
+        self.current_video_hash = None  # Track current video to clear cache on change
     
     def _profile_start(self, name):
         """Start profiling a section."""
@@ -116,9 +119,18 @@ class Refacer:
         return None
     
     def _set_light_cache(self, video_hash, frame_idx, bboxes, kpss):
-        """Set detection data in lightweight in-memory cache."""
+        """Set detection data in lightweight in-memory cache with memory protection."""
+        # Clear cache if video changed
+        if self.current_video_hash != video_hash:
+            self._clear_light_cache()
+            self.current_video_hash = video_hash
+        
         if video_hash not in self.light_cache:
             self.light_cache[video_hash] = {}
+        
+        # Check if video has too many frames cached
+        if len(self.light_cache[video_hash]) >= self.light_cache_max_frames_per_video:
+            return  # Don't cache if video exceeds frame limit
         
         # Only cache bboxes and kpss (lightweight, no embeddings)
         self.light_cache[video_hash][frame_idx] = {
@@ -126,10 +138,34 @@ class Refacer:
             "kpss": kpss.copy() if kpss is not None else None
         }
         
-        # Evict old videos if cache is too large
-        if len(self.light_cache) > self.light_cache_max_videos:
-            oldest_key = next(iter(self.light_cache))
-            del self.light_cache[oldest_key]
+        # Estimate cache size and enforce memory limit
+        self._enforce_light_cache_memory_limit()
+    
+    def _estimate_light_cache_size_mb(self):
+        """Estimate current light cache size in MB."""
+        total_size = 0
+        for video_hash, frames in self.light_cache.items():
+            for frame_idx, data in frames.items():
+                # Estimate: bboxes (n_faces * 5 floats) + kpss (n_faces * 5 * 2 floats)
+                # Each float = 8 bytes
+                if data["bboxes"] is not None:
+                    total_size += data["bboxes"].nbytes
+                if data["kpss"] is not None:
+                    total_size += data["kpss"].nbytes
+        return total_size / (1024 * 1024)  # Convert to MB
+    
+    def _enforce_light_cache_memory_limit(self):
+        """Enforce memory limit by evicting oldest entries if needed."""
+        cache_size_mb = self._estimate_light_cache_size_mb()
+        
+        if cache_size_mb > self.light_cache_max_memory_mb:
+            print(f"[CACHE] Warning: Light cache at {cache_size_mb:.1f}MB, evicting oldest entries...")
+            
+            # Evict oldest videos until under limit
+            while cache_size_mb > self.light_cache_max_memory_mb * 0.8 and len(self.light_cache) > 0:
+                oldest_key = next(iter(self.light_cache))
+                del self.light_cache[oldest_key]
+                cache_size_mb = self._estimate_light_cache_size_mb()
     
     def _clear_light_cache(self, video_hash=None):
         """Clear lightweight cache for specific video or all videos."""
@@ -624,99 +660,6 @@ class Refacer:
         print(f"[ANALYSIS] Completed. Cached {total_frames} frames.")
         return metadata
 
-    def reface_lazy_cache(self, video_path, faces, output_path,
-                         preview=False, disable_similarity=False,
-                         multiple_faces_mode=False, partial_reface_ratio=0.0):
-        """Reface video with lazy in-memory caching (no eager preprocessing)."""
-        
-        # Prepare source faces
-        self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
-        self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
-        self.partial_reface_ratio = partial_reface_ratio
-        
-        # In-memory cache (no disk I/O)
-        frame_cache = {}
-        
-        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        output = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-        
-        batch_size = 300
-        frames = []
-        frame_index = 0
-        skip_rate = 10 if preview else 1
-        cache_hits = 0
-        cache_misses = 0
-        
-        with tqdm(total=total_frames, desc="Processing frames (lazy cache)") as pbar:
-            while cap.isOpened():
-                flag, frame = cap.read()
-                if not flag:
-                    break
-                
-                if frame_index % skip_rate != 0:
-                    frame_index += 1
-                    pbar.update()
-                    continue
-                
-                # Check in-memory cache
-                if frame_index in frame_cache:
-                    cached_data = frame_cache[frame_index]
-                    cache_hits += 1
-                    
-                    # Reconstruct Face objects from cache
-                    faces_in_frame = []
-                    for i in range(len(cached_data["bboxes"])):
-                        face = Face(
-                            bbox=cached_data["bboxes"][i],
-                            kps=cached_data["kpss"][i] if cached_data["kpss"] is not None and len(cached_data["kpss"]) > i else None,
-                            det_score=cached_data["bboxes"][i][4]
-                        )
-                        face.embedding = cached_data["embeddings"][i]
-                        faces_in_frame.append(face)
-                    
-                    processed_frame = self._process_faces_with_cached_data(frame, faces_in_frame)
-                else:
-                    cache_misses += 1
-                    # Process normally and cache result
-                    processed_frame = self.process_faces(frame) if not self.first_face else self.process_first_face(frame)
-                    
-                    # Cache the detection results for this frame
-                    detected_faces = self.__get_faces(frame, max_num=8)
-                    if detected_faces:
-                        frame_cache[frame_index] = {
-                            "bboxes": np.array([f.bbox for f in detected_faces]),
-                            "kpss": np.array([f.kps for f in detected_faces]) if detected_faces[0].kps is not None else None,
-                            "embeddings": [f.embedding for f in detected_faces]
-                        }
-                
-                frames.append(processed_frame)
-                
-                if len(frames) > batch_size:
-                    for f in frames:
-                        output.write(f)
-                    frames = []
-                    gc.collect()
-                
-                frame_index += 1
-                pbar.update()
-        
-        cap.release()
-        if frames:
-            for f in frames:
-                output.write(f)
-        output.release()
-        
-        print(f"[CACHE] Cache hits: {cache_hits}, misses: {cache_misses}")
-        
-        converted_path = self.__convert_video(video_path, output_path, preview=preview)
-        return converted_path
 
     def _process_faces_with_cached_data(self, frame, faces):
         """Process frame using pre-detected and pre-embedded faces (cached data)."""
@@ -1062,9 +1005,9 @@ class Refacer:
                     partial_reface_ratio=partial_reface_ratio
                 )
             elif duration_seconds < 30:
-                # Medium videos: use lazy in-memory cache (no disk I/O)
-                print(f"[CACHE] Using lazy in-memory cache for medium video ({duration_seconds:.1f}s)")
-                converted_path = self.reface_lazy_cache(
+                # Medium videos: use ultra-lightweight in-memory cache (detection only)
+                print(f"[LIGHT CACHE] Using ultra-lightweight in-memory cache for medium video ({duration_seconds:.1f}s)")
+                converted_path = self.reface_with_light_cache(
                     video_path, faces, output_video_path,
                     preview=preview,
                     disable_similarity=disable_similarity,
