@@ -78,8 +78,9 @@ class Refacer:
         # Ultra-lightweight in-memory cache for short videos
         self.light_cache = {}  # {video_hash: {frame_idx: {"bboxes": ..., "kpss": ...}}}
         self.light_cache_max_videos = 1  # Keep cache for current video only
-        self.light_cache_max_memory_mb = 500  # Max 500MB for light cache
-        self.light_cache_max_frames_per_video = 1000  # Max frames per video in cache
+        # Optimized for Tesla T4 (16GB VRAM) - increased limits for better cache hit rate
+        self.light_cache_max_memory_mb = 2000  # Max 2GB for light cache (was 500MB)
+        self.light_cache_max_frames_per_video = 5000  # Max frames per video in cache (was 1000)
         self.current_video_hash = None  # Track current video to clear cache on change
     
     def _profile_start(self, name):
@@ -257,10 +258,12 @@ class Refacer:
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        # Use H264 codec for better quality and compatibility with fallback
+        fourcc = self._get_optimal_video_codec()
         output = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
         
-        batch_size = 300
+        # Dynamic batch size based on VRAM
+        batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
         frames = []
         frame_index = 0
         skip_rate = 10 if preview else 1
@@ -331,6 +334,74 @@ class Refacer:
         # Conservative estimate if detection fails
         return 8.0  # Assume 8GB if unable to detect
 
+    def _calculate_optimal_batch_size(self, frame_width, frame_height, fps):
+        """Calculate optimal batch size based on VRAM availability and frame properties.
+        
+        Optimized for Tesla T4 (16GB VRAM) but works for any GPU.
+        """
+        try:
+            import torch
+            if torch.cuda.is_available():
+                # Get VRAM info
+                vram_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
+                vram_allocated = torch.cuda.memory_allocated(0) / (1024**3)  # GB
+                vram_available = vram_total - vram_allocated
+                
+                # Calculate frame size in MB (RGB)
+                frame_size_mb = (frame_width * frame_height * 3) / (1024**2)
+                
+                # Use 70% of available VRAM for frames
+                vram_for_frames = vram_available * 1024 * 0.7  # MB
+                max_frames_by_vram = int(vram_for_frames / frame_size_mb)
+                
+                # Also consider FPS (batch should represent 1-2 seconds of video)
+                min_frames_by_fps = max(fps, 30)  # At least 1 second
+                max_frames_by_fps = fps * 2  # At most 2 seconds
+                
+                # Apply hard limits
+                min_batch = 100
+                max_batch = 1000
+                
+                # Calculate final batch size
+                batch_size = min(max_frames_by_vram, max_frames_by_fps)
+                batch_size = max(min(batch_size, max_batch), min_batch)
+                
+                print(f"[BATCH] Dynamic batch size: {batch_size} (VRAM: {vram_available:.1f}GB, Frame: {frame_size_mb:.1f}MB)")
+                return batch_size
+        except Exception as e:
+            print(f"[BATCH] Failed to calculate dynamic batch size: {e}")
+        
+        # Fallback to conservative default
+        return 300
+
+    def _get_optimal_video_codec(self):
+        """Get optimal video codec for the system, prioritizing hardware acceleration."""
+        # Try H264 first (most compatible)
+        codecs_to_try = [
+            ('H264', cv2.VideoWriter_fourcc(*'H264')),
+            ('AVC1', cv2.VideoWriter_fourcc(*'AVC1')),
+            ('X264', cv2.VideoWriter_fourcc(*'X264')),
+            ('mp4v', cv2.VideoWriter_fourcc(*'mp4v'))  # Fallback
+        ]
+        
+        for codec_name, fourcc in codecs_to_try:
+            try:
+                # Test if codec works
+                test_writer = cv2.VideoWriter('test_codec.mp4', fourcc, 30, (640, 480))
+                if test_writer.isOpened():
+                    test_writer.release()
+                    if os.path.exists('test_codec.mp4'):
+                        os.remove('test_codec.mp4')
+                    print(f"[CODEC] Using {codec_name} for video encoding")
+                    return fourcc
+            except Exception as e:
+                print(f"[CODEC] {codec_name} not available: {e}")
+                continue
+        
+        # Ultimate fallback
+        print("[CODEC] Using mp4v as fallback")
+        return cv2.VideoWriter_fourcc(*'mp4v')
+
     def _partial_face_blend(self, original_frame, swapped_frame, face):
         h_frame, w_frame = original_frame.shape[:2]
     
@@ -392,15 +463,16 @@ class Refacer:
         if self.force_cpu:
             self.providers = ['CPUExecutionProvider']
         else:
-            # Prefer faster execution providers in order
+            # Prioritize CUDA for Tesla T4 optimization
             self.providers = []
-            for p in ['CoreMLExecutionProvider', 'CUDAExecutionProvider', 'CPUExecutionProvider']:
+            for p in ['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider']:
                 if p in available_providers:
                     self.providers.append(p)
 
         rt.set_default_logger_severity(4)
         self.sess_options = rt.SessionOptions()
-        self.sess_options.execution_mode = rt.ExecutionMode.ORT_PARALLEL
+        # Optimized for GPU: SEQUENTIAL mode is better for CUDA, PARALLEL for CPU
+        self.sess_options.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
         self.sess_options.graph_optimization_level = rt.GraphOptimizationLevel.ORT_ENABLE_ALL
 
         # Ensure buffalo_l model directory and det_10g.onnx are downloaded/available
@@ -736,7 +808,8 @@ class Refacer:
         
         # Setup video writer
         cap = cv2.VideoCapture(video_path)
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        # Use optimal codec for better quality and compatibility
+        fourcc = self._get_optimal_video_codec()
         output = cv2.VideoWriter(
             output_path, fourcc, 
             metadata["fps"], 
@@ -745,7 +818,8 @@ class Refacer:
         
         # Process frames using cached data
         total_frames = metadata["total_frames"]
-        batch_size = 300
+        # Dynamic batch size based on VRAM
+        batch_size = self._calculate_optimal_batch_size(metadata["width"], metadata["height"], metadata["fps"])
         frames = []
         skip_rate = 10 if preview else 1
         
@@ -1049,11 +1123,12 @@ class Refacer:
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            # Use optimal codec for better quality and compatibility
+            fourcc = self._get_optimal_video_codec()
             output = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
 
-            # Use fixed batch size for now - dynamic batch size may be causing performance issues
-            batch_size = 300
+            # Dynamic batch size based on VRAM
+            batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
 
             frames = []
             frame_index = 0
@@ -1217,18 +1292,21 @@ class Refacer:
         commandout = subprocess.run(command, check=True, capture_output=True).stdout
         result = commandout.decode('utf-8').split('\n')
         for r in result:
-            if "264" in r:
+            if "264" in r or "265" in r:
                 encoders = re.search(pattern, r)
                 if encoders:
+                    # Prioritize hardware encoders for Tesla T4
                     for v_c in Refacer.VIDEO_CODECS:
                         for v_k in encoders.group(1).split(' '):
                             if v_c == v_k and self.__try_ffmpeg_encoder(v_k):
                                 self.ffmpeg_video_encoder = v_k
                                 self.ffmpeg_video_bitrate = Refacer.VIDEO_CODECS[v_k]
+                                print(f"[FFMPEG] Using hardware encoder: {v_k}")
                                 return
 
     VIDEO_CODECS = {
-        'h264_videotoolbox': '0',
-        'h264_nvenc': '0',
-        'libx264': '0'
+        'h264_nvenc': '0',      # NVIDIA GPU encoder (Tesla T4) - highest priority
+        'hevc_nvenc': '0',      # NVIDIA H.265 encoder
+        'h264_videotoolbox': '0',  # Apple hardware encoder
+        'libx264': '0'          # Software encoder (fallback)
     }
