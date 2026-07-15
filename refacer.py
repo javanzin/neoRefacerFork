@@ -258,8 +258,9 @@ class Refacer:
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # Use H264 codec for better quality and compatibility with fallback
-        fourcc = self._get_optimal_video_codec()
+        # Use mp4v for OpenCV (H264 support is unreliable in OpenCV)
+        # FFmpeg will handle H264 encoding in __convert_video
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         output = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
         
         # Dynamic batch size based on VRAM
@@ -373,34 +374,6 @@ class Refacer:
         
         # Fallback to conservative default
         return 300
-
-    def _get_optimal_video_codec(self):
-        """Get optimal video codec for the system, prioritizing hardware acceleration."""
-        # Try H264 first (most compatible)
-        codecs_to_try = [
-            ('H264', cv2.VideoWriter_fourcc(*'H264')),
-            ('AVC1', cv2.VideoWriter_fourcc(*'AVC1')),
-            ('X264', cv2.VideoWriter_fourcc(*'X264')),
-            ('mp4v', cv2.VideoWriter_fourcc(*'mp4v'))  # Fallback
-        ]
-        
-        for codec_name, fourcc in codecs_to_try:
-            try:
-                # Test if codec works
-                test_writer = cv2.VideoWriter('test_codec.mp4', fourcc, 30, (640, 480))
-                if test_writer.isOpened():
-                    test_writer.release()
-                    if os.path.exists('test_codec.mp4'):
-                        os.remove('test_codec.mp4')
-                    print(f"[CODEC] Using {codec_name} for video encoding")
-                    return fourcc
-            except Exception as e:
-                print(f"[CODEC] {codec_name} not available: {e}")
-                continue
-        
-        # Ultimate fallback
-        print("[CODEC] Using mp4v as fallback")
-        return cv2.VideoWriter_fourcc(*'mp4v')
 
     def _partial_face_blend(self, original_frame, swapped_frame, face):
         h_frame, w_frame = original_frame.shape[:2]
@@ -808,8 +781,9 @@ class Refacer:
         
         # Setup video writer
         cap = cv2.VideoCapture(video_path)
-        # Use optimal codec for better quality and compatibility
-        fourcc = self._get_optimal_video_codec()
+        # Use mp4v for OpenCV (H264 support is unreliable in OpenCV)
+        # FFmpeg will handle H264 encoding in __convert_video
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         output = cv2.VideoWriter(
             output_path, fourcc, 
             metadata["fps"], 
@@ -1123,8 +1097,9 @@ class Refacer:
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            # Use optimal codec for better quality and compatibility
-            fourcc = self._get_optimal_video_codec()
+            # Use mp4v for OpenCV (H264 support is unreliable in OpenCV)
+            # FFmpeg will handle H264 encoding in __convert_video
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
             output = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
 
             # Dynamic batch size based on VRAM

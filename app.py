@@ -17,6 +17,29 @@ import ffmpeg
 
 print("\033[94m" + pyfiglet.Figlet(font='slant').renderText("NeoRefacer") + "\033[0m")
 
+# Video processing history
+video_history = []
+
+def get_video_history():
+    """Format video history for display"""
+    if not video_history:
+        return []
+    
+    formatted = []
+    for entry in video_history[-10:]:  # Show last 10 entries
+        formatted.append([
+            time.strftime('%H:%M:%S', time.localtime(entry['timestamp'])),
+            os.path.basename(entry['input_video']),
+            os.path.basename(entry['output_video']),
+            os.path.basename(entry['destination_face']) if entry['destination_face'] else 'N/A'
+        ])
+    return formatted
+
+def clear_video_history():
+    """Clear video history"""
+    video_history.clear()
+    return []
+
 def cleanup_temp(folder_path):
     try:
         shutil.rmtree(folder_path)
@@ -88,17 +111,44 @@ def run(*vars):
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
 
-    faces = []
+    # Handle multiple destination faces (queue processing)
+    results = []
     for k in range(num_faces):
-        if destinations[k] is not None:
-            faces.append({
+        dest_files = destinations[k]
+        
+        # Skip if no destination files provided
+        if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
+            continue
+            
+        # Convert single file to list for uniform processing
+        if not isinstance(dest_files, list):
+            dest_files = [dest_files]
+        
+        # Process each destination face in the queue
+        for dest_file in dest_files:
+            faces = [{
                 'origin': origins[k] if not multiple_faces_mode else None,
-                'destination': destinations[k],
+                'destination': dest_file,
                 'threshold': thresholds[k] if not multiple_faces_mode else 0.0
-            })
-
-    mp4_path, gif_path = refacer.reface(video_path, faces, preview=preview, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio, use_cache=use_cache)
-    return mp4_path, gif_path if gif_path else None
+            }]
+            
+            mp4_path, gif_path = refacer.reface(video_path, faces, preview=preview, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio, use_cache=use_cache)
+            results.append((mp4_path, gif_path))
+            
+            # Add to video history
+            if mp4_path:
+                video_history.append({
+                    'timestamp': int(time.time()),
+                    'input_video': video_path,
+                    'output_video': mp4_path,
+                    'destination_face': dest_file
+                })
+    
+    # Return the first result (or all results if needed)
+    if results:
+        return results[0][0], results[0][1] if results[0][1] else None
+    else:
+        return None, None
 
 def load_first_frame(filepath):
     if filepath is None:
@@ -157,7 +207,7 @@ def handle_tif_preview(filepath):
     return preview_path
 
 def rotate_video(video_path, direction):
-    """Rotate video 90 degrees in specified direction ('left' or 'right')"""
+    """Rotate video 90 degrees in specified direction ('left' or 'right') using stream copy (no quality loss)"""
     if video_path is None:
         return video_path
 
@@ -175,7 +225,7 @@ def rotate_video(video_path, direction):
         (
             ffmpeg
             .input(video_path)
-            .output(output_path, vf=rotation_filters[direction])
+            .output(output_path, vf=rotation_filters[direction], c="copy")
             .overwrite_output()
             .run(quiet=True)
         )
@@ -374,13 +424,36 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             preview_checkbox_video = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
             use_cache_video = gr.Checkbox(label="Enable Cache (Faster subsequent runs)", value=False)
 
+        # Video History Section
+        with gr.Accordion("📜 Video History", open=False):
+            history_display = gr.Dataframe(
+                label="Recent Video Swaps",
+                headers=["Time", "Input", "Output", "Destination"],
+                datatype=["str", "str", "str", "str"],
+                interactive=False
+            )
+            refresh_history_btn = gr.Button("🔄 Refresh History", variant="secondary")
+            clear_history_btn = gr.Button("🗑️ Clear History", variant="secondary")
+
+        refresh_history_btn.click(
+            fn=get_video_history,
+            inputs=[],
+            outputs=[history_display]
+        )
+
+        clear_history_btn.click(
+            fn=clear_video_history,
+            inputs=[],
+            outputs=[history_display]
+        )
+
         origin_video, destination_video, thresholds_video, face_tabs_video = [], [], [], []
 
         for i in range(num_faces):
             with gr.Tab(f"Face #{i+1}") as tab:
                 with gr.Row():
                     origin = gr.Image(label="Face to replace")
-                    destination = gr.Image(label="Destination face")
+                    destination = gr.Gallery(label="Destination face(s)", columns=4, height="auto", object_fit="contain")
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
             origin_video.append(origin)
             destination_video.append(destination)
@@ -448,10 +521,16 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             outputs=origin_video
         )
 
+        def run_with_history_update(*args):
+            video_result = run(*args)
+            # Update history display
+            history_data = get_video_history()
+            return video_result[0], video_result[1], history_data
+
         video_btn.click(
-            fn=lambda *args: run(*args),
+            fn=run_with_history_update,
             inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, use_cache_video],
-            outputs=[video_output, gr.File(visible=False)]
+            outputs=[video_output, gr.File(visible=False), history_display]
         )
 
     # --- System / Cache Settings (Global) ---
