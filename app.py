@@ -21,20 +21,63 @@ print("\033[94m" + pyfiglet.Figlet(font='slant').renderText("NeoRefacer") + "\03
 # Video processing history
 video_history = []
 
+def _resolve_history_path(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            resolved = _resolve_history_path(item)
+            if resolved:
+                return resolved
+        return None
+
+    if isinstance(value, dict):
+        for key in ("path", "name", "filepath", "file", "image"):
+            if key in value:
+                resolved = _resolve_history_path(value[key])
+                if resolved:
+                    return resolved
+        return None
+
+    if isinstance(value, str):
+        return value
+
+    return str(value)
+
 def get_video_history():
     """Format video history for display"""
     if not video_history:
-        return []
+        return ""
     
-    formatted = []
+    rows = []
     for entry in video_history[-10:]:  # Show last 10 entries
-        formatted.append([
-            time.strftime('%H:%M:%S', time.localtime(entry['timestamp'])),
-            os.path.basename(entry['input_video']),
-            os.path.basename(entry['output_video']),
-            os.path.basename(entry['destination_face']) if entry['destination_face'] else 'N/A'
-        ])
-    return formatted
+        input_video = _resolve_history_path(entry.get('input_video'))
+        output_video = _resolve_history_path(entry.get('output_video'))
+        destination_face = _resolve_history_path(entry.get('destination_face'))
+
+        input_label = os.path.basename(input_video) if input_video else 'N/A'
+        output_label = os.path.basename(output_video) if output_video else 'N/A'
+        destination_label = os.path.basename(destination_face) if destination_face else 'N/A'
+
+        input_link = f'<a href="file:///{input_video.replace("\\", "/")}" target="_blank">{input_label}</a>' if input_video else 'N/A'
+        output_link = f'<a href="file:///{output_video.replace("\\", "/")}" target="_blank">{output_label}</a>' if output_video else 'N/A'
+        destination_link = f'<a href="file:///{destination_face.replace("\\", "/")}" target="_blank">{destination_label}</a>' if destination_face else 'N/A'
+
+        rows.append(
+            f"<tr><td>{time.strftime('%H:%M:%S', time.localtime(entry['timestamp']))}</td>"
+            f"<td>{input_link}</td><td>{output_link}</td><td>{destination_link}</td></tr>"
+        )
+
+    return (
+        "<div style='overflow-x:auto;'>"
+        "<table style='width:100%; border-collapse:collapse;'>"
+        "<thead><tr><th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Time</th>"
+        "<th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Input</th>"
+        "<th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Output</th>"
+        "<th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Destination</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table></div>"
+    )
 
 def clear_video_history():
     """Clear video history"""
@@ -151,7 +194,7 @@ def run(*vars):
                     'timestamp': int(time.time()),
                     'input_video': video_path,
                     'output_video': mp4_path,
-                    'destination_face': dest_file
+                    'destination_face': destination_image
                 })
     
     # Return the first result (or all results if needed)
@@ -477,12 +520,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         # Video History Section
         with gr.Accordion("📜 Video History", open=False):
-            history_display = gr.Dataframe(
-                label="Recent Video Swaps",
-                headers=["Time", "Input", "Output", "Destination"],
-                datatype=["str", "str", "str", "str"],
-                interactive=False
-            )
+            history_display = gr.HTML(label="Recent Video Swaps")
             refresh_history_btn = gr.Button("🔄 Refresh History", variant="secondary")
             clear_history_btn = gr.Button("🗑️ Clear History", variant="secondary")
 
