@@ -141,6 +141,77 @@ def create_dummy_image():
     dummy.save(temp_file.name)
     return temp_file.name
 
+def load_first_frame(filepath):
+    if filepath is None:
+        return None
+    frames = imageio.get_reader(filepath)
+    return frames.get_data(0)
+
+def load_face_image(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            image = load_face_image(item)
+            if image is not None:
+                return image
+        return None
+
+    if isinstance(value, dict):
+        for key in ("image", "path", "name", "filepath", "file"):
+            if key in value:
+                image = load_face_image(value[key])
+                if image is not None:
+                    return image
+        return None
+
+    if isinstance(value, np.ndarray):
+        if value.ndim == 2:
+            return cv2.cvtColor(value, cv2.COLOR_GRAY2BGR)
+        if value.ndim == 3 and value.shape[2] == 4:
+            return cv2.cvtColor(value, cv2.COLOR_RGBA2BGR)
+        return value
+
+    if hasattr(value, "convert"):
+        return cv2.cvtColor(np.array(value.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+    if isinstance(value, str) and os.path.exists(value):
+        return cv2.imread(value)
+
+    return None
+
+def extract_faces_auto(filepath, refacer_instance, max_faces=5, isvideo=False):
+    if filepath is None:
+        return [None] * max_faces
+
+    if isvideo and os.path.getsize(filepath) > 5 * 1024 * 1024:
+        print("Video too large for auto-extract, skipping face extraction.")
+        return [None] * max_faces
+
+    frame = load_first_frame(filepath)
+    if frame is None:
+        return [None] * max_faces
+
+    while len(frame.shape) > 3:
+        frame = frame[0]
+
+    if frame.shape[-1] != 3:
+        raise ValueError(f"Expected last dimension to be 3 (RGB), but got {frame.shape[-1]}")
+
+    temp_image_path = os.path.join("./tmp", f"temp_face_extract_{int(time.time() * 1000)}.png")
+    Image.fromarray(frame).save(temp_image_path)
+
+    try:
+        faces = refacer_instance.extract_faces_from_image(temp_image_path, max_faces=max_faces)
+        return faces + [None] * (max_faces - len(faces))
+    finally:
+        if os.path.exists(temp_image_path):
+            try:
+                os.remove(temp_image_path)
+            except Exception as e:
+                print(f"Warning: Could not delete temp file {temp_image_path}: {e}")
+
 def run_image(*vars):
     image_path = vars[0]
     origins = vars[1:(num_faces+1)]
