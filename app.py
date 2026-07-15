@@ -45,6 +45,15 @@ def _resolve_history_path(value):
 
     return str(value)
 
+def _history_file_link(value):
+    path = _resolve_history_path(value)
+    if not path:
+        return None
+
+    normalized_path = path.replace("\\", "/")
+    label = os.path.basename(normalized_path)
+    return f'<a href="/gradio_api/file={normalized_path}" target="_blank" rel="noreferrer">{label}</a>'
+
 def get_video_history():
     """Format video history for display"""
     if not video_history:
@@ -52,37 +61,26 @@ def get_video_history():
     
     rows = []
     for entry in video_history[-10:]:  # Show last 10 entries
-        input_video = _resolve_history_path(entry.get('input_video'))
         output_video = _resolve_history_path(entry.get('output_video'))
-        destination_face = _resolve_history_path(entry.get('destination_face'))
-
-        input_label = os.path.basename(input_video) if input_video else 'N/A'
-        output_label = os.path.basename(output_video) if output_video else 'N/A'
-        destination_label = os.path.basename(destination_face) if destination_face else 'N/A'
-
-        input_link = f'<a href="file:///{input_video.replace("\\", "/")}" target="_blank">{input_label}</a>' if input_video else 'N/A'
-        output_link = f'<a href="file:///{output_video.replace("\\", "/")}" target="_blank">{output_label}</a>' if output_video else 'N/A'
-        destination_link = f'<a href="file:///{destination_face.replace("\\", "/")}" target="_blank">{destination_label}</a>' if destination_face else 'N/A'
+        output_link = _history_file_link(output_video) or 'N/A'
 
         rows.append(
-            f"<tr><td>{time.strftime('%H:%M:%S', time.localtime(entry['timestamp']))}</td>"
-            f"<td>{input_link}</td><td>{output_link}</td><td>{destination_link}</td></tr>"
+            f"<tr><td style='padding:6px; border-bottom:1px solid #eee;'>{time.strftime('%H:%M:%S', time.localtime(entry['timestamp']))}</td>"
+            f"<td style='padding:6px; border-bottom:1px solid #eee;'>{output_link}</td></tr>"
         )
 
     return (
         "<div style='overflow-x:auto;'>"
         "<table style='width:100%; border-collapse:collapse;'>"
         "<thead><tr><th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Time</th>"
-        "<th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Input</th>"
-        "<th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Output</th>"
-        "<th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Destination</th></tr></thead>"
+        "<th style='text-align:left; border-bottom:1px solid #ddd; padding:6px;'>Video Link</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table></div>"
     )
 
 def clear_video_history():
     """Clear video history"""
     video_history.clear()
-    return []
+    return ""
 
 def cleanup_temp(folder_path):
     try:
@@ -158,8 +156,8 @@ def run(*vars):
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
 
-    # Handle multiple destination faces (queue processing)
-    results = []
+    # Build a single face list so the video is processed once per run.
+    faces = []
     for k in range(num_faces):
         dest_files = destinations[k]
         
@@ -171,7 +169,6 @@ def run(*vars):
         if not isinstance(dest_files, list):
             dest_files = [dest_files]
         
-        # Process each destination face in the queue
         for dest_file in dest_files:
             destination_image = load_face_image(dest_file)
             origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
@@ -179,29 +176,34 @@ def run(*vars):
             if destination_image is None:
                 continue
 
-            faces = [{
+            faces.append({
                 'origin': origin_image,
                 'destination': destination_image,
                 'threshold': thresholds[k] if not multiple_faces_mode else 0.0
-            }]
-            
-            mp4_path, gif_path = refacer.reface(video_path, faces, preview=preview, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio, use_cache=use_cache)
-            results.append((mp4_path, gif_path))
-            
-            # Add to video history
-            if mp4_path:
-                video_history.append({
-                    'timestamp': int(time.time()),
-                    'input_video': video_path,
-                    'output_video': mp4_path,
-                    'destination_face': destination_image
-                })
-    
-    # Return the first result (or all results if needed)
-    if results:
-        return results[0][0], results[0][1] if results[0][1] else None
-    else:
+            })
+
+    if not faces:
         return None, None
+
+    mp4_path, gif_path = refacer.reface(
+        video_path,
+        faces,
+        preview=preview,
+        disable_similarity=disable_similarity,
+        multiple_faces_mode=multiple_faces_mode,
+        partial_reface_ratio=partial_reface_ratio,
+        use_cache=use_cache
+    )
+
+    if mp4_path:
+        video_history.append({
+            'timestamp': int(time.time()),
+            'input_video': video_path,
+            'output_video': mp4_path,
+            'destination_face': _resolve_history_path(destinations[0]) if destinations and destinations[0] is not None else None
+        })
+
+    return mp4_path, gif_path if gif_path else None
 
 def load_first_frame(filepath):
     if filepath is None:
