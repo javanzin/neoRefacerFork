@@ -83,6 +83,12 @@ class Refacer:
         self.light_cache_max_memory_mb = 2000  # Max 2GB for light cache (was 500MB)
         self.light_cache_max_frames_per_video = 5000  # Max frames per video in cache (was 1000)
         self.current_video_hash = None  # Track current video to clear cache on change
+
+        # Decoded-frame cache: avoids re-reading/re-decoding the same video from disk
+        # when multiple target faces are processed in the same run (one job per face).
+        self.frame_cache = {}  # {video_hash: list[np.ndarray]}
+        self.frame_cache_video_hash = None
+        self.frame_cache_max_memory_mb = 4000  # Max 4GB of raw decoded frames
     
     def _profile_start(self, name):
         """Start profiling a section."""
@@ -176,6 +182,33 @@ class Refacer:
                 del self.light_cache[video_hash]
         else:
             self.light_cache.clear()
+
+    def _get_cached_frames(self, video_hash):
+        """Return the decoded frames for this video if fully cached in RAM, else None."""
+        if self.frame_cache_video_hash == video_hash and video_hash in self.frame_cache:
+            return self.frame_cache[video_hash]
+        return None
+
+    def _store_cached_frames(self, video_hash, frames):
+        """Store fully decoded frames in RAM, keyed by video hash.
+
+        Only one video is kept at a time: when multiple target faces are reused
+        against the same video (one job per face), later jobs skip re-reading and
+        re-decoding the file from disk entirely.
+        """
+        estimated_mb = sum(f.nbytes for f in frames) / (1024 * 1024)
+        if estimated_mb > self.frame_cache_max_memory_mb:
+            print(f"[FRAME CACHE] Skipping cache: {estimated_mb:.0f}MB exceeds "
+                  f"{self.frame_cache_max_memory_mb}MB limit")
+            return
+
+        self.frame_cache = {video_hash: frames}
+        self.frame_cache_video_hash = video_hash
+        print(f"[FRAME CACHE] Cached {len(frames)} decoded frames ({estimated_mb:.0f}MB) for reuse")
+
+    def _clear_frame_cache(self):
+        self.frame_cache = {}
+        self.frame_cache_video_hash = None
     
     def __get_faces_with_light_cache(self, frame, video_hash, frame_idx, max_num=8):
         """Get faces with lightweight in-memory cache for detection only."""
@@ -250,73 +283,100 @@ class Refacer:
         
         # Compute video hash for cache key
         video_hash = self._compute_video_hash(video_path)
-        
-        # Setup video writer
-        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
+
+        # Reuse already-decoded frames when the same video was just processed for
+        # another target face (one job per face, same run) — skips disk I/O + decode.
+        cached_frames = self._get_cached_frames(video_hash)
+
+        if cached_frames is not None:
+            cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
+            total_frames = len(cached_frames)
+            print(f"[FRAME CACHE] Reusing {total_frames} decoded frames, skipping video re-read")
+        else:
+            cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
         # Use mp4v for OpenCV (H264 support is unreliable in OpenCV)
         # FFmpeg will handle H264 encoding in __convert_video
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         output = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-        
+
         # Dynamic batch size based on VRAM
         batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
         frames = []
+        decoded_frames = [] if cached_frames is None else None
         frame_index = 0
         skip_rate = 10 if preview else 1
         cache_hits = 0
         cache_misses = 0
-        
+
         start_total = self._profile_start("total_processing")
-        
+
+        def _frame_source():
+            if cached_frames is not None:
+                for f in cached_frames:
+                    yield True, f
+            else:
+                while cap.isOpened():
+                    yield cap.read()
+
         with tqdm(total=total_frames, desc="Processing frames (light cache)") as pbar:
-            while cap.isOpened():
-                flag, frame = cap.read()
+            for flag, frame in _frame_source():
                 if not flag:
                     break
-                
+
+                if decoded_frames is not None:
+                    decoded_frames.append(frame)
+
                 if frame_index % skip_rate != 0:
                     frame_index += 1
                     pbar.update()
                     continue
-                
+
                 # Use light cache for detection
                 faces_in_frame = self.__get_faces_with_light_cache(frame, video_hash, frame_index, max_num=8)
-                
+
                 # Track cache hits/misses
                 if self._get_light_cache(video_hash, frame_index) is not None:
                     cache_hits += 1
                 else:
                     cache_misses += 1
-                
+
                 # Process faces
                 if not faces_in_frame:
                     processed_frame = frame
                 else:
                     processed_frame = self._process_faces_with_cached_data(frame, faces_in_frame)
-                
+
                 frames.append(processed_frame)
-                
+
                 if len(frames) > batch_size:
                     for f in frames:
                         output.write(f)
                     frames = []
                     gc.collect()
-                
+
                 frame_index += 1
                 pbar.update()
-        
-        cap.release()
+
+        if cached_frames is None:
+            cap.release()
         if frames:
             for f in frames:
                 output.write(f)
         output.release()
-        
+
+        if decoded_frames:
+            self._store_cached_frames(video_hash, decoded_frames)
+
         self._profile_end("total_processing", start_total)
         
         print(f"[LIGHT CACHE] Cache hits: {cache_hits}, misses: {cache_misses}")
@@ -608,6 +668,9 @@ class Refacer:
         for k in keys_to_remove:
             del self.light_cache[k]
             print(f"[CACHE] Automatically cleaned up in-memory cache for video: {k[:8]}...")
+
+        if self.frame_cache_video_hash is not None and self.frame_cache_video_hash != current_hash:
+            self._clear_frame_cache()
 
     def analyze_target_video(self, video_path, max_num_faces=8, force_reanalyze=False, cache_embeddings=True):
         """Analyze target video and cache face detection and embedding results.
