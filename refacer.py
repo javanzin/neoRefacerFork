@@ -718,13 +718,17 @@ class Refacer:
         return metadata
 
 
-    def _process_faces_with_cached_data(self, frame, faces):
-        """Process frame using pre-detected and pre-embedded faces (cached data)."""
+    def _apply_swaps(self, frame, faces):
+        """Apply face swaps to an already-detected+embedded list of faces.
+
+        Shared by the cached and non-cached processing paths so a fix to the
+        matching logic only needs to happen in one place.
+        """
         if not faces:
             return frame
-        
+
         faces = sorted(faces, key=lambda face: face.bbox[0])
-        
+
         if self.multiple_faces_mode:
             for idx, face in enumerate(faces):
                 if idx >= len(self.replacement_faces):
@@ -736,13 +740,24 @@ class Refacer:
                 else:
                     frame = swapped
         elif self.disable_similarity:
-            for face in faces:
-                swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
-                if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                    self.blend_height_ratio = self.partial_reface_ratio
-                    frame = self._partial_face_blend(frame, swapped, face)
-                else:
-                    frame = swapped
+            if len(self.replacement_faces) > 1:
+                for idx, face in enumerate(faces):
+                    if idx >= len(self.replacement_faces):
+                        break
+                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
+                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                        self.blend_height_ratio = self.partial_reface_ratio
+                        frame = self._partial_face_blend(frame, swapped, face)
+                    else:
+                        frame = swapped
+            else:
+                for face in faces:
+                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
+                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                        self.blend_height_ratio = self.partial_reface_ratio
+                        frame = self._partial_face_blend(frame, swapped, face)
+                    else:
+                        frame = swapped
         else:
             for rep_face in self.replacement_faces:
                 for i in range(len(faces) - 1, -1, -1):
@@ -757,6 +772,10 @@ class Refacer:
                         del faces[i]
                         break
         return frame
+
+    def _process_faces_with_cached_data(self, frame, faces):
+        """Process frame using pre-detected and pre-embedded faces (cached data)."""
+        return self._apply_swaps(frame, faces)
 
     def reface_with_cache(self, video_path, faces, output_path, 
                           preview=False, disable_similarity=False,
@@ -945,52 +964,9 @@ class Refacer:
         faces = self.__get_faces(frame, max_num=8)
         if not faces:
             return frame
- 
-        faces = sorted(faces, key=lambda face: face.bbox[0])
- 
+
         start_swap = self._profile_start("face_swap")
-        if self.multiple_faces_mode:
-            for idx, face in enumerate(faces):
-                if idx >= len(self.replacement_faces):
-                    break
-                swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
-                if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                    self.blend_height_ratio = self.partial_reface_ratio
-                    frame = self._partial_face_blend(frame, swapped, face)
-                else:
-                    frame = swapped
-        elif self.disable_similarity:
-            if len(self.replacement_faces) > 1:
-                for idx, face in enumerate(faces):
-                    if idx >= len(self.replacement_faces):
-                        break
-                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
-                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                        self.blend_height_ratio = self.partial_reface_ratio
-                        frame = self._partial_face_blend(frame, swapped, face)
-                    else:
-                        frame = swapped
-            else:
-                for face in faces:
-                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
-                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                        self.blend_height_ratio = self.partial_reface_ratio
-                        frame = self._partial_face_blend(frame, swapped, face)
-                    else:
-                        frame = swapped
-        else:
-            for rep_face in self.replacement_faces:
-                for i in range(len(faces) - 1, -1, -1):
-                    sim = self.rec_app.compute_sim(rep_face[0], faces[i].embedding)
-                    if sim >= rep_face[2]:
-                        swapped = self.face_swapper.get(frame, faces[i], rep_face[1], paste_back=True)
-                        if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                            self.blend_height_ratio = self.partial_reface_ratio
-                            frame = self._partial_face_blend(frame, swapped, faces[i])
-                        else:
-                            frame = swapped
-                        del faces[i]
-                        break
+        frame = self._apply_swaps(frame, faces)
         self._profile_end("face_swap", start_swap)
         return frame
 
