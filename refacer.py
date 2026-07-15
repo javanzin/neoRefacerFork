@@ -927,21 +927,7 @@ class Refacer:
         return ret
 
     def process_first_face(self, frame):
-        faces = self.__get_faces(frame, max_num=8)
-        if not faces:
-            return frame
-
-        start_swap = self._profile_start("face_swap")
-        if self.disable_similarity:
-            for face in faces:
-                swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
-                if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                    self.blend_height_ratio = self.partial_reface_ratio
-                    frame = self._partial_face_blend(frame, swapped, face)
-                else:
-                    frame = swapped
-        self._profile_end("face_swap", start_swap)
-        return frame
+        return self.process_faces(frame)
 
     def process_faces(self, frame):
         faces = self.__get_faces(frame, max_num=8)
@@ -962,13 +948,24 @@ class Refacer:
                 else:
                     frame = swapped
         elif self.disable_similarity:
-            for face in faces:
-                swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
-                if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                    self.blend_height_ratio = self.partial_reface_ratio
-                    frame = self._partial_face_blend(frame, swapped, face)
-                else:
-                    frame = swapped
+            if len(self.replacement_faces) > 1:
+                for idx, face in enumerate(faces):
+                    if idx >= len(self.replacement_faces):
+                        break
+                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
+                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                        self.blend_height_ratio = self.partial_reface_ratio
+                        frame = self._partial_face_blend(frame, swapped, face)
+                    else:
+                        frame = swapped
+            else:
+                for face in faces:
+                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
+                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                        self.blend_height_ratio = self.partial_reface_ratio
+                        frame = self._partial_face_blend(frame, swapped, face)
+                    else:
+                        frame = swapped
         else:
             for rep_face in self.replacement_faces:
                 for i in range(len(faces) - 1, -1, -1):
@@ -996,13 +993,24 @@ class Refacer:
                 results = list(tqdm(executor.map(self.process_faces, frames), total=len(frames), desc="Processing frames"))
             for result in results:
                 output.write(result)
-
-    def __check_video_has_audio(self, video_path):
-        self.video_has_audio = False
-        probe = ffmpeg.probe(video_path)
-        audio_stream = next((stream for stream in probe['streams'] if stream['codec_type'] == 'audio'), None)
-        if audio_stream is not None:
-            self.video_has_audio = True
+                            if len(self.replacement_faces) > 1:
+                                for idx, face in enumerate(faces):
+                                    if idx >= len(self.replacement_faces):
+                                        break
+                                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
+                                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                                        self.blend_height_ratio = self.partial_reface_ratio
+                                        frame = self._partial_face_blend(frame, swapped, face)
+                                    else:
+                                        frame = swapped
+                            else:
+                                for face in faces:
+                                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
+                                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                                        self.blend_height_ratio = self.partial_reface_ratio
+                                        frame = self._partial_face_blend(frame, swapped, face)
+                                    else:
+                                        frame = swapped
 
     def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, use_cache=False):
         """Reface video with optional caching for faster subsequent runs.
