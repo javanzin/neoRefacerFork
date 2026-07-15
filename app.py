@@ -166,6 +166,34 @@ def run_image(*vars):
 
     return refacer.reface_image(image_path, faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
 
+def _build_video_faces(origins, destinations, thresholds, multiple_faces_mode):
+    faces = []
+
+    for k in range(num_faces):
+        dest_files = destinations[k]
+
+        if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
+            continue
+
+        origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
+
+        if not isinstance(dest_files, list):
+            dest_files = [dest_files]
+
+        for dest_file in dest_files:
+            destination_image = load_face_image(dest_file)
+
+            if destination_image is None:
+                continue
+
+            faces.append({
+                'origin': origin_image,
+                'destination': destination_image,
+                'threshold': thresholds[k] if not multiple_faces_mode else 0.0
+            })
+
+    return faces
+
 def run(*vars):
     video_path = vars[0]
     origins = vars[1:(num_faces+1)]
@@ -179,146 +207,42 @@ def run(*vars):
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
 
-    # Build a lightweight queue with one job per destination face.
-    jobs = []
-    for k in range(num_faces):
-        dest_files = destinations[k]
-        
-        # Skip if no destination files provided
-        if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
-            continue
+    faces = _build_video_faces(origins, destinations, thresholds, multiple_faces_mode)
 
-        origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
-            
-        # Convert single file to list for uniform processing
-        if not isinstance(dest_files, list):
-            dest_files = [dest_files]
-        
-        for dest_file in dest_files:
-            destination_image = load_face_image(dest_file)
-
-            if destination_image is None:
-                continue
-
-            jobs.append({
-                'face': {
-                    'origin': origin_image,
-                    'destination': destination_image,
-                    'threshold': thresholds[k] if not multiple_faces_mode else 0.0
-                },
-                'destination_label': _resolve_history_path(dest_file)
-            })
-
-    if not jobs:
+    if not faces:
         return None, None
 
-    last_mp4_path = None
-    last_gif_path = None
+    destination_labels = []
+    for dest_group in destinations:
+        if dest_group is None:
+            continue
+        if not isinstance(dest_group, list):
+            dest_group = [dest_group]
+        for dest_file in dest_group:
+            label = _resolve_history_path(dest_file)
+            if label:
+                destination_labels.append(label)
 
-    for job in jobs:
-        mp4_path, gif_path = refacer.reface(
-            video_path,
-            [job['face']],
-            preview=preview,
-            disable_similarity=disable_similarity,
-            multiple_faces_mode=multiple_faces_mode,
-            partial_reface_ratio=partial_reface_ratio,
-            use_cache=use_cache
-        )
+    mp4_path, gif_path = refacer.reface(
+        video_path,
+        faces,
+        preview=preview,
+        disable_similarity=disable_similarity,
+        multiple_faces_mode=multiple_faces_mode,
+        partial_reface_ratio=partial_reface_ratio,
+        use_cache=use_cache
+    )
 
-        if mp4_path:
-            history_video_path = _copy_history_video(mp4_path)
+    if mp4_path:
+        history_video_path = _copy_history_video(mp4_path)
+        video_history.append({
+            'timestamp': int(time.time()),
+            'input_video': video_path,
+            'output_video': history_video_path,
+            'destination_face': ', '.join(destination_labels) if destination_labels else 'Multiple faces'
+        })
 
-            video_history.append({
-                'timestamp': int(time.time()),
-                'input_video': video_path,
-                'output_video': history_video_path,
-                'destination_face': job['destination_label']
-            })
-
-        last_mp4_path = mp4_path
-        last_gif_path = gif_path
-
-    return last_mp4_path, last_gif_path if last_gif_path else None
-
-def load_first_frame(filepath):
-    if filepath is None:
-        return None
-    frames = imageio.get_reader(filepath)
-    return frames.get_data(0)
-
-def load_face_image(value):
-    if value is None:
-        return None
-
-    if isinstance(value, (list, tuple)):
-        for item in value:
-            image = load_face_image(item)
-            if image is not None:
-                return image
-        return None
-
-    if isinstance(value, dict):
-        for key in ("image", "path", "name", "filepath", "file"):
-            if key in value:
-                image = load_face_image(value[key])
-                if image is not None:
-                    return image
-        return None
-
-    if isinstance(value, np.ndarray):
-        if value.ndim == 2:
-            return cv2.cvtColor(value, cv2.COLOR_GRAY2BGR)
-        if value.ndim == 3 and value.shape[2] == 4:
-            return cv2.cvtColor(value, cv2.COLOR_RGBA2BGR)
-        return value
-
-    if hasattr(value, "convert"):
-        return cv2.cvtColor(np.array(value.convert("RGB")), cv2.COLOR_RGB2BGR)
-
-    if isinstance(value, str) and os.path.exists(value):
-        return cv2.imread(value)
-
-    return None
-
-def extract_faces_auto(filepath, refacer_instance, max_faces=5, isvideo=False):
-    if filepath is None:
-        return [None] * max_faces
-
-    if isvideo and os.path.getsize(filepath) > 5 * 1024 * 1024:
-        print("Video too large for auto-extract, skipping face extraction.")
-        return [None] * max_faces
-
-    frame = load_first_frame(filepath)
-    if frame is None:
-        return [None] * max_faces
-
-    while len(frame.shape) > 3:
-        frame = frame[0]
-
-    if frame.shape[-1] != 3:
-        raise ValueError(f"Expected last dimension to be 3 (RGB), but got {frame.shape[-1]}")
-
-    temp_image_path = os.path.join("./tmp", f"temp_face_extract_{int(time.time() * 1000)}.png")
-    Image.fromarray(frame).save(temp_image_path)
-
-    try:
-        faces = refacer_instance.extract_faces_from_image(temp_image_path, max_faces=max_faces)
-        return faces + [None] * (max_faces - len(faces))
-    finally:
-        if os.path.exists(temp_image_path):
-            try:
-                os.remove(temp_image_path)
-            except Exception as e:
-                print(f"Warning: Could not delete temp file {temp_image_path}: {e}")
-
-def toggle_tabs_and_faces(mode, face_tabs, origin_faces):
-    if mode == "Single Face":
-        tab_updates = [gr.update(visible=(i == 0)) for i in range(len(face_tabs))]
-        origin_updates = [gr.update(visible=False) for _ in range(len(origin_faces))]
-    elif mode == "Multiple Faces":
-        tab_updates = [gr.update(visible=True) for _ in range(len(face_tabs))]
-        origin_updates = [gr.update(visible=False) for _ in range(len(origin_faces))]
+    return mp4_path, gif_path
     else:
         tab_updates = [gr.update(visible=True) for _ in range(len(face_tabs))]
         origin_updates = [gr.update(visible=True) for _ in range(len(origin_faces))]
