@@ -245,7 +245,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             gif_btn = gr.Button("Reface GIF", variant="primary")
             with gr.Column():
                 preview_checkbox_gif = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
-                use_cache_gif = gr.Checkbox(label="Enable Cache (Faster subsequent runs)", value=True)
+                use_cache_gif = gr.Checkbox(label="Enable Cache (Faster subsequent runs)", value=False)
 
         origin_gif, destination_gif, thresholds_gif, face_tabs_gif = [], [], [], []
 
@@ -372,7 +372,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         with gr.Row():
             preview_checkbox_video = gr.Checkbox(label="Preview Generation (skip 90% of frames)", value=False)
-            use_cache_video = gr.Checkbox(label="Enable Cache (Faster subsequent runs)", value=True)
+            use_cache_video = gr.Checkbox(label="Enable Cache (Faster subsequent runs)", value=False)
 
         origin_video, destination_video, thresholds_video, face_tabs_video = [], [], [], []
 
