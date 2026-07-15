@@ -156,14 +156,16 @@ def run(*vars):
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
 
-    # Build a single face list so the video is processed once per run.
-    faces = []
+    # Build a lightweight queue with one job per destination face.
+    jobs = []
     for k in range(num_faces):
         dest_files = destinations[k]
         
         # Skip if no destination files provided
         if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
             continue
+
+        origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
             
         # Convert single file to list for uniform processing
         if not isinstance(dest_files, list):
@@ -171,39 +173,48 @@ def run(*vars):
         
         for dest_file in dest_files:
             destination_image = load_face_image(dest_file)
-            origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
 
             if destination_image is None:
                 continue
 
-            faces.append({
-                'origin': origin_image,
-                'destination': destination_image,
-                'threshold': thresholds[k] if not multiple_faces_mode else 0.0
+            jobs.append({
+                'face': {
+                    'origin': origin_image,
+                    'destination': destination_image,
+                    'threshold': thresholds[k] if not multiple_faces_mode else 0.0
+                },
+                'destination_label': _resolve_history_path(dest_file)
             })
 
-    if not faces:
+    if not jobs:
         return None, None
 
-    mp4_path, gif_path = refacer.reface(
-        video_path,
-        faces,
-        preview=preview,
-        disable_similarity=disable_similarity,
-        multiple_faces_mode=multiple_faces_mode,
-        partial_reface_ratio=partial_reface_ratio,
-        use_cache=use_cache
-    )
+    last_mp4_path = None
+    last_gif_path = None
 
-    if mp4_path:
-        video_history.append({
-            'timestamp': int(time.time()),
-            'input_video': video_path,
-            'output_video': mp4_path,
-            'destination_face': _resolve_history_path(destinations[0]) if destinations and destinations[0] is not None else None
-        })
+    for job in jobs:
+        mp4_path, gif_path = refacer.reface(
+            video_path,
+            [job['face']],
+            preview=preview,
+            disable_similarity=disable_similarity,
+            multiple_faces_mode=multiple_faces_mode,
+            partial_reface_ratio=partial_reface_ratio,
+            use_cache=use_cache
+        )
 
-    return mp4_path, gif_path if gif_path else None
+        if mp4_path:
+            video_history.append({
+                'timestamp': int(time.time()),
+                'input_video': video_path,
+                'output_video': mp4_path,
+                'destination_face': job['destination_label']
+            })
+
+        last_mp4_path = mp4_path
+        last_gif_path = gif_path
+
+    return last_mp4_path, last_gif_path if last_gif_path else None
 
 def load_first_frame(filepath):
     if filepath is None:
