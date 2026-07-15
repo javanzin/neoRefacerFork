@@ -50,7 +50,7 @@ def _history_file_link(value):
     if not path:
         return None
 
-    normalized_path = path.replace("\\", "/")
+    normalized_path = os.path.abspath(path).replace("\\", "/")
     label = os.path.basename(normalized_path)
     return f'<a href="/gradio_api/file={normalized_path}" target="_blank" rel="noreferrer">{label}</a>'
 
