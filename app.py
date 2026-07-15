@@ -16,6 +16,8 @@ import shutil
 import time
 import ffmpeg
 from urllib.parse import quote
+from gradio.processing_utils import save_file_to_cache
+from gradio.utils import get_upload_folder
 
 print("\033[94m" + pyfiglet.Figlet(font='slant').renderText("NeoRefacer") + "\033[0m")
 
@@ -46,35 +48,25 @@ def _resolve_history_path(value):
 
     return str(value)
 
-def _history_file_link(value):
-    path = _resolve_history_path(value)
-    if not path:
-        return None
+def _gradio_file_url(path):
+    """Build the exact same '/gradio_api/file=...' URL the gr.Video preview player uses.
 
-    normalized_path = os.path.abspath(path).replace("\\", "/")
-    label = os.path.basename(normalized_path)
-    return f'<a href="/gradio_api/file={quote(normalized_path, safe="/:._-")}" target="_blank" rel="noreferrer">{label}</a>'
+    gr.Video copies its output into GRADIO_CACHE before serving it, and the file
+    endpoint only allows paths inside that cache (or explicit allowed_paths).
+    A link built straight from the raw output/ path 403s and Chrome shows it as
+    a corrupted video, so we run the file through the same cache step here.
+    """
+    cached_path = save_file_to_cache(path, cache_dir=get_upload_folder())
+    normalized_path = os.path.abspath(cached_path).replace("\\", "/")
+    return f"/gradio_api/file={quote(normalized_path, safe='/:._-')}"
 
 def _history_file_link_with_label(value, label):
     path = _resolve_history_path(value)
-    if not path:
+    if not path or not os.path.exists(path):
         return None
 
-    normalized_path = os.path.abspath(path).replace("\\", "/")
-    return f'<a href="/gradio_api/file={quote(normalized_path, safe="/:._-")}" target="_blank" rel="noreferrer">{label}</a>'
-
-def _copy_history_video(video_path):
-    resolved_path = _resolve_history_path(video_path)
-    if not resolved_path or not os.path.exists(resolved_path):
-        return resolved_path
-
-    history_dir = os.path.join("./tmp", "history")
-    os.makedirs(history_dir, exist_ok=True)
-
-    history_name = f"{int(time.time() * 1000)}_{os.path.basename(resolved_path)}"
-    history_path = os.path.join(history_dir, history_name)
-    shutil.copy2(resolved_path, history_path)
-    return history_path
+    url = _gradio_file_url(path)
+    return f'<a href="{url}" target="_blank" rel="noreferrer">{label}</a>'
 
 def get_video_history():
     """Format video history for display"""
@@ -237,16 +229,40 @@ def run_image(*vars):
 
     return refacer.reface_image(image_path, faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
 
-def _build_video_faces(origins, destinations, thresholds, multiple_faces_mode):
-    faces = []
+def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode):
+    """Build one job per destination face, keeping Multiple Faces as a single combined job."""
+    if multiple_faces_mode:
+        # All destination faces are swapped together, by position, in one video.
+        faces = []
+        labels = []
+        for k in range(num_faces):
+            dest_files = destinations[k]
+            if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
+                continue
+            if not isinstance(dest_files, list):
+                dest_files = [dest_files]
+            for dest_file in dest_files:
+                destination_image = load_face_image(dest_file)
+                if destination_image is None:
+                    continue
+                faces.append({'origin': None, 'destination': destination_image, 'threshold': 0.0})
+                label = _resolve_history_path(dest_file)
+                if label:
+                    labels.append(label)
 
+        if not faces:
+            return []
+        return [{'faces': faces, 'label': ', '.join(labels) if labels else 'Multiple faces'}]
+
+    # Single Face / Faces By Match: one independent job per destination face.
+    jobs = []
     for k in range(num_faces):
         dest_files = destinations[k]
 
         if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
             continue
 
-        origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
+        origin_image = load_face_image(origins[k])
 
         if not isinstance(dest_files, list):
             dest_files = [dest_files]
@@ -257,13 +273,17 @@ def _build_video_faces(origins, destinations, thresholds, multiple_faces_mode):
             if destination_image is None:
                 continue
 
-            faces.append({
-                'origin': origin_image,
-                'destination': destination_image,
-                'threshold': thresholds[k] if not multiple_faces_mode else 0.0
+            label = _resolve_history_path(dest_file)
+            jobs.append({
+                'faces': [{
+                    'origin': origin_image,
+                    'destination': destination_image,
+                    'threshold': thresholds[k]
+                }],
+                'label': label or f'Face #{k + 1}'
             })
 
-    return faces
+    return jobs
 
 def run(*vars):
     video_path = vars[0]
@@ -278,42 +298,37 @@ def run(*vars):
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
 
-    faces = _build_video_faces(origins, destinations, thresholds, multiple_faces_mode)
+    jobs = _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode)
 
-    if not faces:
-        return None, None
+    if not jobs:
+        yield None, None
+        return
 
-    destination_labels = []
-    for dest_group in destinations:
-        if dest_group is None:
-            continue
-        if not isinstance(dest_group, list):
-            dest_group = [dest_group]
-        for dest_file in dest_group:
-            label = _resolve_history_path(dest_file)
-            if label:
-                destination_labels.append(label)
+    last_mp4_path, last_gif_path = None, None
 
-    mp4_path, gif_path = refacer.reface(
-        video_path,
-        faces,
-        preview=preview,
-        disable_similarity=disable_similarity,
-        multiple_faces_mode=multiple_faces_mode,
-        partial_reface_ratio=partial_reface_ratio,
-        use_cache=use_cache
-    )
+    for job in jobs:
+        mp4_path, gif_path = refacer.reface(
+            video_path,
+            job['faces'],
+            preview=preview,
+            disable_similarity=disable_similarity,
+            multiple_faces_mode=multiple_faces_mode,
+            partial_reface_ratio=partial_reface_ratio,
+            use_cache=use_cache
+        )
 
-    if mp4_path:
-        history_video_path = _copy_history_video(mp4_path)
-        video_history.append({
-            'timestamp': int(time.time()),
-            'input_video': video_path,
-            'output_video': history_video_path,
-            'destination_face': ', '.join(destination_labels) if destination_labels else 'Multiple faces'
-        })
+        if mp4_path:
+            # Record the exact same path Gradio serves for the preview player,
+            # so the history link always matches a video that actually opens.
+            video_history.append({
+                'timestamp': int(time.time()),
+                'input_video': video_path,
+                'output_video': mp4_path,
+                'destination_face': job['label']
+            })
 
-    return mp4_path, gif_path
+        last_mp4_path, last_gif_path = mp4_path, gif_path
+        yield last_mp4_path, last_gif_path
 
 def toggle_tabs_and_faces(mode, face_tabs, origin_faces):
     if mode == "Single Face":
@@ -652,10 +667,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         )
 
         def run_with_history_update(*args):
-            video_result = run(*args)
-            # Update history display
-            history_data = get_video_history()
-            return video_result[0], video_result[1], history_data
+            for mp4_path, gif_path in run(*args):
+                yield mp4_path, gif_path, get_video_history()
 
         video_btn.click(
             fn=run_with_history_update,
