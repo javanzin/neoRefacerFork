@@ -6,6 +6,7 @@ from refacer import Refacer
 import argparse
 import ngrok
 import imageio
+import cv2
 import numpy as np
 from PIL import Image
 import tempfile
@@ -89,10 +90,13 @@ def run_image(*vars):
 
     faces = []
     for k in range(num_faces):
-        if destinations[k] is not None:
+        destination_image = load_face_image(destinations[k])
+        origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
+
+        if destination_image is not None:
             faces.append({
-                'origin': origins[k] if not multiple_faces_mode else None,
-                'destination': destinations[k],
+                'origin': origin_image,
+                'destination': destination_image,
                 'threshold': thresholds[k] if not multiple_faces_mode else 0.0
             })
 
@@ -126,9 +130,15 @@ def run(*vars):
         
         # Process each destination face in the queue
         for dest_file in dest_files:
+            destination_image = load_face_image(dest_file)
+            origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
+
+            if destination_image is None:
+                continue
+
             faces = [{
-                'origin': origins[k] if not multiple_faces_mode else None,
-                'destination': dest_file,
+                'origin': origin_image,
+                'destination': destination_image,
                 'threshold': thresholds[k] if not multiple_faces_mode else 0.0
             }]
             
@@ -155,6 +165,40 @@ def load_first_frame(filepath):
         return None
     frames = imageio.get_reader(filepath)
     return frames.get_data(0)
+
+def load_face_image(value):
+    if value is None:
+        return None
+
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            image = load_face_image(item)
+            if image is not None:
+                return image
+        return None
+
+    if isinstance(value, dict):
+        for key in ("image", "path", "name", "filepath", "file"):
+            if key in value:
+                image = load_face_image(value[key])
+                if image is not None:
+                    return image
+        return None
+
+    if isinstance(value, np.ndarray):
+        if value.ndim == 2:
+            return cv2.cvtColor(value, cv2.COLOR_GRAY2BGR)
+        if value.ndim == 3 and value.shape[2] == 4:
+            return cv2.cvtColor(value, cv2.COLOR_RGBA2BGR)
+        return value
+
+    if hasattr(value, "convert"):
+        return cv2.cvtColor(np.array(value.convert("RGB")), cv2.COLOR_RGB2BGR)
+
+    if isinstance(value, str) and os.path.exists(value):
+        return cv2.imread(value)
+
+    return None
 
 def extract_faces_auto(filepath, refacer_instance, max_faces=5, isvideo=False):
     if filepath is None:
@@ -207,7 +251,6 @@ def handle_tif_preview(filepath):
     return preview_path
 
 def rotate_video(video_path, direction):
-    """Rotate video 90 degrees in specified direction ('left' or 'right') using stream copy (no quality loss)"""
     if video_path is None:
         return video_path
 
@@ -222,10 +265,18 @@ def rotate_video(video_path, direction):
     output_path = os.path.join("./tmp", f"rotated_{direction}_{int(time.time() * 1000)}.mp4")
 
     try:
+        probe = ffmpeg.probe(video_path)
+        has_audio = any(stream.get('codec_type') == 'audio' for stream in probe.get('streams', []))
+        input_stream = ffmpeg.input(video_path)
+        rotated_video = input_stream.video.filter('transpose', 2 if direction == 'left' else 1)
+
+        if has_audio:
+            output = ffmpeg.output(rotated_video, input_stream.audio, output_path, vcodec='libx264', acodec='copy', movflags='+faststart')
+        else:
+            output = ffmpeg.output(rotated_video, output_path, vcodec='libx264', movflags='+faststart')
+
         (
-            ffmpeg
-            .input(video_path)
-            .output(output_path, vf=rotation_filters[direction], c="copy")
+            output
             .overwrite_output()
             .run(quiet=True)
         )
