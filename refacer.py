@@ -56,6 +56,7 @@ class Refacer:
         self.first_face = False
         self.force_cpu = force_cpu
         self.colab_performance = colab_performance
+        self.video_has_audio = False
         self.use_num_cpus = mp.cpu_count()
         self.__check_encoders()
         self.__check_providers()
@@ -429,6 +430,17 @@ class Refacer:
 
         if total_size != 0 and t.n != total_size:
             raise Exception("ERROR, something went wrong downloading the model!")
+
+    def __check_video_has_audio(self, video_path):
+        self.video_has_audio = False
+        try:
+            probe = ffmpeg.probe(video_path)
+            for stream in probe.get('streams', []):
+                if stream.get('codec_type') == 'audio':
+                    self.video_has_audio = True
+                    break
+        except Exception as e:
+            print(f"[WARNING] Failed to inspect audio streams for {video_path}: {e}")
 
     def __check_providers(self):
         available_providers = rt.get_available_providers()
