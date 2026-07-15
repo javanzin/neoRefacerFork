@@ -54,7 +54,8 @@ def estimate_norm(lmk, image_size=112, mode='arcface'):
     else:
         src = src_map[image_size]
     for i in np.arange(src.shape[0]):
-        tform = trans.SimilarityTransform.from_estimate(lmk, src[i])
+        tform = trans.SimilarityTransform()
+        tform.estimate(lmk, src[i])
         M = tform.params[0:2, :]
         results = np.dot(M, lmk_tran.T)
         results = results.T

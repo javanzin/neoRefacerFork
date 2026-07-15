@@ -997,7 +997,9 @@ class Refacer:
         original_name = osp.splitext(osp.basename(video_path))[0]
         timestamp = str(int(time.time()))
         filename = f"{original_name}_preview.mp4" if preview else f"{original_name}_{timestamp}.mp4"
-    
+
+        multi_face_start_time = time.time() if multiple_faces_mode else None
+
         self.__check_video_has_audio(video_path)
     
         if preview:
@@ -1115,8 +1117,15 @@ class Refacer:
                 gif_output_path = os.path.join("output", "gifs", os.path.basename(converted_path).replace(".mp4", ".gif"))
     
             self.__generate_gif(converted_path, gif_output_path)
+            if multi_face_start_time is not None:
+                elapsed = time.time() - multi_face_start_time
+                print(f"[MULTI FACE] Processo concluido em {elapsed:.2f}s ({video_path})")
             return converted_path, gif_output_path
-    
+
+        if multi_face_start_time is not None:
+            elapsed = time.time() - multi_face_start_time
+            print(f"[MULTI FACE] Processo concluido em {elapsed:.2f}s ({video_path})")
+
         return converted_path, None
     
    
