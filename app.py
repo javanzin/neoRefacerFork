@@ -243,6 +243,14 @@ def run(*vars):
         })
 
     return mp4_path, gif_path
+
+def toggle_tabs_and_faces(mode, face_tabs, origin_faces):
+    if mode == "Single Face":
+        tab_updates = [gr.update(visible=(i == 0)) for i in range(len(face_tabs))]
+        origin_updates = [gr.update(visible=False) for _ in range(len(origin_faces))]
+    elif mode == "Multiple Faces":
+        tab_updates = [gr.update(visible=True) for _ in range(len(face_tabs))]
+        origin_updates = [gr.update(visible=False) for _ in range(len(origin_faces))]
     else:
         tab_updates = [gr.update(visible=True) for _ in range(len(face_tabs))]
         origin_updates = [gr.update(visible=True) for _ in range(len(origin_faces))]
