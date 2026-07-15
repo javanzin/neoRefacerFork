@@ -598,7 +598,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             with gr.Tab(f"Face #{i+1}") as tab:
                 with gr.Row():
                     origin = gr.Image(label="Face to replace")
-                    destination = gr.Gallery(label="Destination face(s)", columns=4, height="auto", object_fit="contain")
+                    destination = gr.Gallery(label="Destination face(s)", columns=4, height="auto", object_fit="contain", file_types=["image"])
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
             origin_video.append(origin)
             destination_video.append(destination)
