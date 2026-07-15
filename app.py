@@ -15,6 +15,7 @@ import pyfiglet
 import shutil
 import time
 import ffmpeg
+from urllib.parse import quote
 
 print("\033[94m" + pyfiglet.Figlet(font='slant').renderText("NeoRefacer") + "\033[0m")
 
@@ -52,7 +53,20 @@ def _history_file_link(value):
 
     normalized_path = os.path.abspath(path).replace("\\", "/")
     label = os.path.basename(normalized_path)
-    return f'<a href="/gradio_api/file={normalized_path}" target="_blank" rel="noreferrer">{label}</a>'
+    return f'<a href="/gradio_api/file={quote(normalized_path, safe="/:._-")}" target="_blank" rel="noreferrer">{label}</a>'
+
+def _copy_history_video(video_path):
+    resolved_path = _resolve_history_path(video_path)
+    if not resolved_path or not os.path.exists(resolved_path):
+        return resolved_path
+
+    history_dir = os.path.join("./tmp", "history")
+    os.makedirs(history_dir, exist_ok=True)
+
+    history_name = f"{int(time.time() * 1000)}_{os.path.basename(resolved_path)}"
+    history_path = os.path.join(history_dir, history_name)
+    shutil.copy2(resolved_path, history_path)
+    return history_path
 
 def get_video_history():
     """Format video history for display"""
@@ -207,7 +221,7 @@ def run(*vars):
             video_history.append({
                 'timestamp': int(time.time()),
                 'input_video': video_path,
-                'output_video': mp4_path,
+                'output_video': _copy_history_video(mp4_path),
                 'destination_face': job['destination_label']
             })
 
