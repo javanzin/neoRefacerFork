@@ -55,6 +55,61 @@ def _history_file_link(value):
     label = os.path.basename(normalized_path)
     return f'<a href="/gradio_api/file={quote(normalized_path, safe="/:._-")}" target="_blank" rel="noreferrer">{label}</a>'
 
+def _history_file_link_with_label(value, label):
+    path = _resolve_history_path(value)
+    if not path:
+        return None
+
+    normalized_path = os.path.abspath(path).replace("\\", "/")
+    return f'<a href="/gradio_api/file={quote(normalized_path, safe="/:._-")}" target="_blank" rel="noreferrer">{label}</a>'
+
+def _create_history_replay_page(video_path):
+        path = _resolve_history_path(video_path)
+        if not path or not os.path.exists(path):
+                return None
+
+        normalized_video_path = os.path.abspath(path).replace("\\", "/")
+        history_pages_dir = os.path.join("./tmp", "history_pages")
+        os.makedirs(history_pages_dir, exist_ok=True)
+
+        page_name = f"{int(time.time() * 1000)}_{os.path.basename(normalized_video_path)}.html"
+        page_path = os.path.join(history_pages_dir, page_name)
+        page_url = f"/gradio_api/file={quote(normalized_video_path, safe='/:._-')}"
+
+        html = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+    <meta charset=\"utf-8\" />
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+    <title>NeoRefacer Replay</title>
+    <style>
+        html, body {{
+            margin: 0;
+            width: 100%;
+            height: 100%;
+            background: #000;
+            overflow: hidden;
+        }}
+        video {{
+            width: 100vw;
+            height: 100vh;
+            object-fit: contain;
+            background: #000;
+        }}
+    </style>
+</head>
+<body>
+    <video autoplay loop muted controls playsinline>
+        <source src=\"{page_url}\" type=\"video/mp4\" />
+    </video>
+</body>
+</html>"""
+
+        with open(page_path, "w", encoding="utf-8") as page_file:
+                page_file.write(html)
+
+        return page_path
+
 def _copy_history_video(video_path):
     resolved_path = _resolve_history_path(video_path)
     if not resolved_path or not os.path.exists(resolved_path):
@@ -76,7 +131,9 @@ def get_video_history():
     rows = []
     for entry in video_history[-10:]:  # Show last 10 entries
         output_video = _resolve_history_path(entry.get('output_video'))
-        output_link = _history_file_link(output_video) or 'N/A'
+        output_page = _resolve_history_path(entry.get('output_video_page'))
+        output_label = os.path.basename(output_video) if output_video else 'N/A'
+        output_link = _history_file_link_with_label(output_page, output_label) or 'N/A'
 
         rows.append(
             f"<tr><td style='padding:6px; border-bottom:1px solid #eee;'>{time.strftime('%H:%M:%S', time.localtime(entry['timestamp']))}</td>"
@@ -218,10 +275,14 @@ def run(*vars):
         )
 
         if mp4_path:
+            history_video_path = _copy_history_video(mp4_path)
+            history_page_path = _create_history_replay_page(history_video_path)
+
             video_history.append({
                 'timestamp': int(time.time()),
                 'input_video': video_path,
-                'output_video': _copy_history_video(mp4_path),
+                'output_video': history_video_path,
+                'output_video_page': history_page_path,
                 'destination_face': job['destination_label']
             })
 
