@@ -993,24 +993,6 @@ class Refacer:
                 results = list(tqdm(executor.map(self.process_faces, frames), total=len(frames), desc="Processing frames"))
             for result in results:
                 output.write(result)
-                            if len(self.replacement_faces) > 1:
-                                for idx, face in enumerate(faces):
-                                    if idx >= len(self.replacement_faces):
-                                        break
-                                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
-                                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                                        self.blend_height_ratio = self.partial_reface_ratio
-                                        frame = self._partial_face_blend(frame, swapped, face)
-                                    else:
-                                        frame = swapped
-                            else:
-                                for face in faces:
-                                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
-                                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
-                                        self.blend_height_ratio = self.partial_reface_ratio
-                                        frame = self._partial_face_blend(frame, swapped, face)
-                                    else:
-                                        frame = swapped
 
     def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, use_cache=False):
         """Reface video with optional caching for faster subsequent runs.
