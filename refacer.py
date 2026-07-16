@@ -712,15 +712,22 @@ class Refacer:
 
         mouth_left, mouth_right = face.kps[3], face.kps[4]
         mouth_cx = (mouth_left[0] + mouth_right[0]) / 2.0 - crop_x1
-        mouth_cy = (mouth_left[1] + mouth_right[1]) / 2.0 - crop_y1
+        mouth_corner_y = (mouth_left[1] + mouth_right[1]) / 2.0 - crop_y1
         mouth_width = abs(mouth_right[0] - mouth_left[0])
 
         chin_y = float(h)  # bbox base as chin approximation (no chin landmark in 5-pt kps)
-        if chin_y <= mouth_cy:
+        if chin_y <= mouth_corner_y:
             return self._rect_cutoff_mask(w, h)
 
-        center_y = (mouth_cy + chin_y) / 2.0
-        semi_axis_y = (chin_y - mouth_cy) / 2.0
+        # mouth_corner_y sits at the corner-of-mouth line (roughly where the
+        # lips meet), not the top of the upper lip — starting the ellipse there
+        # covers the whole mouth. Push the top edge down by a fraction of the
+        # corner-to-chin span so at most the upper lip is inside the ellipse.
+        span = chin_y - mouth_corner_y
+        top_y = mouth_corner_y + span * 0.35
+
+        center_y = (top_y + chin_y) / 2.0
+        semi_axis_y = (chin_y - top_y) / 2.0
         semi_axis_x = max(mouth_width * 0.9, semi_axis_y * 0.6)
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
