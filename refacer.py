@@ -71,8 +71,9 @@ class Refacer:
         self.cache_dir.mkdir(exist_ok=True)
         self.pipeline_version = "1.0"
         
-        # Performance profiling
-        self.profiling_enabled = True
+        # Performance profiling (per-frame/per-face overhead — keep off by default,
+        # enable only for debugging via os.environ.get("REFACER_PROFILE"))
+        self.profiling_enabled = os.environ.get("REFACER_PROFILE", "0") == "1"
         self.profile_times = defaultdict(float)
         self.profile_counts = defaultdict(int)
         
@@ -89,6 +90,14 @@ class Refacer:
         self.frame_cache = {}  # {video_hash: list[np.ndarray]}
         self.frame_cache_video_hash = None
         self.frame_cache_max_memory_mb = 4000  # Max 4GB of raw decoded frames
+
+        # Cap for analyze_video_in_memory(): decoded frames + detections held as a
+        # plain local variable are NOT bounded by frame_cache_max_memory_mb (that
+        # limit only applies to the self.frame_cache attribute). Free hosts like
+        # Google Colab report a small total_mem and often kill/freeze the whole
+        # notebook well before an OOM would show up in this process, so budget
+        # only a fraction of total RAM instead of an absolute constant.
+        self.in_memory_analysis_max_mb = min(4000, (self.total_mem / (1024 * 1024)) * 0.25)
     
     def _profile_start(self, name):
         """Start profiling a section."""
@@ -264,6 +273,141 @@ class Refacer:
         
         return ret
     
+    def analyze_video_in_memory(self, video_path, max_num_faces=8, preview=False):
+        """Decode every frame and detect faces exactly once, returning a plain
+        local value (list of (frame, bboxes, kpss) tuples), or None if the
+        video is too large to hold fully decoded in RAM (see
+        in_memory_analysis_max_mb) — callers must fall back to a per-job path
+        that re-decodes instead of holding everything at once.
+
+        This is meant for the multi-job-same-video scenario driven by app.py
+        (one job per configured face, same target video, same process): the
+        orchestrator calls this once and passes the result to reface() for
+        every job as a normal function argument, instead of stashing it on
+        `self` behind a hash-keyed cache with memory accounting. The data lives
+        only as long as the caller's local variable, so it is freed by the GC
+        as soon as all jobs for that video are done.
+        """
+        cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        skip_rate = 10 if preview else 1
+        bytes_per_frame = frame_width * frame_height * 3
+        decoded_frame_count = len(range(0, max(total_frames, 0), skip_rate)) or total_frames
+        estimated_mb = (decoded_frame_count * bytes_per_frame) / (1024 * 1024)
+        if estimated_mb > self.in_memory_analysis_max_mb:
+            print(f"[IN-MEMORY ANALYSIS] Skipping: estimated {estimated_mb:.0f}MB exceeds "
+                  f"{self.in_memory_analysis_max_mb:.0f}MB limit, falling back to per-job processing")
+            cap.release()
+            return None
+
+        frame_index = 0
+        entries = []
+        running_bytes = 0
+
+        with tqdm(total=total_frames, desc="Analyzing frames (in-memory)") as pbar:
+            while cap.isOpened():
+                flag, frame = cap.read()
+                if not flag:
+                    break
+
+                running_bytes += frame.nbytes
+                if running_bytes / (1024 * 1024) > self.in_memory_analysis_max_mb:
+                    print(f"[IN-MEMORY ANALYSIS] Aborting mid-decode: exceeded "
+                          f"{self.in_memory_analysis_max_mb:.0f}MB limit, falling back to per-job processing")
+                    cap.release()
+                    return None
+
+                if frame_index % skip_rate == 0:
+                    start_detect = self._profile_start("face_detection")
+                    bboxes, kpss = self.face_detector.detect(frame, max_num=max_num_faces, metric='default')
+                    self._profile_end("face_detection", start_detect)
+
+                    # Embeddings depend only on the frame, not on which source face a
+                    # given job is matching against — compute them once here so N
+                    # jobs over the same video don't each re-run embedding inference.
+                    embeddings = []
+                    for i in range(bboxes.shape[0]):
+                        kps = kpss[i] if kpss is not None else None
+                        start_embed = self._profile_start("face_embedding")
+                        embeddings.append(self.rec_app.get(frame, kps))
+                        self._profile_end("face_embedding", start_embed)
+
+                    entries.append((frame, bboxes, kpss, embeddings))
+                else:
+                    entries.append((frame, None, None, None))
+
+                frame_index += 1
+                pbar.update()
+
+        cap.release()
+
+        return {
+            "entries": entries,
+            "fps": fps,
+            "frame_width": frame_width,
+            "frame_height": frame_height,
+        }
+
+    def reface_with_precomputed(self, video_path, faces, output_path, precomputed,
+                                preview=False, disable_similarity=False,
+                                multiple_faces_mode=False, partial_reface_ratio=0.0):
+        """Reface a video reusing frames/detections already computed in memory
+        by analyze_video_in_memory(), passed in directly as a local variable
+        (no self.light_cache / self.frame_cache involved).
+        """
+        self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
+        self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
+        self.partial_reface_ratio = partial_reface_ratio
+
+        fps = precomputed["fps"]
+        frame_width = precomputed["frame_width"]
+        frame_height = precomputed["frame_height"]
+        entries = precomputed["entries"]
+
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        output = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+
+        batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
+        frames = []
+
+        with tqdm(total=len(entries), desc="Processing frames (precomputed)") as pbar:
+            for frame, bboxes, kpss, embeddings in entries:
+                if bboxes is None:
+                    processed_frame = frame
+                else:
+                    faces_in_frame = []
+                    for i in range(bboxes.shape[0]):
+                        bbox = bboxes[i, 0:4]
+                        det_score = bboxes[i, 4]
+                        kps = kpss[i] if kpss is not None else None
+                        face = Face(bbox=bbox, kps=kps, det_score=det_score)
+                        face.embedding = embeddings[i]
+                        faces_in_frame.append(face)
+
+                    processed_frame = self._process_faces_with_cached_data(frame, faces_in_frame) if faces_in_frame else frame
+
+                frames.append(processed_frame)
+
+                if len(frames) > batch_size:
+                    for f in frames:
+                        output.write(f)
+                    frames = []
+
+                pbar.update()
+
+        if frames:
+            for f in frames:
+                output.write(f)
+        output.release()
+
+        converted_path = self.__convert_video(video_path, output_path, preview=preview)
+        return converted_path
+
     def reface_with_light_cache(self, video_path, faces, output_path,
                                 preview=False, disable_similarity=False,
                                 multiple_faces_mode=False, partial_reface_ratio=0.0):
@@ -362,7 +506,6 @@ class Refacer:
                     for f in frames:
                         output.write(f)
                     frames = []
-                    gc.collect()
 
                 frame_index += 1
                 pbar.update()
@@ -458,13 +601,19 @@ class Refacer:
     
         mask = np.ones((h, w, 3), dtype=np.float32)
         transition = 40
-    
+
         if cutoff < h:
             blend_start = max(cutoff - transition // 2, 0)
             blend_end = min(cutoff + transition // 2, h)
-    
+
             if blend_end > blend_start:
-                alpha = np.linspace(1.0, 0.0, blend_end - blend_start)[:, np.newaxis, np.newaxis]
+                # Smoothstep instead of a linear ramp: flattens out at both ends of
+                # the transition band (zero derivative at t=0/1), which softens the
+                # perceptible "step" right at the cutoff line without changing where
+                # the cut is or its shape — same cost, same numpy op, just a
+                # different curve over the same 40px band.
+                t = np.linspace(0.0, 1.0, blend_end - blend_start)
+                alpha = (1.0 - (3 * t**2 - 2 * t**3))[:, np.newaxis, np.newaxis]
                 mask[blend_start:blend_end, :, :] = alpha
             mask[blend_end:, :, :] = 0.0
     
@@ -918,7 +1067,6 @@ class Refacer:
                         for f in frames:
                             output.write(f)
                         frames = []
-                        gc.collect()
                     pbar.update(1)
                     continue
                 
@@ -950,17 +1098,16 @@ class Refacer:
                     for f in frames:
                         output.write(f)
                     frames = []
-                    gc.collect()
-                
+
                 pbar.update(1)
-        
+
         # Write remaining frames
         for f in frames:
             output.write(f)
-        
+
         cap.release()
         output.release()
-        
+
         # Convert video (add audio if needed)
         converted_path = self.__convert_video(video_path, output_path, preview)
         return converted_path
@@ -1034,20 +1181,32 @@ class Refacer:
         return frame
 
     def reface_group(self, faces, frames, output):
-        # Use all available CPUs - GPU-bound tasks still benefit from parallel preprocessing
-        max_workers = self.use_num_cpus
+        worker_fn = self.process_first_face if self.first_face else self.process_faces
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            if self.first_face:
-                results = list(tqdm(executor.map(self.process_first_face, frames), total=len(frames), desc="Processing frames"))
-            else:
-                results = list(tqdm(executor.map(self.process_faces, frames), total=len(frames), desc="Processing frames"))
-            for result in results:
-                output.write(result)
+        # Write each processed frame to disk as soon as it's ready instead of
+        # materializing the whole batch (list(executor.map(...))) in RAM first —
+        # with batch sizes up to 1000 Full HD frames that peak was ~6GB just for
+        # the output list, on top of the input `frames` batch already in memory.
+        if self.mode == RefacerMode.CUDA:
+            # In CUDA mode all three models (detector/embedding/swapper) share one
+            # GPU via an ONNX session pinned to intra_op_num_threads=1, so a frame
+            # is fully GPU-serialized regardless of how many Python threads submit
+            # work. A ThreadPoolExecutor here only adds GIL contention and
+            # scheduling overhead on top of that serialization — worse the fewer
+            # vCPUs are available (Colab/Lightning free tiers). Run serially instead.
+            for frame in tqdm(frames, desc="Processing frames"):
+                output.write(worker_fn(frame))
+        else:
+            # Other modes (CPU/COREML/TensorRT) split ONNX intra-op threads across
+            # use_num_cpus, so overlapping frame-level Python work with threads can
+            # still help hide I/O/preprocessing latency.
+            with ThreadPoolExecutor(max_workers=self.use_num_cpus) as executor:
+                for result in tqdm(executor.map(worker_fn, frames), total=len(frames), desc="Processing frames"):
+                    output.write(result)
 
-    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, use_cache=False):
+    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, use_cache=False, precomputed=None):
         """Reface video with optional caching for faster subsequent runs.
-        
+
         Args:
             video_path: Path to input video
             faces: List of face configurations
@@ -1056,7 +1215,41 @@ class Refacer:
             multiple_faces_mode: If True, use multiple faces mode
             partial_reface_ratio: Ratio for partial face blending (0-0.5)
             use_cache: If True, use cached target analysis for faster processing (disabled by default)
+            precomputed: Optional dict from analyze_video_in_memory(), reused across
+                multiple faces/jobs for the same video within the same run. When
+                given, takes priority over use_cache — no hash-keyed cache involved.
         """
+        if precomputed is not None:
+            original_name = osp.splitext(osp.basename(video_path))[0]
+            timestamp = str(int(time.time()))
+            filename = f"{original_name}_preview.mp4" if preview else f"{original_name}_{timestamp}.mp4"
+
+            self.__check_video_has_audio(video_path)
+
+            if preview:
+                os.makedirs("output/preview", exist_ok=True)
+                output_video_path = os.path.join('output', 'preview', filename)
+            else:
+                os.makedirs("output", exist_ok=True)
+                output_video_path = os.path.join('output', filename)
+
+            converted_path = self.reface_with_precomputed(
+                video_path, faces, output_video_path, precomputed,
+                preview=preview,
+                disable_similarity=disable_similarity,
+                multiple_faces_mode=multiple_faces_mode,
+                partial_reface_ratio=partial_reface_ratio
+            )
+
+            if video_path.lower().endswith(".gif"):
+                if preview:
+                    gif_output_path = os.path.join("output", "preview", os.path.basename(converted_path).replace(".mp4", ".gif"))
+                else:
+                    gif_output_path = os.path.join("output", "gifs", os.path.basename(converted_path).replace(".mp4", ".gif"))
+                self.__generate_gif(converted_path, gif_output_path)
+                return converted_path, gif_output_path
+
+            return converted_path, None
         original_name = osp.splitext(osp.basename(video_path))[0]
         timestamp = str(int(time.time()))
         filename = f"{original_name}_preview.mp4" if preview else f"{original_name}_{timestamp}.mp4"
@@ -1162,7 +1355,6 @@ class Refacer:
                         if len(frames) > batch_size:
                             self.reface_group(faces, frames, output)
                             frames = []
-                            gc.collect()
                     frame_index += 1
                     pbar.update()
         
@@ -1207,14 +1399,21 @@ class Refacer:
         )
 
     def __convert_video(self, video_path, output_video_path, preview=False):
-        if self.video_has_audio and not preview:
+        if preview:
+            new_path = output_video_path
+        else:
+            # Always re-encode through the GPU/H.264 encoder, not just when audio
+            # needs muxing — the OpenCV mp4v writer used upstream is lower quality
+            # than h264_nvenc, and re-encoding here is ~free on a T4.
             new_path = output_video_path + str(random.randint(0, 999)) + "_c.mp4"
             in1 = ffmpeg.input(output_video_path)
-            in2 = ffmpeg.input(video_path)
-            out = ffmpeg.output(in1.video, in2.audio, new_path, video_bitrate=self.ffmpeg_video_bitrate, vcodec=self.ffmpeg_video_encoder)
+            out_kwargs = dict(video_bitrate=self.ffmpeg_video_bitrate, vcodec=self.ffmpeg_video_encoder)
+            if self.video_has_audio:
+                in2 = ffmpeg.input(video_path)
+                out = ffmpeg.output(in1.video, in2.audio, new_path, **out_kwargs)
+            else:
+                out = ffmpeg.output(in1.video, new_path, **out_kwargs)
             out.run(overwrite_output=True, quiet=True)
-        else:
-            new_path = output_video_path
         print(f"Refaced video saved at: {os.path.abspath(new_path)}")
         return new_path
 

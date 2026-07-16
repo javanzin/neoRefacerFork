@@ -74,7 +74,7 @@ def get_video_history():
         return ""
     
     rows = []
-    for entry in video_history[-10:]:  # Show last 10 entries
+    for entry in video_history:
         output_video = _resolve_history_path(entry.get('output_video'))
         output_label = os.path.basename(output_video) if output_video else 'N/A'
         output_link = _history_file_link_with_label(output_video, output_label) or 'N/A'
@@ -306,6 +306,13 @@ def run(*vars):
 
     last_mp4_path, last_gif_path = None, None
 
+    # When the same target video will be processed for more than one face job,
+    # decode + detect it once into a local variable and hand that to every
+    # reface() call, instead of relying on refacer's hash-keyed RAM caches.
+    precomputed = None
+    if use_cache and len(jobs) > 1:
+        precomputed = refacer.analyze_video_in_memory(video_path, preview=preview)
+
     for job in jobs:
         mp4_path, gif_path = refacer.reface(
             video_path,
@@ -314,7 +321,8 @@ def run(*vars):
             disable_similarity=disable_similarity,
             multiple_faces_mode=multiple_faces_mode,
             partial_reface_ratio=partial_reface_ratio,
-            use_cache=use_cache
+            use_cache=use_cache,
+            precomputed=precomputed
         )
 
         if mp4_path:
