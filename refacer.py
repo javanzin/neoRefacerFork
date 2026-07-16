@@ -728,7 +728,11 @@ class Refacer:
 
         center_y = (top_y + chin_y) / 2.0
         semi_axis_y = (chin_y - top_y) / 2.0
-        semi_axis_x = max(mouth_width * 0.9, semi_axis_y * 0.6)
+        # Width from mouth width alone (not from a fraction of the vertical
+        # axis — that previously inflated the ellipse wide enough to reach
+        # into the cheeks and made the soft-edge band swallow the solid
+        # "always preserved" core, so the swap visibly bled through).
+        semi_axis_x = mouth_width * 0.55
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
         normalized = ((xx - mouth_cx) / semi_axis_x) ** 2 + ((yy - center_y) / semi_axis_y) ** 2
@@ -739,7 +743,9 @@ class Refacer:
         # alpha -> 1, swap is shown everywhere else (eyes, forehead, nose, and
         # the rest of the face) — inverse of the rect cutoff's "below the line
         # is preserved" default, since here only the ellipse itself is excluded.
-        band = 0.35
+        # A narrower band (vs. the previous 0.35) keeps a solid fully-preserved
+        # core at the ellipse center instead of blending it away entirely.
+        band = 0.2
         t = np.clip((normalized - (1.0 - band)) / (2 * band), 0.0, 1.0)
         alpha = 3 * t**2 - 2 * t**3
         mask = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
