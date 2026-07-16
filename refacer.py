@@ -695,12 +695,13 @@ class Refacer:
         return mask
 
     def _mouth_chin_oval_mask(self, face, crop_x1, crop_y1, w, h):
-        """Opt-in shape (partial_blend_shape="oval"): swap only a narrow ellipse
-        spanning upper-lip-to-chin, centered on the mouth. Cheeks stay outside
-        the ellipse at all times and are therefore always preserved, unlike the
-        wide face-contour ellipse discussed and discarded earlier (which had to
-        guess where cheek/jaw occlusions were). Residual risk is limited to
-        occlusions that land inside the narrow mouth/chin band itself.
+        """Opt-in shape (partial_blend_shape="oval"): swap everywhere EXCEPT a
+        narrow ellipse spanning upper-lip-to-chin, centered on the mouth. Cheeks
+        stay outside the ellipse at all times and are therefore always
+        preserved, unlike the wide face-contour ellipse discussed and discarded
+        earlier (which had to guess where cheek/jaw occlusions were). Residual
+        risk is limited to occlusions that land inside the narrow mouth/chin
+        band itself.
 
         Falls back to the rect cutoff if kps is unavailable (5-point kps only
         has eyes/nose/mouth-corners — no chin landmark to size the ellipse
@@ -725,11 +726,15 @@ class Refacer:
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
         normalized = ((xx - mouth_cx) / semi_axis_x) ** 2 + ((yy - center_y) / semi_axis_y) ** 2
 
-        # Smoothstep falloff over a band around the ellipse edge (normalized==1),
-        # same softening approach as the rect cutoff's transition band.
+        # Smoothstep falloff over a band around the ellipse edge (normalized==1).
+        # Inside the ellipse (normalized -> 0): alpha -> 0, original is preserved
+        # (mouth/chin/cheek gap). Outside the ellipse (normalized -> large):
+        # alpha -> 1, swap is shown everywhere else (eyes, forehead, nose, and
+        # the rest of the face) — inverse of the rect cutoff's "below the line
+        # is preserved" default, since here only the ellipse itself is excluded.
         band = 0.35
         t = np.clip((normalized - (1.0 - band)) / (2 * band), 0.0, 1.0)
-        alpha = 1.0 - (3 * t**2 - 2 * t**3)
+        alpha = 3 * t**2 - 2 * t**3
         mask = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
 
         return mask
