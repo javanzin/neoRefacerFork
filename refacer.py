@@ -413,7 +413,8 @@ class Refacer:
 
     def reface_with_precomputed(self, video_path, faces, output_path, precomputed,
                                 preview=False, disable_similarity=False,
-                                multiple_faces_mode=False, partial_reface_ratio=0.0):
+                                multiple_faces_mode=False, partial_reface_ratio=0.0,
+                                partial_blend_shape="rect"):
         """Reface a video reusing frames/detections already computed in memory
         by analyze_video_in_memory(), passed in directly as a local variable
         (no self.light_cache / self.frame_cache involved).
@@ -421,6 +422,7 @@ class Refacer:
         self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
         self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
         self.partial_reface_ratio = partial_reface_ratio
+        self.partial_blend_shape = partial_blend_shape
 
         fps = precomputed["fps"]
         frame_width = precomputed["frame_width"]
@@ -467,7 +469,8 @@ class Refacer:
 
     def reface_with_light_cache(self, video_path, faces, output_path,
                                 preview=False, disable_similarity=False,
-                                multiple_faces_mode=False, partial_reface_ratio=0.0):
+                                multiple_faces_mode=False, partial_reface_ratio=0.0,
+                                partial_blend_shape="rect"):
         """Reface video with ultra-lightweight in-memory cache (detection only).
         
         This caches ONLY face detection results (bboxes + kpss) in RAM.
@@ -481,7 +484,8 @@ class Refacer:
         self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
         self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
         self.partial_reface_ratio = partial_reface_ratio
-        
+        self.partial_blend_shape = partial_blend_shape
+
         # Compute video hash for cache key
         video_hash = self._compute_video_hash(video_path)
 
@@ -635,24 +639,41 @@ class Refacer:
 
     def _partial_face_blend(self, original_frame, swapped_frame, face):
         h_frame, w_frame = original_frame.shape[:2]
-    
+
         x1, y1, x2, y2 = map(int, face.bbox)
         x1 = max(0, min(x1, w_frame-1))
         y1 = max(0, min(y1, h_frame-1))
         x2 = max(0, min(x2, w_frame))
         y2 = max(0, min(y2, h_frame))
-    
+
         if x2 <= x1 or y2 <= y1:
             print(f"Invalid bbox: {x1},{y1},{x2},{y2}")
             return swapped_frame
-    
+
         w = x2 - x1
         h = y2 - y1
-        cutoff = int(h * (1.0 - self.blend_height_ratio))
-    
+
         swap_crop = swapped_frame[y1:y2, x1:x2].copy()
         orig_crop = original_frame[y1:y2, x1:x2].copy()
-    
+
+        shape = getattr(self, 'partial_blend_shape', 'rect')
+        if shape == 'oval':
+            mask = self._mouth_chin_oval_mask(face, x1, y1, w, h)
+        else:
+            mask = self._rect_cutoff_mask(w, h)
+
+        blended_crop = (swap_crop.astype(np.float32) * mask + orig_crop.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
+
+        blended_frame = swapped_frame.copy()
+        blended_frame[y1:y2, x1:x2] = blended_crop
+
+        return blended_frame
+
+    def _rect_cutoff_mask(self, w, h):
+        """Default shape: straight horizontal cutoff at blend_height_ratio,
+        softened by a smoothstep transition band. Preserves everything below
+        the line unconditionally (predictable behavior around occlusions)."""
+        cutoff = int(h * (1.0 - self.blend_height_ratio))
         mask = np.ones((h, w, 3), dtype=np.float32)
         transition = 40
 
@@ -670,13 +691,48 @@ class Refacer:
                 alpha = (1.0 - (3 * t**2 - 2 * t**3))[:, np.newaxis, np.newaxis]
                 mask[blend_start:blend_end, :, :] = alpha
             mask[blend_end:, :, :] = 0.0
-    
-        blended_crop = (swap_crop.astype(np.float32) * mask + orig_crop.astype(np.float32) * (1.0 - mask)).astype(np.uint8)
-    
-        blended_frame = swapped_frame.copy()
-        blended_frame[y1:y2, x1:x2] = blended_crop
-    
-        return blended_frame
+
+        return mask
+
+    def _mouth_chin_oval_mask(self, face, crop_x1, crop_y1, w, h):
+        """Opt-in shape (partial_blend_shape="oval"): swap only a narrow ellipse
+        spanning upper-lip-to-chin, centered on the mouth. Cheeks stay outside
+        the ellipse at all times and are therefore always preserved, unlike the
+        wide face-contour ellipse discussed and discarded earlier (which had to
+        guess where cheek/jaw occlusions were). Residual risk is limited to
+        occlusions that land inside the narrow mouth/chin band itself.
+
+        Falls back to the rect cutoff if kps is unavailable (5-point kps only
+        has eyes/nose/mouth-corners — no chin landmark to size the ellipse
+        against, so we approximate the chin as the bbox base).
+        """
+        if face.kps is None or len(face.kps) < 5:
+            return self._rect_cutoff_mask(w, h)
+
+        mouth_left, mouth_right = face.kps[3], face.kps[4]
+        mouth_cx = (mouth_left[0] + mouth_right[0]) / 2.0 - crop_x1
+        mouth_cy = (mouth_left[1] + mouth_right[1]) / 2.0 - crop_y1
+        mouth_width = abs(mouth_right[0] - mouth_left[0])
+
+        chin_y = float(h)  # bbox base as chin approximation (no chin landmark in 5-pt kps)
+        if chin_y <= mouth_cy:
+            return self._rect_cutoff_mask(w, h)
+
+        center_y = (mouth_cy + chin_y) / 2.0
+        semi_axis_y = (chin_y - mouth_cy) / 2.0
+        semi_axis_x = max(mouth_width * 0.9, semi_axis_y * 0.6)
+
+        yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+        normalized = ((xx - mouth_cx) / semi_axis_x) ** 2 + ((yy - center_y) / semi_axis_y) ** 2
+
+        # Smoothstep falloff over a band around the ellipse edge (normalized==1),
+        # same softening approach as the rect cutoff's transition band.
+        band = 0.35
+        t = np.clip((normalized - (1.0 - band)) / (2 * band), 0.0, 1.0)
+        alpha = 1.0 - (3 * t**2 - 2 * t**3)
+        mask = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
+
+        return mask
 
     def _open_video_writer(self, output_path, fps, frame_width, frame_height):
         """Try a single direct-to-H.264 encode via ffmpeg pipe (no intermediate
@@ -1063,21 +1119,22 @@ class Refacer:
         """Process frame using pre-detected and pre-embedded faces (cached data)."""
         return self._apply_swaps(frame, faces)
 
-    def reface_with_cache(self, video_path, faces, output_path, 
+    def reface_with_cache(self, video_path, faces, output_path,
                           preview=False, disable_similarity=False,
                           multiple_faces_mode=False, partial_reface_ratio=0.0,
-                          cache_embeddings=True):
+                          partial_blend_shape="rect", cache_embeddings=True):
         """Reface video using cached target analysis for faster processing.
-        
+
         Args:
             cache_embeddings: If True, cache embeddings (expensive). If False, only cache detection.
         """
-        
+
         # Prepare source faces (not cached - depends on source)
         self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
         self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
         self.partial_reface_ratio = partial_reface_ratio
-        
+        self.partial_blend_shape = partial_blend_shape
+
         # Load or create cache
         video_hash = self._compute_video_hash(video_path)
         cache_dir = self._get_cache_dir(video_hash)
@@ -1273,7 +1330,8 @@ class Refacer:
                 for result in tqdm(executor.map(worker_fn, frames), total=len(frames), desc="Processing frames"):
                     output.write(result)
 
-    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0, use_cache=False, precomputed=None):
+    def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False,
+               partial_reface_ratio=0.0, partial_blend_shape="rect", use_cache=False, precomputed=None):
         """Reface video with optional caching for faster subsequent runs.
 
         Args:
@@ -1282,7 +1340,12 @@ class Refacer:
             preview: If True, skip 90% of frames for faster preview
             disable_similarity: If True, disable face similarity matching
             multiple_faces_mode: If True, use multiple faces mode
-            partial_reface_ratio: Ratio for partial face blending (0-0.5)
+            partial_reface_ratio: Ratio for partial face blending (0-0.5). Only used
+                when partial_blend_shape="rect"; ignored in "oval" mode, which sizes
+                itself from the mouth keypoints instead.
+            partial_blend_shape: "rect" (default, straight horizontal cutoff) or
+                "oval" (opt-in narrow ellipse from upper lip to chin, preserving
+                cheeks — see REVIEW_GERAL_VIDEO.md achado #discutido).
             use_cache: If True, use cached target analysis for faster processing (disabled by default)
             precomputed: Optional dict from analyze_video_in_memory(), reused across
                 multiple faces/jobs for the same video within the same run. When
@@ -1307,7 +1370,8 @@ class Refacer:
                 preview=preview,
                 disable_similarity=disable_similarity,
                 multiple_faces_mode=multiple_faces_mode,
-                partial_reface_ratio=partial_reface_ratio
+                partial_reface_ratio=partial_reface_ratio,
+                partial_blend_shape=partial_blend_shape
             )
 
             if video_path.lower().endswith(".gif"):
@@ -1355,7 +1419,8 @@ class Refacer:
                     preview=preview,
                     disable_similarity=disable_similarity,
                     multiple_faces_mode=multiple_faces_mode,
-                    partial_reface_ratio=partial_reface_ratio
+                    partial_reface_ratio=partial_reface_ratio,
+                    partial_blend_shape=partial_blend_shape
                 )
             elif duration_seconds < 30:
                 # Medium videos: use ultra-lightweight in-memory cache (detection only)
@@ -1365,7 +1430,8 @@ class Refacer:
                     preview=preview,
                     disable_similarity=disable_similarity,
                     multiple_faces_mode=multiple_faces_mode,
-                    partial_reface_ratio=partial_reface_ratio
+                    partial_reface_ratio=partial_reface_ratio,
+                    partial_blend_shape=partial_blend_shape
                 )
             elif duration_seconds < 60:
                 # Long videos: use selective disk cache (detection only, not embeddings)
@@ -1376,6 +1442,7 @@ class Refacer:
                     disable_similarity=disable_similarity,
                     multiple_faces_mode=multiple_faces_mode,
                     partial_reface_ratio=partial_reface_ratio,
+                    partial_blend_shape=partial_blend_shape,
                     cache_embeddings=False
                 )
             else:
@@ -1387,6 +1454,7 @@ class Refacer:
                     disable_similarity=disable_similarity,
                     multiple_faces_mode=multiple_faces_mode,
                     partial_reface_ratio=partial_reface_ratio,
+                    partial_blend_shape=partial_blend_shape,
                     cache_embeddings=True
                 )
         else:
@@ -1394,6 +1462,7 @@ class Refacer:
             self.prepare_faces(faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode)
             self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
             self.partial_reface_ratio = partial_reface_ratio
+            self.partial_blend_shape = partial_blend_shape
 
             cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)  # Increase buffer size for smoother I/O
@@ -1495,10 +1564,12 @@ class Refacer:
         print(f"Refaced video saved at: {os.path.abspath(new_path)}")
         return new_path
 
-    def reface_image(self, image_path, faces, disable_similarity=False, multiple_faces_mode=False, partial_reface_ratio=0.0):
+    def reface_image(self, image_path, faces, disable_similarity=False, multiple_faces_mode=False,
+                      partial_reface_ratio=0.0, partial_blend_shape="rect"):
          self.prepare_faces(faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode)
          self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
          self.partial_reface_ratio = partial_reface_ratio
+         self.partial_blend_shape = partial_blend_shape
  
          ext = osp.splitext(image_path)[1].lower()
          os.makedirs("output", exist_ok=True)

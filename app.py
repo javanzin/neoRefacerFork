@@ -289,11 +289,13 @@ def run(*vars):
     video_path = vars[0]
     origins = vars[1:(num_faces+1)]
     destinations = vars[(num_faces+1):(num_faces*2)+1]
-    thresholds = vars[(num_faces*2)+1:-4]
-    preview = vars[-4]
-    face_mode = vars[-3]
-    partial_reface_ratio = vars[-2]
+    thresholds = vars[(num_faces*2)+1:-5]
+    preview = vars[-5]
+    face_mode = vars[-4]
+    partial_reface_ratio = vars[-3]
+    oval_mask = vars[-2]
     use_cache = vars[-1]
+    partial_blend_shape = "oval" if oval_mask else "rect"
 
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
@@ -321,6 +323,7 @@ def run(*vars):
             disable_similarity=disable_similarity,
             multiple_faces_mode=multiple_faces_mode,
             partial_reface_ratio=partial_reface_ratio,
+            partial_blend_shape=partial_blend_shape,
             use_cache=use_cache,
             precomputed=precomputed
         )
@@ -571,6 +574,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
                 label="Replacement Mode"
             )
             partial_reface_ratio_video = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
+            oval_mask_video = gr.Checkbox(label="Oval Mask (lip-to-chin, preserves cheeks)", value=False)
             video_btn = gr.Button("Reface Video", variant="primary")
 
         with gr.Row():
@@ -680,7 +684,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         video_btn.click(
             fn=run_with_history_update,
-            inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, use_cache_video],
+            inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, oval_mask_video, use_cache_video],
             outputs=[video_output, gr.File(visible=False), history_display]
         )
 

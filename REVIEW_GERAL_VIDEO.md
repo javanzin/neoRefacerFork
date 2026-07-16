@@ -19,6 +19,7 @@ Confirmado lendo o código atual — mantido aqui só como registro, sem exigir 
 
 ## Prioridade sugerida (todos os achados abaixo)
 
+0. **#13 / #14** (Parte 4) — validar de verdade o pipe ffmpeg antes de confiar nele: o fallback atual não dispara nos modos de falha reais, e dimensões ímpares quebram o pipe. Resolver **antes** do teste em produção da 2ª tentativa de encode (#8), para não confundir essas falhas com a incompatibilidade da 1ª tentativa.
 1. **#6** — logar qual job falhou e não deixar jobs seguintes serem pulados silenciosamente em `app.py` — baixo custo. Impacto real é menor do que parece: jobs *anteriores* ao que falha já ficam no histórico normalmente (o `video_history.append` roda dentro do loop, antes do próximo job); só os jobs *depois* do que falhar são perdidos, sem indicar qual falhou.
 2. **#1** — assignment por similaridade global em "Faces By Match" em vez de greedy por ordem de configuração — maior efeito na qualidade percebida do swap com múltiplos rostos-alvo (relevante só se o usuário configura 2+ rostos-alvo simultaneamente nesse modo).
 4. **#9 / #10** — I/O pulverizado do `.npz` e hash/capture recomputado no light cache — ganho de CPU real se esses caminhos ainda forem usados na prática (confirmar antes).
@@ -137,6 +138,60 @@ Achado removido após verificação: o `yield` (`app.py:339`) já está dentro d
 - **Discutido e descartado no review anterior**: cogitou-se trocar o corte reto por máscara oval/elíptica acompanhando o formato do rosto (via keypoints já detectados), para bochecha retraída onde a linha reta corta visivelmente o contorno. Descartado como comportamento padrão porque uma elipse fixa não sabe distinguir pele de oclusão real no queixo (mão, microfone, sombra dura) — nesses casos borraria/misturaria o objeto com o frame anterior em vez de preservá-lo, pior que o corte reto atual (previsível: tudo abaixo da linha fica 100% preservado). Resolver isso direito exigiria segmentação de oclusão por frame, cara demais para o hardware-alvo.
 - **Relacionado ao achado #5 desta revisão** (pose de cabeça): ambos apontam para a mesma limitação estrutural do corte por bbox/altura fixa.
 - **Sugestão futura (não implementada)**: expor a máscara oval como opção **opt-in via flag** (ex.: `partial_blend_shape="oval"` vs. o padrão `"rect"`), baseada nos keypoints já calculados (sem inferência extra), sem chegar até o queixo (encerrar a elipse antes da região mais provável de oclusão) — para permitir testes controlados antes de considerar virar padrão.
+
+---
+
+## Parte 4 — Achados novos do segundo passe (não cobertos pelos reviews anteriores)
+
+Verificados linha a linha contra o código atual em 2026-07-16. Os achados #13 e #14 afetam diretamente a 2ª tentativa de encode via pipe (achado #8) e devem ser considerados **antes** do teste em produção.
+
+### 13. O fallback do `_open_video_writer` quase nunca dispara — falhas reais do ffmpeg estouram no meio do processamento, sem fallback
+
+- **Arquivo:linha**: `refacer.py:690-700` (`_open_video_writer`), `refacer.py:91-108` (`write`/`release` de `_FfmpegVideoWriter`)
+- **Problema**: o fallback para `cv2.VideoWriter`+mp4v só é acionado se a **construção** de `_FfmpegVideoWriter` levantar exceção — e a construção só falha se o binário `ffmpeg` não existir (o `subprocess.Popen` abre com sucesso mesmo com encoder inválido, resolução incompatível ou GPU indisponível; o erro do ffmpeg só aparece depois, ao processar o primeiro frame). Nesses casos reais de falha, o erro surge como `RuntimeError` dentro de `write()` (BrokenPipeError quando o pipe enche, frame Full HD tem ~6MB) ou em `release()` — **depois** que o writer já foi retornado como "bom".
+- **Impacto**: (a) o fallback desenhado nunca protege contra os modos de falha plausíveis; (b) como os caminhos de processamento acumulam até `batch_size` frames (até 1000) antes do primeiro `output.write`, uma falha do encoder é detectada só depois de descartar até 1000 frames de trabalho de GPU; (c) a `RuntimeError` propaga até o loop de jobs em `app.py:316` e aborta os jobs restantes (agrava o achado #6). O único cenário em que o fallback funciona é `ffmpeg` ausente do PATH — que nunca acontece, pois `__check_encoders` já rodou no startup.
+- **Sugestão**: validar o pipe de verdade antes de devolver o writer — ex.: escrever 1 frame preto de teste num `_FfmpegVideoWriter` descartável com os mesmos parâmetros (ou checar `process.poll()` após um pequeno write inicial) dentro do `try` de `_open_video_writer`; se falhar, cair para mp4v ali mesmo. Alternativa mais simples: capturar a `RuntimeError` de `write()`/`release()` no chamador e reprocessar o vídeo com o writer mp4v (custo: reprocessa 1 vídeo, mas não aborta o lote).
+
+### 14. Pipe ffmpeg com `-pix_fmt yuv420p` falha em vídeos com dimensão ímpar — o mp4v antigo aceitava
+
+- **Arquivo:linha**: `refacer.py:75` (`command += ['-pix_fmt', 'yuv420p', output_path]`)
+- **Problema**: H.264 com `yuv420p` exige largura e altura pares (subsampling 4:2:0). O `cv2.VideoWriter` mp4v aceitava qualquer dimensão; o pipe novo faz o ffmpeg abortar com "width/height not divisible by 2" em vídeos com dimensão ímpar (crops manuais, vídeos de celular processados por outras ferramentas). Combinado com o achado #13, isso não cai no fallback — vira `RuntimeError` no meio do job.
+- **Impacto**: regressão silenciosa de compatibilidade da 2ª tentativa de encode; é exatamente o tipo de "incompatibilidade" que pode ser confundida com a da 1ª tentativa ao testar.
+- **Sugestão**: no `_open_video_writer`, se `frame_width % 2 != 0 or frame_height % 2 != 0`, ou usar o fallback mp4v direto, ou adicionar `-vf pad=ceil(iw/2)*2:ceil(ih/2)*2` ao comando do pipe (custo zero para vídeos já pares).
+
+### 15. Preview + `precomputed`: vídeo sai em duração cheia com só 1 a cada 10 frames trocados, e a estimativa de RAM fica 10× menor que o real
+
+- **Arquivo:linha**: `refacer.py:383-400` (`analyze_video_in_memory` — frames pulados são anexados como `(frame, None, None, None)`), `refacer.py:436-449` (`reface_with_precomputed` escreve o frame original quando `bboxes is None`), `refacer.py:356-359` (estimativa usa `range(0, total, skip_rate)`)
+- **Problema**: nos outros caminhos, preview **descarta** os frames pulados (vídeo final curto, todos os frames trocados). No caminho `precomputed`, os frames pulados são mantidos e escritos **sem swap** — o preview sai com a duração original, com 9 de cada 10 frames mostrando o rosto original (flicker constante), e o encode roda sobre o vídeo inteiro (nenhum ganho de tempo no encode). Além disso, a estimativa inicial de RAM (`decoded_frame_count`) divide por `skip_rate`, mas `entries` acumula todos os frames — a checagem prévia subestima o consumo em 10× no preview (o guard de `running_bytes` nas linhas 376-381 ainda protege, mas só depois de gastar o decode).
+- **Impacto**: qualquer uso de "Preview Generation" + "Enable Cache" + 2+ jobs produz um preview visivelmente quebrado e mais lento do que o preview dos outros caminhos.
+- **Sugestão**: em `analyze_video_in_memory`, quando `preview=True`, simplesmente **não** anexar os frames pulados a `entries` (igual aos outros caminhos) — corrige o flicker, a duração, o tempo de encode e a estimativa de RAM de uma vez.
+
+### 16. Em "Faces By Match", mesmo com um único rosto-alvo, o escolhido é o rosto mais à direita acima do threshold — não o mais similar
+
+- **Arquivo:linha**: `refacer.py:1048-1059` (`_apply_swaps`, ramo `else`)
+- **Problema**: complementa o achado #1, que só tratou do empate entre múltiplos `rep_face`. O loop interno percorre os rostos detectados da direita para a esquerda (`range(len(faces)-1, -1, -1)`, lista ordenada por `bbox[0]`) e aceita o **primeiro** com `sim >= threshold` — não o de maior similaridade. Com o threshold padrão de 0.2 (baixo), num frame com 2+ pessoas é comum mais de um rosto passar do threshold; o escolhido é sempre o mais à direita, mesmo que outro rosto tenha similaridade muito maior.
+- **Impacto**: swap na pessoa errada em cenas com múltiplas pessoas, mesmo no caso simples de 1 rosto-alvo — e alternância entre frames conforme os rostos se movem horizontalmente (outra fonte do "flicker" além dos achados #1/#2).
+- **Sugestão**: dentro do loop de `rep_face`, calcular `sim` para **todos** os rostos restantes e trocar o `argmax` (se `>= threshold`), em vez de aceitar o primeiro. É a versão mínima da correção do achado #1 e pode ser feita junto (a matriz global de similaridade cobre os dois).
+
+### 17. O caminho `precomputed` está preso ao checkbox "Enable Cache" — multi-job sem o checkbox refaz decode+detecção+embedding N vezes
+
+- **Arquivo:linha**: `app.py:313` (`if use_cache and len(jobs) > 1:`)
+- **Problema**: `analyze_video_in_memory` não é um cache persistente — é uma variável local que vive só durante o `run()`, sem hash, sem estado entre execuções. Condicioná-lo ao checkbox "Enable Cache (Faster subsequent runs)" (que descreve outra coisa: cache entre execuções) faz com que o cenário multi-rosto com o checkbox desligado — o default da UI — pague N passadas completas de decode + detecção + embedding sobre o mesmo vídeo.
+- **Impacto**: com 3 rostos-alvo e checkbox desligado (padrão), o custo de análise triplica sem motivo; é exatamente o desperdício que o `precomputed` foi criado para eliminar.
+- **Sugestão**: trocar a condição para `len(jobs) > 1` apenas (o teto de RAM `in_memory_analysis_max_mb` já protege contra vídeos grandes, com fallback automático para o caminho por-job). O checkbox continua controlando os caches persistentes (`use_cache` no `reface()`).
+
+### 18. `first_face` / `process_first_face` são vestigiais — flag calculada em 4 lugares para escolher entre duas funções idênticas
+
+- **Arquivo:linha**: `refacer.py:1239-1240` (`process_first_face` só chama `process_faces`), flag atribuída em `refacer.py:422, 482, 1078, 1395` e consumida apenas em `refacer.py:1133` e `1253` — ambos escolhendo entre as duas funções idênticas
+- **Problema**: `self.first_face` não altera nenhum comportamento hoje (`_apply_swaps` nunca a consulta). No modo "Single Face", o ramo `disable_similarity` com 1 destino troca **todos** os rostos detectados do frame pelo mesmo destino — se a intenção histórica de "first face" era trocar só um rosto, isso se perdeu; se o comportamento atual é o desejado, a flag e o método são código morto que sugere uma distinção inexistente.
+- **Impacto**: sem efeito em runtime; custo é de manutenção/leitura (qualquer correção futura de matching precisa primeiro descobrir que a flag não faz nada). Confirmar com o usuário qual comportamento "Single Face" deve ter num frame com várias pessoas.
+- **Sugestão**: remover `process_first_face` e todas as atribuições de `self.first_face`, ou reimplementar a semântica de "só o rosto principal" (ex.: maior bbox) se ela for desejada.
+
+### 19. Menores (registrar, baixa prioridade)
+
+- **`__try_ffmpeg_encoder` deixa `testsrc.mp4` no diretório de trabalho** (`refacer.py:1581-1587`): o teste de encoder do startup grava um mp4 de 1s no CWD e nunca remove. Lixo pequeno, mas em Colab o arquivo aparece na raiz do notebook a cada start. Usar `tempfile` ou `-f null -`.
+- **Paridade de qualidade do pipe não conferida**: o pipe novo omite `-b:v` quando o bitrate é `'0'` (`refacer.py:73-74`), enquanto o `__convert_video` antigo passava `-b:v 0` explicitamente. Para `h264_nvenc`, sem nenhum controle de rate o default do ffmpeg é um bitrate fixo baixo (~2Mbps), que em 1080p é visivelmente pior que o resultado do caminho antigo. Ao validar a 2ª tentativa, comparar qualidade além de "funcionou"; se necessário, adicionar `-cq`/`-preset` ao comando do pipe.
+- **Intermediário nunca é apagado quando há mux/reencode** (`refacer.py:1478-1494`): quando `__convert_video` gera `*_c.mp4`, o arquivo intermediário permanece em `output/` — 2× o disco por vídeo processado. Pré-existente (não é regressão do pipe), mas em disco pequeno de Colab acumula rápido.
 
 ---
 
