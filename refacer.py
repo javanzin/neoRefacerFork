@@ -1078,6 +1078,19 @@ class Refacer:
         return metadata
 
 
+    def _should_partial_blend(self):
+        """Whether _partial_face_blend should run at all.
+
+        The "oval" shape sizes itself from mouth keypoints, not from
+        blend_height_ratio, so it must not be gated behind the "Reface Ratio"
+        slider being > 0 — otherwise leaving that slider at its 0.0 default
+        (as it is unless the user drags it) silently disables the oval mask
+        checkbox too, making it look like a no-op.
+        """
+        if getattr(self, 'partial_blend_shape', 'rect') == 'oval':
+            return True
+        return getattr(self, 'partial_reface_ratio', 0.0) > 0.0
+
     def _apply_swaps(self, frame, faces):
         """Apply face swaps to an already-detected+embedded list of faces.
 
@@ -1094,7 +1107,7 @@ class Refacer:
                 if idx >= len(self.replacement_faces):
                     break
                 swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
-                if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                if self._should_partial_blend():
                     self.blend_height_ratio = self.partial_reface_ratio
                     frame = self._partial_face_blend(frame, swapped, face)
                 else:
@@ -1105,7 +1118,7 @@ class Refacer:
                     if idx >= len(self.replacement_faces):
                         break
                     swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
-                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                    if self._should_partial_blend():
                         self.blend_height_ratio = self.partial_reface_ratio
                         frame = self._partial_face_blend(frame, swapped, face)
                     else:
@@ -1113,7 +1126,7 @@ class Refacer:
             else:
                 for face in faces:
                     swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
-                    if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                    if self._should_partial_blend():
                         self.blend_height_ratio = self.partial_reface_ratio
                         frame = self._partial_face_blend(frame, swapped, face)
                     else:
@@ -1124,7 +1137,7 @@ class Refacer:
                     sim = self.rec_app.compute_sim(rep_face[0], faces[i].embedding)
                     if sim >= rep_face[2]:
                         swapped = self.face_swapper.get(frame, faces[i], rep_face[1], paste_back=True)
-                        if hasattr(self, 'partial_reface_ratio') and self.partial_reface_ratio > 0.0:
+                        if self._should_partial_blend():
                             self.blend_height_ratio = self.partial_reface_ratio
                             frame = self._partial_face_blend(frame, swapped, faces[i])
                         else:
