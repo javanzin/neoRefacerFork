@@ -29,7 +29,8 @@ import hashlib
 import json
 import shutil
 from pathlib import Path
-from collections import defaultdict
+from collections import defaultdict, deque
+import threading
 
 gc = __import__('gc')
 
@@ -48,6 +49,63 @@ if sys.platform in ("win32", "win64"):
 
 class RefacerMode(Enum):
     CPU, CUDA, COREML, TENSORRT = range(1, 5)
+
+class _FfmpegVideoWriter:
+    """Drop-in replacement for cv2.VideoWriter that pipes raw BGR frames
+    directly to ffmpeg for a single H.264/nvenc encode, instead of writing
+    an intermediate mp4v file that then gets fully re-decoded and re-encoded
+    by __convert_video. Falls back to raising on construction if ffmpeg
+    cannot be started, so callers can catch and fall back to cv2.VideoWriter.
+    """
+    def __init__(self, output_path, fps, frame_size, vcodec, bitrate):
+        width, height = frame_size
+        command = [
+            'ffmpeg', '-y',
+            '-f', 'rawvideo',
+            '-vcodec', 'rawvideo',
+            '-pix_fmt', 'bgr24',
+            '-s', f'{width}x{height}',
+            '-r', str(fps if fps > 0 else 30),
+            '-i', '-',
+            '-an',
+            '-vcodec', vcodec,
+        ]
+        if bitrate and bitrate != '0':
+            command += ['-b:v', bitrate]
+        command += ['-pix_fmt', 'yuv420p', output_path]
+
+        self.process = subprocess.Popen(
+            command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+
+        # Drain stderr continuously in a background thread so ffmpeg never
+        # blocks on a full pipe buffer; keep only the tail for error reporting.
+        self._stderr_tail = deque(maxlen=200)
+        self._stderr_thread = threading.Thread(target=self._drain_stderr, daemon=True)
+        self._stderr_thread.start()
+
+    def _drain_stderr(self):
+        for line in self.process.stderr:
+            self._stderr_tail.append(line)
+
+    def write(self, frame):
+        try:
+            self.process.stdin.write(frame.tobytes())
+        except BrokenPipeError:
+            raise RuntimeError(
+                "ffmpeg process died while writing frames:\n"
+                + b"".join(self._stderr_tail).decode(errors="replace")
+            )
+
+    def release(self):
+        self.process.stdin.close()
+        returncode = self.process.wait()
+        self._stderr_thread.join(timeout=2)
+        if returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg exited with code {returncode} during direct H.264 encode:\n"
+                + b"".join(self._stderr_tail).decode(errors="replace")
+            )
 
 class Refacer:
     def __init__(self, force_cpu=False, colab_performance=False):
@@ -369,8 +427,7 @@ class Refacer:
         frame_height = precomputed["frame_height"]
         entries = precomputed["entries"]
 
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        output = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+        output, already_encoded = self._open_video_writer(output_path, fps, frame_width, frame_height)
 
         batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
         frames = []
@@ -405,7 +462,7 @@ class Refacer:
                 output.write(f)
         output.release()
 
-        converted_path = self.__convert_video(video_path, output_path, preview=preview)
+        converted_path = self.__convert_video(video_path, output_path, preview=preview, already_encoded=already_encoded)
         return converted_path
 
     def reface_with_light_cache(self, video_path, faces, output_path,
@@ -448,10 +505,7 @@ class Refacer:
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-        # Use mp4v for OpenCV (H264 support is unreliable in OpenCV)
-        # FFmpeg will handle H264 encoding in __convert_video
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        output = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+        output, already_encoded = self._open_video_writer(output_path, fps, frame_width, frame_height)
 
         # Dynamic batch size based on VRAM
         batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
@@ -525,7 +579,7 @@ class Refacer:
         print(f"[LIGHT CACHE] Cache hits: {cache_hits}, misses: {cache_misses}")
         print(f"[LIGHT CACHE] Hit rate: {cache_hits/(cache_hits+cache_misses)*100:.1f}%")
         
-        converted_path = self.__convert_video(video_path, output_path, preview=preview)
+        converted_path = self.__convert_video(video_path, output_path, preview=preview, already_encoded=already_encoded)
         return converted_path
 
     def _detect_vram(self):
@@ -623,7 +677,27 @@ class Refacer:
         blended_frame[y1:y2, x1:x2] = blended_crop
     
         return blended_frame
-    
+
+    def _open_video_writer(self, output_path, fps, frame_width, frame_height):
+        """Try a single direct-to-H.264 encode via ffmpeg pipe (no intermediate
+        mp4v). Falls back to the old cv2.VideoWriter + mp4v path if the pipe
+        can't be started (e.g. ffmpeg missing the configured encoder at runtime).
+
+        Returns (writer, already_encoded). When already_encoded is True, callers
+        must pass already_encoded=True to __convert_video so the video stream is
+        only muxed with audio (if any), not re-encoded a second time.
+        """
+        try:
+            writer = _FfmpegVideoWriter(
+                output_path, fps, (frame_width, frame_height),
+                self.ffmpeg_video_encoder, self.ffmpeg_video_bitrate
+            )
+            return writer, True
+        except Exception as e:
+            print(f"[ENCODE] Direct H.264 pipe failed ({e}), falling back to mp4v + re-encode")
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+            return writer, False
 
     def __download_with_progress(self, url, output_path):
         response = requests.get(url, stream=True)
@@ -1024,13 +1098,8 @@ class Refacer:
         
         # Setup video writer
         cap = cv2.VideoCapture(video_path)
-        # Use mp4v for OpenCV (H264 support is unreliable in OpenCV)
-        # FFmpeg will handle H264 encoding in __convert_video
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        output = cv2.VideoWriter(
-            output_path, fourcc, 
-            metadata["fps"], 
-            (metadata["width"], metadata["height"])
+        output, already_encoded = self._open_video_writer(
+            output_path, metadata["fps"], metadata["width"], metadata["height"]
         )
         
         # Process frames using cached data
@@ -1109,7 +1178,7 @@ class Refacer:
         output.release()
 
         # Convert video (add audio if needed)
-        converted_path = self.__convert_video(video_path, output_path, preview)
+        converted_path = self.__convert_video(video_path, output_path, preview, already_encoded=already_encoded)
         return converted_path
 
     def prepare_faces(self, faces, disable_similarity=False, multiple_faces_mode=False):
@@ -1333,10 +1402,7 @@ class Refacer:
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
-            # Use mp4v for OpenCV (H264 support is unreliable in OpenCV)
-            # FFmpeg will handle H264 encoding in __convert_video
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            output = cv2.VideoWriter(output_video_path, fourcc, fps, (frame_width, frame_height))
+            output, already_encoded = self._open_video_writer(output_video_path, fps, frame_width, frame_height)
 
             # Dynamic batch size based on VRAM
             batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
@@ -1363,8 +1429,8 @@ class Refacer:
                 self.reface_group(faces, frames, output)
             output.release()
         
-            converted_path = self.__convert_video(video_path, output_video_path, preview=preview)
-    
+            converted_path = self.__convert_video(video_path, output_video_path, preview=preview, already_encoded=already_encoded)
+
         if video_path.lower().endswith(".gif"):
             if preview:
                 gif_output_path = os.path.join("output", "preview", os.path.basename(converted_path).replace(".mp4", ".gif"))
@@ -1398,21 +1464,33 @@ class Refacer:
             .run(quiet=True)
         )
 
-    def __convert_video(self, video_path, output_video_path, preview=False):
+    def __convert_video(self, video_path, output_video_path, preview=False, already_encoded=False):
+        """already_encoded=True means output_video_path was already written directly
+        to H.264/nvenc via _FfmpegVideoWriter (single encode, no intermediate mp4v) —
+        only audio muxing is needed here, with -c:v copy so the video stream is not
+        re-encoded a second time.
+        """
         if preview:
             new_path = output_video_path
+        elif already_encoded and not self.video_has_audio:
+            new_path = output_video_path
         else:
-            # Always re-encode through the GPU/H.264 encoder, not just when audio
-            # needs muxing — the OpenCV mp4v writer used upstream is lower quality
-            # than h264_nvenc, and re-encoding here is ~free on a T4.
             new_path = output_video_path + str(random.randint(0, 999)) + "_c.mp4"
             in1 = ffmpeg.input(output_video_path)
-            out_kwargs = dict(video_bitrate=self.ffmpeg_video_bitrate, vcodec=self.ffmpeg_video_encoder)
-            if self.video_has_audio:
+            if already_encoded:
+                # Video is already H.264 from the direct pipe encode — just mux audio.
                 in2 = ffmpeg.input(video_path)
-                out = ffmpeg.output(in1.video, in2.audio, new_path, **out_kwargs)
+                out = ffmpeg.output(in1.video, in2.audio, new_path, vcodec='copy', acodec='aac')
             else:
-                out = ffmpeg.output(in1.video, new_path, **out_kwargs)
+                # Always re-encode through the GPU/H.264 encoder, not just when audio
+                # needs muxing — the OpenCV mp4v writer used upstream is lower quality
+                # than h264_nvenc, and re-encoding here is ~free on a T4.
+                out_kwargs = dict(video_bitrate=self.ffmpeg_video_bitrate, vcodec=self.ffmpeg_video_encoder)
+                if self.video_has_audio:
+                    in2 = ffmpeg.input(video_path)
+                    out = ffmpeg.output(in1.video, in2.audio, new_path, **out_kwargs)
+                else:
+                    out = ffmpeg.output(in1.video, new_path, **out_kwargs)
             out.run(overwrite_output=True, quiet=True)
         print(f"Refaced video saved at: {os.path.abspath(new_path)}")
         return new_path
