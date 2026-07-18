@@ -122,6 +122,16 @@ class _FfmpegVideoWriter:
 
 class Refacer:
     def __init__(self, force_cpu=False, colab_performance=False):
+        # prepare_faces/_apply_swaps mutate instance state (replacement_faces,
+        # tracking dicts, partial_reface_ratio/shape) with no protection of
+        # their own — this single Refacer instance is shared globally by
+        # app.py across every concurrent Gradio request. reface()/reface_image()
+        # already had this race pre-existing this change (not addressed here —
+        # would require reindenting large existing methods); this lock covers
+        # the new identity-profile preview entry point (app.py
+        # preview_identity_swap), the one most likely to run concurrently with
+        # an in-progress video reface from another tab.
+        self.swap_lock = threading.Lock()
         self.disable_similarity = False
         self.multiple_faces_mode = False
         # Frame-to-frame identity continuity (see _apply_swaps): IoU above
@@ -1380,16 +1390,27 @@ class Refacer:
         self._match_tracks = {}
 
         for face in faces:
-            if "destination" not in face or face["destination"] is None:
+            identity_profile_face = face.get("identity_profile")
+
+            if identity_profile_face is None and ("destination" not in face or face["destination"] is None):
                 print("Skipping face config: No destination face provided.")
                 continue
 
-            _faces = self.__get_faces(face['destination'], max_num=1)
-            if len(_faces) < 1:
-                raise Exception('No face detected on "Destination face" image')
+            if identity_profile_face is not None:
+                # Perfil de identidade pré-computado (extraído de várias
+                # imagens/vídeos na aba "Criar Identidade") — já é um Face com
+                # .embedding pronto, no mesmo espaço vetorial do dest_face
+                # abaixo. Pula a detecção porque não há uma única imagem para
+                # detectar; ver identity_profile.py.
+                dest_face = identity_profile_face
+            else:
+                _faces = self.__get_faces(face['destination'], max_num=1)
+                if len(_faces) < 1:
+                    raise Exception('No face detected on "Destination face" image')
+                dest_face = _faces[0]
 
             if multiple_faces_mode:
-                self.replacement_faces.append((None, _faces[0], 0.0))
+                self.replacement_faces.append((None, dest_face, 0.0))
             else:
                 if "origin" in face and face["origin"] is not None and not disable_similarity:
                     face_threshold = face['threshold']
@@ -1403,7 +1424,7 @@ class Refacer:
                     face_threshold = 0
                     feat_original = None
 
-                self.replacement_faces.append((feat_original, _faces[0], face_threshold))
+                self.replacement_faces.append((feat_original, dest_face, face_threshold))
 
     def __get_faces(self, frame, max_num=8):
         # Limit max_num to avoid detecting unnecessary faces (default 8 from app.py)

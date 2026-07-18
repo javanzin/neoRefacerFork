@@ -230,13 +230,45 @@ def run_image(*vars):
 
     return refacer.reface_image(image_path, faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
 
-def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode):
-    """Build one job per destination face, keeping Multiple Faces as a single combined job."""
+def _load_identity_profile_face(profile_file, slot_label=""):
+    """Resolves a Face-slot's uploaded .npz into a synthetic Face, or None.
+
+    A corrupted/incompatible .npz must not abort every other configured
+    Face-slot: _build_video_face_jobs runs once, before run()'s per-job
+    try/except, so an uncaught exception here would drop all jobs (including
+    valid ones on other slots) instead of just this slot's.
+    """
+    path = _resolve_history_path(profile_file)
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        profile = import_profile(path)
+    except ValueError as e:
+        gr.Warning(f"Perfil de identidade inválido em {slot_label or 'um slot'}: {e}. Ignorando este slot.")
+        return None
+    return profile["face"]
+
+def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles=None):
+    """Build one job per destination face, keeping Multiple Faces as a single combined job.
+
+    identity_profiles (optional): one entry per Face-slot; when a slot has an
+    uploaded .npz identity profile, it takes priority over that slot's
+    Destination Gallery (the gallery is also disabled in the UI when a
+    profile is uploaded, see Video Mode tab).
+    """
+    identity_profiles = identity_profiles or [None] * num_faces
+
     if multiple_faces_mode:
         # All destination faces are swapped together, by position, in one video.
         faces = []
         labels = []
         for k in range(num_faces):
+            profile_face = _load_identity_profile_face(identity_profiles[k], slot_label=f'Face #{k + 1}')
+            if profile_face is not None:
+                faces.append({'origin': None, 'identity_profile': profile_face, 'threshold': 0.0})
+                labels.append(f'Face #{k + 1} (identity profile)')
+                continue
+
             dest_files = destinations[k]
             if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
                 continue
@@ -258,12 +290,28 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
     # Single Face / Faces By Match: one independent job per destination face.
     jobs = []
     for k in range(num_faces):
+        profile_face = _load_identity_profile_face(identity_profiles[k], slot_label=f'Face #{k + 1}')
         dest_files = destinations[k]
+        has_destination = dest_files is not None and not (isinstance(dest_files, list) and len(dest_files) == 0)
 
-        if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
+        if profile_face is None and not has_destination:
+            # Nothing configured for this slot — skip decoding origin_image,
+            # matching the pre-identity-profile behavior of not doing any
+            # work for an empty slot.
             continue
 
         origin_image = load_face_image(origins[k])
+
+        if profile_face is not None:
+            jobs.append({
+                'faces': [{
+                    'origin': origin_image,
+                    'identity_profile': profile_face,
+                    'threshold': thresholds[k]
+                }],
+                'label': f'Face #{k + 1} (identity profile)'
+            })
+            continue
 
         if not isinstance(dest_files, list):
             dest_files = [dest_files]
@@ -290,7 +338,8 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
     video_path = vars[0]
     origins = vars[1:(num_faces+1)]
     destinations = vars[(num_faces+1):(num_faces*2)+1]
-    thresholds = vars[(num_faces*2)+1:-5]
+    thresholds = vars[(num_faces*2)+1:(num_faces*3)+1]
+    identity_profiles = vars[(num_faces*3)+1:-5]
     preview = vars[-5]
     face_mode = vars[-4]
     partial_reface_ratio = vars[-3]
@@ -301,7 +350,7 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
 
-    jobs = _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode)
+    jobs = _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles)
 
     if not jobs:
         yield None, None
@@ -413,6 +462,238 @@ def rotate_video(video_path, direction):
     except Exception as e:
         print(f"Error rotating video: {e}")
         return video_path
+
+# --- Identity Profile (multi-image / multi-video, single person) ---
+import identity_profile
+from identity_profile import IdentityProfileBuilder, export_profile, import_profile, merge_profiles
+
+_IDENTITY_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+_IDENTITY_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".gif"}
+
+def _pluralize_count(count, singular_suffix="", plural_suffix="s"):
+    """`f"{count} amostra{_pluralize_count(count)}"` style helper — shared by
+    extract/merge/discard status messages instead of each one repeating its
+    own "(s)"/"(is)" logic.
+    """
+    return singular_suffix if count == 1 else plural_suffix
+
+def _populate_builder_from_files(builder, source_files):
+    """Feeds each uploaded file into the builder as an image or video sample
+    source, based on its extension.
+    """
+    for f in source_files:
+        path = _resolve_history_path(f)
+        if not path or not os.path.exists(path):
+            continue
+
+        label = os.path.basename(path)
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _IDENTITY_VIDEO_EXTENSIONS:
+            builder.add_video(path, label)
+        else:
+            frame = cv2.imread(path)
+            builder.add_image(frame, label)
+
+def _format_extraction_status(profiles):
+    status_lines = [
+        f"{len(profiles)} pessoa(s) detectada(s), separada(s) automaticamente por similaridade facial.",
+        "Se a mesma pessoa foi dividida em dois perfis, use \"Mesclar Perfis\" abaixo. "
+        "Se um perfil é ruído/pessoa indesejada, use \"Descartar Perfil\". Se duas pessoas "
+        "diferentes foram fundidas no mesmo perfil, extraia novamente com material separado "
+        "por pessoa (mesclagem não separa um perfil já fundido).",
+    ]
+    for profile in profiles:
+        n = profile['n_samples']
+        status_lines.append(f"- {profile['name']}: {n} amostra{_pluralize_count(n)} válida{_pluralize_count(n)}")
+    if profiles[0]["discarded"]:
+        status_lines.append(f"Descartes ({profiles[0]['n_discarded']}):")
+        status_lines.extend(f"  - {d['source']}: {d['reason']}" for d in profiles[0]["discarded"])
+    return "\n".join(status_lines)
+
+def extract_identity_profile(source_files):
+    """Builds one reusable identity profile (Face + centroid embedding) per
+    person detected in the uploaded images/videos (greedy clustering by
+    cosine similarity — see identity_profile.cluster_samples). Video mode
+    only consumes a profile via a per-slot .npz upload (see Video Mode tab)
+    — no in-session sharing/gr.State is used across tabs, since Colab
+    sessions are volatile and export is the primary persistence mechanism
+    (see PLANO_IDENTIDADE_MULTI_FONTE.md).
+    """
+    if not source_files:
+        empty_dropdown = gr.update(choices=[], value=None)
+        return "Nenhum arquivo enviado.", [], empty_dropdown, empty_dropdown, empty_dropdown, []
+
+    builder = IdentityProfileBuilder.from_refacer(refacer)
+    _populate_builder_from_files(builder, source_files)
+
+    if not builder.samples:
+        reasons = "; ".join(f"{d['source']}: {d['reason']}" for d in builder.discarded) or "motivo desconhecido"
+        raise gr.Error(f"Nenhuma amostra de rosto válida foi extraída. Descartes: {reasons}")
+
+    profiles = builder.build_profiles()
+    status = _format_extraction_status(profiles)
+    choices = [profile["name"] for profile in profiles]
+
+    # A lista de perfis (cada um com seu Face sintético) fica só na gr.State
+    # desta aba, para o dropdown escolher qual baixar/testar sem precisar
+    # re-extrair do zero. Não é persistida em disco além do(s) .npz baixado(s).
+    return (
+        status,
+        _profiles_to_gallery(profiles),
+        gr.update(choices=choices, value=choices[0]),
+        gr.update(choices=choices, value=None),
+        gr.update(choices=choices, value=None),
+        profiles,
+    )
+
+def _get_selected_profile(profiles, selected_name):
+    if not profiles or not selected_name:
+        return None
+    for profile in profiles:
+        if profile["name"] == selected_name:
+            return profile
+    return None
+
+def _profiles_to_gallery(profiles):
+    gallery_items = []
+    for profile in profiles:
+        thumbnail = profile["thumbnail"]
+        thumbnail_rgb = cv2.cvtColor(thumbnail, cv2.COLOR_BGR2RGB) if thumbnail is not None else None
+        n = profile['n_samples']
+        caption = f"{profile['name']} ({n} amostra{_pluralize_count(n)})"
+        gallery_items.append((thumbnail_rgb, caption))
+    return gallery_items
+
+def merge_selected_profiles(profiles, name_a, name_b):
+    """Combines two clustered profiles into one — the mitigation for the
+    clustering greedily splitting the same person into two profiles (e.g.
+    with/without glasses, very different pose/lighting between samples).
+    Not intended to fix the opposite failure (two different people merged
+    into one profile by the automatic clustering) — that requires discarding
+    and re-extracting with cleaner/separated source material instead.
+    """
+    if not profiles:
+        raise gr.Error("Nenhum perfil para mesclar. Extraia uma identidade primeiro.")
+    if not name_a or not name_b:
+        raise gr.Error("Selecione os dois perfis a mesclar.")
+    if name_a == name_b:
+        raise gr.Error("Selecione dois perfis diferentes para mesclar.")
+
+    profile_a = _get_selected_profile(profiles, name_a)
+    profile_b = _get_selected_profile(profiles, name_b)
+    if profile_a is None or profile_b is None:
+        raise gr.Error("Perfil selecionado não encontrado.")
+
+    try:
+        merged = merge_profiles(profile_a, profile_b, name=profile_a["name"])
+    except ValueError as e:
+        raise gr.Error(str(e))
+    remaining = [p for p in profiles if p["name"] not in (name_a, name_b)]
+    new_profiles = remaining + [merged]
+
+    n = merged['n_samples']
+    status = (
+        f"{name_a} e {name_b} mesclados em {merged['name']} "
+        f"({n} amostra{_pluralize_count(n)} combinada{_pluralize_count(n)})."
+    )
+    choices = [p["name"] for p in new_profiles]
+    return (
+        status,
+        _profiles_to_gallery(new_profiles),
+        gr.update(choices=choices, value=merged["name"]),
+        gr.update(choices=choices, value=None),
+        new_profiles,
+    )
+
+def discard_selected_profile(profiles, selected_name):
+    """Removes a profile the clustering created spuriously (background
+    face, misdetection, duplicate split) without needing to re-extract
+    everything from scratch.
+    """
+    if not profiles or not selected_name:
+        raise gr.Error("Nenhum perfil selecionado para descartar.")
+
+    new_profiles = [p for p in profiles if p["name"] != selected_name]
+    if len(new_profiles) == len(profiles):
+        raise gr.Error("Perfil selecionado não encontrado.")
+
+    n = len(new_profiles)
+    profile_word = "perfil" if n == 1 else "perfis"
+    status = f"{selected_name} descartado. {n} {profile_word} restante{_pluralize_count(n)}."
+    choices = [p["name"] for p in new_profiles]
+    next_selected = choices[0] if choices else None
+    return (
+        status,
+        _profiles_to_gallery(new_profiles),
+        gr.update(choices=choices, value=next_selected),
+        gr.update(choices=choices, value=None),
+        new_profiles,
+    )
+
+def export_selected_profile(profiles, selected_name):
+    profile = _get_selected_profile(profiles, selected_name)
+    if profile is None:
+        raise gr.Error("Nenhum perfil selecionado. Extraia uma identidade primeiro.")
+
+    export_path = os.path.join(
+        "./tmp",
+        f"identity_profile_{selected_name.replace(' ', '_')}_{int(time.time() * 1000)}.npz",
+    )
+    export_profile(profile, export_path)
+    return gr.update(value=export_path, visible=True)
+
+def preview_identity_swap(test_image_file, profiles, selected_name):
+    """Applies the selected in-session identity profile to a separate test
+    image, so the user can see the real swap result (profile identity ->
+    someone else's face) before downloading/trusting the .npz, instead of
+    judging it against the profile's own source photos (which would always
+    look trivially perfect and prove nothing about swap quality).
+    """
+    profile = _get_selected_profile(profiles, selected_name)
+    if profile is None:
+        raise gr.Error("Extraia um perfil de identidade primeiro.")
+
+    path = _resolve_history_path(test_image_file)
+    if not path or not os.path.exists(path):
+        raise gr.Error("Envie uma imagem de teste (o rosto que será substituído pelo perfil).")
+
+    frame = cv2.imread(path)
+    if frame is None:
+        raise gr.Error("Não foi possível ler a imagem de teste.")
+
+    # refacer is a single global instance also used by the video/image reface
+    # pipeline (run()/run_image()) — hold swap_lock for the whole
+    # prepare_faces+process_faces span so a concurrent video reface from
+    # another tab can't mutate self.replacement_faces mid-preview.
+    with refacer.swap_lock:
+        refacer.prepare_faces(
+            [{"identity_profile": profile["face"], "threshold": 0.0}],
+            disable_similarity=True,
+            multiple_faces_mode=False,
+        )
+        # partial_reface_ratio/partial_blend_shape are instance state left
+        # over from any earlier video reface in this session (oval mask,
+        # reface ratio) — reset them so the preview shows a plain full-face
+        # swap, matching what the user is actually judging the profile against.
+        refacer.partial_reface_ratio = 0.0
+        refacer.partial_blend_shape = "rect"
+        swapped = refacer.process_faces(frame.copy())
+    return cv2.cvtColor(swapped, cv2.COLOR_BGR2RGB)
+
+def _reset_profile_dropdown(profiles):
+    """Resets a profile-selection dropdown's choices after the profile list
+    changes (merge/discard), clearing any stale selection.
+    """
+    return gr.update(choices=[p["name"] for p in profiles], value=None)
+
+def clear_identity_temp_files():
+    for fname in os.listdir("./tmp"):
+        if fname.startswith("identity_profile_"):
+            try:
+                os.remove(os.path.join("./tmp", fname))
+            except Exception as e:
+                print(f"Warning: could not delete {fname}: {e}")
+    return "Arquivos temporários de identidade removidos."
 
 # --- UI ---
 theme = gr.themes.Base(primary_hue="blue", secondary_hue="cyan")
@@ -580,6 +861,151 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         tif_input.change(fn=lambda _: 0.0, inputs=tif_input, outputs=partial_reface_ratio_tif)
 
 
+    # --- CRIAR IDENTIDADE ---
+    with gr.Tab("Criar Identidade"):
+        gr.Markdown(
+            "**Uso somente com autorização.** Embeddings faciais são dados biométricos "
+            "sensíveis. Processamento é feito localmente nesta sessão — nenhuma imagem, "
+            "vídeo ou embedding é enviado para serviços externos. As pessoas presentes no "
+            "material são separadas automaticamente por similaridade facial (\"Pessoa 1\", "
+            "\"Pessoa 2\", ...) — **a separação automática pode errar** (fundir duas pessoas "
+            "parecidas, ou dividir uma pessoa em dois perfis); confira a galeria de "
+            "resultados abaixo antes de confiar em um perfil. Use \"Mesclar Perfis\" se a "
+            "mesma pessoa foi dividida em dois, ou \"Descartar Perfil\" para remover ruído "
+            "— fusão indevida de pessoas diferentes ainda exige reextrair com material "
+            "separado. De vídeos, uma amostra de quadros é "
+            f"extraída automaticamente (a cada {identity_profile.VIDEO_FRAME_STRIDE} frames, "
+            f"até {identity_profile.MAX_FRAMES_PER_VIDEO} por vídeo)."
+        )
+        identity_consent = gr.Checkbox(
+            label="Confirmo que possuo autorização para processar este material.",
+            value=False,
+        )
+        identity_images = gr.File(
+            label="Imagens e/ou vídeos (múltiplos arquivos, podem conter várias pessoas)",
+            file_count="multiple",
+            file_types=sorted(_IDENTITY_IMAGE_EXTENSIONS | _IDENTITY_VIDEO_EXTENSIONS),
+            interactive=False,
+        )
+        identity_extract_btn = gr.Button("Extrair Identidade(s)", variant="primary", interactive=False)
+
+        identity_status = gr.Textbox(label="Status da extração", lines=8, interactive=False)
+        identity_gallery = gr.Gallery(
+            label="Pessoas detectadas (amostra representativa de cada perfil)",
+            columns=4,
+            height="auto",
+            object_fit="contain",
+        )
+
+        identity_profile_state = gr.State([])
+        identity_selected_profile = gr.Dropdown(label="Perfil ativo (para baixar/testar)", choices=[], value=None)
+
+        with gr.Accordion("Corrigir agrupamento (mesclar/descartar perfis)", open=False):
+            gr.Markdown(
+                "Se a separação automática dividiu a **mesma pessoa** em dois perfis "
+                "(ex.: com/sem óculos, ângulos muito diferentes), mescle-os abaixo — o "
+                "perfil combinado recalcula o centroide usando as amostras de ambos. "
+                "Mesclar **não separa** dois perfis já mesclados nem corrige duas pessoas "
+                "diferentes que foram fundidas em um só — nesse caso, descarte e reextraia "
+                "com o material separado por pessoa."
+            )
+            with gr.Row():
+                identity_merge_a = gr.Dropdown(label="Perfil A", choices=[], value=None)
+                identity_merge_b = gr.Dropdown(label="Perfil B", choices=[], value=None)
+            identity_merge_btn = gr.Button("Mesclar Perfis", variant="secondary")
+            identity_discard_btn = gr.Button("🗑️ Descartar Perfil Selecionado", variant="secondary")
+
+        gr.Markdown(
+            "⚠️ O arquivo exportado contém dados biométricos derivados de rosto(s). "
+            "Trate como informação sensível — não compartilhe sem autorização. "
+            "Baixe-o agora: o Colab não retém a sessão entre execuções."
+        )
+        identity_export_btn = gr.Button("Baixar Perfil Selecionado (.npz)", variant="primary")
+        identity_export_file = gr.File(label="Perfil de identidade (.npz)", visible=False, interactive=False)
+
+        gr.Markdown(
+            "**Teste antes de confiar no perfil**: envie uma foto de teste com o rosto "
+            "de **outra pessoa** (não a que você acabou de extrair) para ver o resultado "
+            "real do swap com o perfil selecionado acima — testar na própria foto de "
+            "origem sempre pareceria perfeito e não comprova nada."
+        )
+        with gr.Row():
+            identity_test_image = gr.Image(label="Imagem de teste (outro rosto)", type="filepath")
+            identity_test_output = gr.Image(label="Resultado do swap com o perfil", interactive=False)
+        identity_test_btn = gr.Button("Testar Perfil Selecionado", variant="secondary")
+
+        identity_cleanup_btn = gr.Button("🗑️ Apagar arquivos temporários de identidade", variant="secondary")
+        identity_cleanup_status = gr.Textbox(label="", interactive=False, show_label=False)
+
+        identity_consent.change(
+            fn=lambda consent: (gr.update(interactive=consent), gr.update(interactive=consent)),
+            inputs=[identity_consent],
+            outputs=[identity_images, identity_extract_btn],
+        )
+
+        identity_extract_btn.click(
+            fn=extract_identity_profile,
+            inputs=[identity_images],
+            outputs=[
+                identity_status,
+                identity_gallery,
+                identity_selected_profile,
+                identity_merge_a,
+                identity_merge_b,
+                identity_profile_state,
+            ],
+        )
+
+        identity_export_btn.click(
+            fn=export_selected_profile,
+            inputs=[identity_profile_state, identity_selected_profile],
+            outputs=[identity_export_file],
+        )
+
+        identity_test_btn.click(
+            fn=preview_identity_swap,
+            inputs=[identity_test_image, identity_profile_state, identity_selected_profile],
+            outputs=[identity_test_output],
+        )
+
+        identity_merge_btn.click(
+            fn=merge_selected_profiles,
+            inputs=[identity_profile_state, identity_merge_a, identity_merge_b],
+            outputs=[
+                identity_status,
+                identity_gallery,
+                identity_selected_profile,
+                identity_merge_a,
+                identity_profile_state,
+            ],
+        ).then(
+            fn=_reset_profile_dropdown,
+            inputs=[identity_profile_state],
+            outputs=[identity_merge_b],
+        )
+
+        identity_discard_btn.click(
+            fn=discard_selected_profile,
+            inputs=[identity_profile_state, identity_selected_profile],
+            outputs=[
+                identity_status,
+                identity_gallery,
+                identity_selected_profile,
+                identity_merge_a,
+                identity_profile_state,
+            ],
+        ).then(
+            fn=_reset_profile_dropdown,
+            inputs=[identity_profile_state],
+            outputs=[identity_merge_b],
+        )
+
+        identity_cleanup_btn.click(
+            fn=clear_identity_temp_files,
+            inputs=[],
+            outputs=[identity_cleanup_status],
+        )
+
     # --- VIDEO MODE ---
     with gr.Tab("Video Mode"):
         with gr.Row():
@@ -624,6 +1050,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         )
 
         origin_video, destination_video, thresholds_video, face_tabs_video = [], [], [], []
+        identity_profile_video = []
 
         for i in range(num_faces):
             with gr.Tab(f"Face #{i+1}") as tab:
@@ -631,10 +1058,22 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
                     origin = gr.Image(label="Face to replace")
                     destination = gr.Gallery(label="Destination face(s)", columns=4, height="auto", object_fit="contain", file_types=["image"])
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
+                identity_profile_file = gr.File(
+                    label="Identity Profile (.npz) — opcional, substitui a galeria acima quando enviado",
+                    file_count="single",
+                    file_types=[".npz"],
+                )
             origin_video.append(origin)
             destination_video.append(destination)
             thresholds_video.append(threshold)
             face_tabs_video.append(tab)
+            identity_profile_video.append(identity_profile_file)
+
+            identity_profile_file.change(
+                fn=lambda f: gr.update(interactive=(f is None)),
+                inputs=[identity_profile_file],
+                outputs=[destination],
+            )
 
         face_mode_video.change(
             fn=lambda mode: toggle_tabs_and_faces(mode, face_tabs_video, origin_video),
@@ -706,7 +1145,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         video_btn.click(
             fn=run_with_history_update,
-            inputs=[video_input] + origin_video + destination_video + thresholds_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, oval_mask_video, use_cache_video],
+            inputs=[video_input] + origin_video + destination_video + thresholds_video + identity_profile_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, oval_mask_video, use_cache_video],
             outputs=[video_output, gr.File(visible=False), history_display]
         )
 
