@@ -230,32 +230,48 @@ def run_image(*vars):
 
     return refacer.reface_image(image_path, faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
 
-def _load_identity_profile_face(profile_file, slot_label=""):
-    """Resolves a Face-slot's uploaded .npz into a synthetic Face, or None.
+def _load_identity_profile_faces(profile_files, slot_label=""):
+    """Resolves a Face-slot's uploaded .npz file(s) into synthetic Faces.
+
+    Accepts a single file, a list of files (file_count="multiple"), or None,
+    and always returns a list — possibly empty, one entry per valid profile,
+    each paired with a label naming that specific file (so multiple profiles
+    queued from the same slot show up as distinct jobs in run()'s progress
+    and video history, not an ambiguous repeated "identity profile" label).
 
     A corrupted/incompatible .npz must not abort every other configured
-    Face-slot: _build_video_face_jobs runs once, before run()'s per-job
-    try/except, so an uncaught exception here would drop all jobs (including
-    valid ones on other slots) instead of just this slot's.
+    Face-slot or sibling profile in the same slot: _build_video_face_jobs
+    runs once, before run()'s per-job try/except, so an uncaught exception
+    here would drop all jobs (including valid ones on other slots) instead
+    of just this one file.
     """
-    path = _resolve_history_path(profile_file)
-    if not path or not os.path.exists(path):
-        return None
-    try:
-        profile = import_profile(path)
-    except ValueError as e:
-        gr.Warning(f"Perfil de identidade inválido em {slot_label or 'um slot'}: {e}. Ignorando este slot.")
-        return None
-    return profile["face"]
+    if profile_files is None:
+        return []
+    if not isinstance(profile_files, list):
+        profile_files = [profile_files]
+
+    results = []
+    for profile_file in profile_files:
+        path = _resolve_history_path(profile_file)
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            profile = import_profile(path)
+        except ValueError as e:
+            gr.Warning(f"Perfil de identidade inválido em {slot_label or 'um slot'} ({os.path.basename(path)}): {e}. Ignorando este arquivo.")
+            continue
+        results.append((profile["face"], os.path.basename(path)))
+    return results
 
 def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles=None):
     """Build one job per destination face, keeping Multiple Faces as a single combined job.
 
-    identity_profiles (optional): one entry per Face-slot; when a slot has an
-    uploaded .npz identity profile, it is queued ALONGSIDE that slot's
-    Destination Gallery images (not instead of them) — a slot with 3 gallery
-    images plus a profile produces 4 independent jobs in Single Face/Faces By
-    Match mode, or all 4 combined into the same Multiple Faces job.
+    identity_profiles (optional): one entry per Face-slot, each either a
+    single uploaded .npz or a list of them (file_count="multiple"); every
+    profile in a slot is queued ALONGSIDE that slot's Destination Gallery
+    images (not instead of them) — a slot with 3 gallery images plus 2
+    profiles produces 5 independent jobs in Single Face/Faces By Match mode,
+    or all 5 combined into the same Multiple Faces job.
     """
     identity_profiles = identity_profiles or [None] * num_faces
 
@@ -264,10 +280,9 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
         faces = []
         labels = []
         for k in range(num_faces):
-            profile_face = _load_identity_profile_face(identity_profiles[k], slot_label=f'Face #{k + 1}')
-            if profile_face is not None:
+            for profile_face, profile_label in _load_identity_profile_faces(identity_profiles[k], slot_label=f'Face #{k + 1}'):
                 faces.append({'origin': None, 'identity_profile': profile_face, 'threshold': 0.0})
-                labels.append(f'Face #{k + 1} (identity profile)')
+                labels.append(f'Face #{k + 1} ({profile_label})')
 
             dest_files = destinations[k]
             if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
@@ -291,11 +306,11 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
     # source (gallery image or identity profile), same Face-slot origin/threshold.
     jobs = []
     for k in range(num_faces):
-        profile_face = _load_identity_profile_face(identity_profiles[k], slot_label=f'Face #{k + 1}')
+        profile_faces = _load_identity_profile_faces(identity_profiles[k], slot_label=f'Face #{k + 1}')
         dest_files = destinations[k]
         has_destination = dest_files is not None and not (isinstance(dest_files, list) and len(dest_files) == 0)
 
-        if profile_face is None and not has_destination:
+        if not profile_faces and not has_destination:
             # Nothing configured for this slot — skip decoding origin_image,
             # matching the pre-identity-profile behavior of not doing any
             # work for an empty slot.
@@ -303,14 +318,14 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
 
         origin_image = load_face_image(origins[k])
 
-        if profile_face is not None:
+        for profile_face, profile_label in profile_faces:
             jobs.append({
                 'faces': [{
                     'origin': origin_image,
                     'identity_profile': profile_face,
                     'threshold': thresholds[k]
                 }],
-                'label': f'Face #{k + 1} (identity profile)'
+                'label': f'Face #{k + 1} ({profile_label})'
             })
 
         if not has_destination:
@@ -411,6 +426,31 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
 
     if failed_jobs:
         gr.Warning(f"Falha ao processar: {', '.join(failed_jobs)}. Os demais jobs foram concluídos.")
+
+def _merge_gallery_upload(new_value, accumulated):
+    """Makes a Face-slot's Destination Gallery additive: a fresh gr.Gallery
+    upload event replaces the component's own `value` instead of appending to
+    it, so each new upload otherwise wipes out everything already there. This
+    combines the freshly uploaded items with whatever was already accumulated
+    in the slot's gr.State, deduplicating by resolved path so re-selecting
+    the same file twice doesn't create a duplicate job later in the queue.
+    """
+    accumulated = list(accumulated or [])
+    seen_paths = {_resolve_history_path(item) for item in accumulated}
+    for item in (new_value or []):
+        path = _resolve_history_path(item)
+        if path and path not in seen_paths:
+            accumulated.append(item)
+            seen_paths.add(path)
+    return accumulated, accumulated
+
+def _sync_gallery_state(current_value):
+    """Keeps a Face-slot's gr.State mirror in sync whenever the gallery's
+    displayed value changes for any reason other than _merge_gallery_upload
+    itself — in particular, the user removing an individual item via the
+    gallery's own delete UI.
+    """
+    return list(current_value or [])
 
 def toggle_tabs_and_faces(mode, face_tabs, origin_faces):
     if mode == "Single Face":
@@ -1126,8 +1166,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
                     destination = gr.Gallery(label="Destination face(s)", columns=4, height="auto", object_fit="contain", file_types=["image"])
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
                 identity_profile_file = gr.File(
-                    label="Identity Profile (.npz) — opcional, some-se à galeria acima na fila de jobs",
-                    file_count="single",
+                    label="Identity Profile(s) (.npz) — opcional, cada um some-se à galeria acima na fila de jobs",
+                    file_count="multiple",
                     file_types=[".npz"],
                 )
             origin_video.append(origin)
@@ -1135,6 +1175,25 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             thresholds_video.append(threshold)
             face_tabs_video.append(tab)
             identity_profile_video.append(identity_profile_file)
+
+            # A new gallery upload replaces the component's own value instead
+            # of appending to it — mirror the accumulated list in a gr.State
+            # so each additional upload merges with what's already there
+            # instead of wiping it out (see _merge_gallery_upload). The
+            # .change() listener keeps that mirror in sync when the value
+            # changes for any other reason (e.g. the user removing an item
+            # via the gallery's own delete UI).
+            destination_state = gr.State([])
+            destination.upload(
+                fn=_merge_gallery_upload,
+                inputs=[destination, destination_state],
+                outputs=[destination, destination_state],
+            )
+            destination.change(
+                fn=_sync_gallery_state,
+                inputs=[destination],
+                outputs=[destination_state],
+            )
 
         face_mode_video.change(
             fn=lambda mode: toggle_tabs_and_faces(mode, face_tabs_video, origin_video),
