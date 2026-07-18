@@ -56,6 +56,13 @@ Evolved from the foundations of the [Refacer](https://github.com/xaviviro/reface
 
 NeoRefacer, just like the original Refacer project, requires no training - just one photo and you're ready to go.
 
+## Known Limitations
+
+* **Extreme head poses (profile / strong tilt)**: face alignment uses a 2D similarity transform against a frontal template, and the swap model works on a fixed 128×128 frontal crop. In-plane rotation (tilted head) is handled well, but strong yaw/pitch (near-profile, head leaned far forward/back) loses 3D perspective and the swap may come out distorted or blurry. This is structural to the underlying InsightFace `inswapper` model, not a bug in this project.
+* **Reface Ratio with head rotation**: the partial-face cutoff line is computed from the detected bounding box, which is always axis-aligned. When the head rotates during a video, the cutoff line may appear to "float" relative to the mouth/chin between frames. The opt-in **Oval Mask** reduces this by anchoring the blend region to the mouth keypoints instead.
+* **Multiple Faces mode when people cross paths**: this mode matches detected faces to destination faces purely by left-to-right position in each frame (no identity check, by design — it's the fast mode). If two people swap relative horizontal positions, their destination faces swap too. Use **Faces by Match** when people move around each other.
+* **No enhancement on video**: automatic image enhancement (CodeFormer) runs only for images/TIFFs. Running it per video frame would be prohibitively slow on typical hardware.
+
 :warning: Please, before using the code from this repository, make sure to read the [LICENSE](https://github.com/MechasAI/NeoRefacer/blob/main/LICENSE).
 
 ## System Compatibility

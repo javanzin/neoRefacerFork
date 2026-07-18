@@ -14,6 +14,7 @@ import base64
 import pyfiglet
 import shutil
 import time
+import traceback
 import ffmpeg
 from urllib.parse import quote
 from gradio.processing_utils import save_file_to_cache
@@ -285,7 +286,7 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
 
     return jobs
 
-def run(*vars):
+def run(progress=gr.Progress(track_tqdm=True), *vars):
     video_path = vars[0]
     origins = vars[1:(num_faces+1)]
     destinations = vars[(num_faces+1):(num_faces*2)+1]
@@ -311,22 +312,37 @@ def run(*vars):
     # When the same target video will be processed for more than one face job,
     # decode + detect it once into a local variable and hand that to every
     # reface() call, instead of relying on refacer's hash-keyed RAM caches.
+    # Not gated on use_cache: this is a run-local variable, not a persistent
+    # cache — without it every extra job pays a full decode+detect+embedding
+    # pass over the same video. The RAM ceiling inside
+    # analyze_video_in_memory already falls back to per-job processing when
+    # the video is too large to hold decoded in memory.
     precomputed = None
-    if use_cache and len(jobs) > 1:
+    if len(jobs) > 1:
         precomputed = refacer.analyze_video_in_memory(video_path, preview=preview)
 
-    for job in jobs:
-        mp4_path, gif_path = refacer.reface(
-            video_path,
-            job['faces'],
-            preview=preview,
-            disable_similarity=disable_similarity,
-            multiple_faces_mode=multiple_faces_mode,
-            partial_reface_ratio=partial_reface_ratio,
-            partial_blend_shape=partial_blend_shape,
-            use_cache=use_cache,
-            precomputed=precomputed
-        )
+    failed_jobs = []
+    for k, job in enumerate(jobs):
+        progress(k / len(jobs), desc=f"{job['label']} ({k + 1}/{len(jobs)})")
+        try:
+            mp4_path, gif_path = refacer.reface(
+                video_path,
+                job['faces'],
+                preview=preview,
+                disable_similarity=disable_similarity,
+                multiple_faces_mode=multiple_faces_mode,
+                partial_reface_ratio=partial_reface_ratio,
+                partial_blend_shape=partial_blend_shape,
+                use_cache=use_cache,
+                precomputed=precomputed
+            )
+        except Exception as e:
+            # A bad destination image (or any per-job failure) must not
+            # silently abort the remaining queued jobs.
+            print(f"[ERROR] Job '{job['label']}' failed: {e}")
+            traceback.print_exc()
+            failed_jobs.append(job['label'])
+            continue
 
         if mp4_path:
             # Record the exact same path Gradio serves for the preview player,
@@ -340,6 +356,9 @@ def run(*vars):
 
         last_mp4_path, last_gif_path = mp4_path, gif_path
         yield last_mp4_path, last_gif_path
+
+    if failed_jobs:
+        gr.Warning(f"Falha ao processar: {', '.join(failed_jobs)}. Os demais jobs foram concluídos.")
 
 def toggle_tabs_and_faces(mode, face_tabs, origin_faces):
     if mode == "Single Face":
@@ -678,8 +697,11 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             outputs=origin_video
         )
 
-        def run_with_history_update(*args):
-            for mp4_path, gif_path in run(*args):
+        def run_with_history_update(progress=gr.Progress(track_tqdm=True), *args):
+            # Gradio injects Progress into the registered handler (this one),
+            # not into plain Python calls — forward it to run() explicitly so
+            # the video tab's inputs don't shift into the progress slot.
+            for mp4_path, gif_path in run(progress, *args):
                 yield mp4_path, gif_path, get_video_history()
 
         video_btn.click(

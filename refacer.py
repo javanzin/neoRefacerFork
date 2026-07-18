@@ -72,6 +72,19 @@ class _FfmpegVideoWriter:
         ]
         if bitrate and bitrate != '0':
             command += ['-b:v', bitrate]
+        elif 'nvenc' in vcodec:
+            # With no rate control at all, nvenc falls back to a low fixed
+            # bitrate (~2Mbps) — visibly worse at 1080p than the old
+            # mp4v + re-encode path. Constant-quality VBR matches it.
+            command += ['-rc', 'vbr', '-cq', '23', '-b:v', '0']
+        elif 'videotoolbox' in vcodec:
+            command += ['-q:v', '65']
+        else:
+            command += ['-crf', '20']
+        if width % 2 != 0 or height % 2 != 0:
+            # H.264 with yuv420p requires even dimensions; the old mp4v writer
+            # accepted odd ones, so pad by one pixel instead of failing.
+            command += ['-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2']
         command += ['-pix_fmt', 'yuv420p', output_path]
 
         self.process = subprocess.Popen(
@@ -111,7 +124,17 @@ class Refacer:
     def __init__(self, force_cpu=False, colab_performance=False):
         self.disable_similarity = False
         self.multiple_faces_mode = False
-        self.first_face = False
+        # Frame-to-frame identity continuity (see _apply_swaps): IoU above
+        # this keeps a face bound to the same destination as last frame; the
+        # By Match fallback persists at most this many frames below threshold.
+        self._tracking_enabled = False
+        self._pos_tracks = {}
+        self._match_tracks = {}
+        self.track_iou_threshold = 0.4
+        self.track_max_misses = 15
+        self._pipe_probe_cache = {}
+        self._video_hash_cache = {}
+        self.frame_cache_meta = None
         self.force_cpu = force_cpu
         self.colab_performance = colab_performance
         self.video_has_audio = False
@@ -256,12 +279,13 @@ class Refacer:
             return self.frame_cache[video_hash]
         return None
 
-    def _store_cached_frames(self, video_hash, frames):
+    def _store_cached_frames(self, video_hash, frames, meta=None):
         """Store fully decoded frames in RAM, keyed by video hash.
 
         Only one video is kept at a time: when multiple target faces are reused
         against the same video (one job per face), later jobs skip re-reading and
-        re-decoding the file from disk entirely.
+        re-decoding the file from disk entirely. `meta` carries fps/width/height
+        so reusing jobs don't have to reopen the file just to read them.
         """
         estimated_mb = sum(f.nbytes for f in frames) / (1024 * 1024)
         if estimated_mb > self.frame_cache_max_memory_mb:
@@ -271,14 +295,20 @@ class Refacer:
 
         self.frame_cache = {video_hash: frames}
         self.frame_cache_video_hash = video_hash
+        self.frame_cache_meta = meta
         print(f"[FRAME CACHE] Cached {len(frames)} decoded frames ({estimated_mb:.0f}MB) for reuse")
 
     def _clear_frame_cache(self):
         self.frame_cache = {}
         self.frame_cache_video_hash = None
+        self.frame_cache_meta = None
     
     def __get_faces_with_light_cache(self, frame, video_hash, frame_idx, max_num=8):
-        """Get faces with lightweight in-memory cache for detection only."""
+        """Get faces with lightweight in-memory cache for detection only.
+
+        Returns (faces, cache_hit) so the caller can count hits without a
+        second redundant cache lookup.
+        """
         # Check light cache first
         cached = self._get_light_cache(video_hash, frame_idx)
         if cached is not None:
@@ -287,24 +317,24 @@ class Refacer:
             kpss = cached["kpss"]
             
             if bboxes.shape[0] == 0:
-                return []
-            
+                return [], True
+
             ret = []
             for i in range(bboxes.shape[0]):
                 bbox = bboxes[i, 0:4]
                 det_score = bboxes[i, 4]
                 kps = kpss[i] if kpss is not None else None
                 face = Face(bbox=bbox, kps=kps, det_score=det_score)
-                
+
                 # Still need to compute embedding (depends on source face)
                 start_embed = self._profile_start("face_embedding")
                 face.embedding = self.rec_app.get(frame, kps)
                 self._profile_end("face_embedding", start_embed)
-                
+
                 ret.append(face)
-            
-            return ret
-        
+
+            return ret, True
+
         # Cache miss: do full detection and cache result
         start_detect = self._profile_start("face_detection")
         bboxes, kpss = self.face_detector.detect(frame, max_num=max_num, metric='default')
@@ -312,25 +342,25 @@ class Refacer:
         
         # Cache detection result (bboxes + kpss only, no embeddings)
         self._set_light_cache(video_hash, frame_idx, bboxes, kpss)
-        
+
         if bboxes.shape[0] == 0:
-            return []
-        
+            return [], False
+
         ret = []
         for i in range(bboxes.shape[0]):
             bbox = bboxes[i, 0:4]
             det_score = bboxes[i, 4]
             kps = kpss[i] if kpss is not None else None
             face = Face(bbox=bbox, kps=kps, det_score=det_score)
-            
+
             start_embed = self._profile_start("face_embedding")
             face.embedding = self.rec_app.get(frame, kps)
             self._profile_end("face_embedding", start_embed)
-            
+
             ret.append(face)
-        
-        return ret
-    
+
+        return ret, False
+
     def analyze_video_in_memory(self, video_path, max_num_faces=8, preview=False):
         """Decode every frame and detect faces exactly once, returning a plain
         local value (list of (frame, bboxes, kpss) tuples), or None if the
@@ -347,7 +377,6 @@ class Refacer:
         as soon as all jobs for that video are done.
         """
         cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
         frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -373,6 +402,16 @@ class Refacer:
                 if not flag:
                     break
 
+                # Skipped preview frames are dropped entirely, matching the
+                # other preview paths (short fast-forward output, every kept
+                # frame swapped) — keeping them produced a full-length preview
+                # with 9 of every 10 frames unswapped, and made the upfront
+                # RAM estimate 10x smaller than what was actually retained.
+                if frame_index % skip_rate != 0:
+                    frame_index += 1
+                    pbar.update()
+                    continue
+
                 running_bytes += frame.nbytes
                 if running_bytes / (1024 * 1024) > self.in_memory_analysis_max_mb:
                     print(f"[IN-MEMORY ANALYSIS] Aborting mid-decode: exceeded "
@@ -380,24 +419,21 @@ class Refacer:
                     cap.release()
                     return None
 
-                if frame_index % skip_rate == 0:
-                    start_detect = self._profile_start("face_detection")
-                    bboxes, kpss = self.face_detector.detect(frame, max_num=max_num_faces, metric='default')
-                    self._profile_end("face_detection", start_detect)
+                start_detect = self._profile_start("face_detection")
+                bboxes, kpss = self.face_detector.detect(frame, max_num=max_num_faces, metric='default')
+                self._profile_end("face_detection", start_detect)
 
-                    # Embeddings depend only on the frame, not on which source face a
-                    # given job is matching against — compute them once here so N
-                    # jobs over the same video don't each re-run embedding inference.
-                    embeddings = []
-                    for i in range(bboxes.shape[0]):
-                        kps = kpss[i] if kpss is not None else None
-                        start_embed = self._profile_start("face_embedding")
-                        embeddings.append(self.rec_app.get(frame, kps))
-                        self._profile_end("face_embedding", start_embed)
+                # Embeddings depend only on the frame, not on which source face a
+                # given job is matching against — compute them once here so N
+                # jobs over the same video don't each re-run embedding inference.
+                embeddings = []
+                for i in range(bboxes.shape[0]):
+                    kps = kpss[i] if kpss is not None else None
+                    start_embed = self._profile_start("face_embedding")
+                    embeddings.append(self.rec_app.get(frame, kps))
+                    self._profile_end("face_embedding", start_embed)
 
-                    entries.append((frame, bboxes, kpss, embeddings))
-                else:
-                    entries.append((frame, None, None, None))
+                entries.append((frame, bboxes, kpss, embeddings))
 
                 frame_index += 1
                 pbar.update()
@@ -420,7 +456,7 @@ class Refacer:
         (no self.light_cache / self.frame_cache involved).
         """
         self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
-        self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
+        self._tracking_enabled = True
         self.partial_reface_ratio = partial_reface_ratio
         self.partial_blend_shape = partial_blend_shape
 
@@ -431,37 +467,21 @@ class Refacer:
 
         output, already_encoded = self._open_video_writer(output_path, fps, frame_width, frame_height)
 
-        batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
-        frames = []
-
         with tqdm(total=len(entries), desc="Processing frames (precomputed)") as pbar:
             for frame, bboxes, kpss, embeddings in entries:
-                if bboxes is None:
-                    processed_frame = frame
-                else:
-                    faces_in_frame = []
-                    for i in range(bboxes.shape[0]):
-                        bbox = bboxes[i, 0:4]
-                        det_score = bboxes[i, 4]
-                        kps = kpss[i] if kpss is not None else None
-                        face = Face(bbox=bbox, kps=kps, det_score=det_score)
-                        face.embedding = embeddings[i]
-                        faces_in_frame.append(face)
+                faces_in_frame = []
+                for i in range(bboxes.shape[0]):
+                    bbox = bboxes[i, 0:4]
+                    det_score = bboxes[i, 4]
+                    kps = kpss[i] if kpss is not None else None
+                    face = Face(bbox=bbox, kps=kps, det_score=det_score)
+                    face.embedding = embeddings[i]
+                    faces_in_frame.append(face)
 
-                    processed_frame = self._process_faces_with_cached_data(frame, faces_in_frame) if faces_in_frame else frame
-
-                frames.append(processed_frame)
-
-                if len(frames) > batch_size:
-                    for f in frames:
-                        output.write(f)
-                    frames = []
-
+                processed_frame = self._process_faces_with_cached_data(frame, faces_in_frame) if faces_in_frame else frame
+                output.write(processed_frame)
                 pbar.update()
 
-        if frames:
-            for f in frames:
-                output.write(f)
         output.release()
 
         converted_path = self.__convert_video(video_path, output_path, preview=preview, already_encoded=already_encoded)
@@ -482,7 +502,7 @@ class Refacer:
         
         # Prepare source faces
         self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
-        self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
+        self._tracking_enabled = True
         self.partial_reface_ratio = partial_reface_ratio
         self.partial_blend_shape = partial_blend_shape
 
@@ -493,17 +513,15 @@ class Refacer:
         # another target face (one job per face, same run) — skips disk I/O + decode.
         cached_frames = self._get_cached_frames(video_hash)
 
-        if cached_frames is not None:
-            cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-            fps = cap.get(cv2.CAP_PROP_FPS)
-            frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            cap.release()
+        if cached_frames is not None and self.frame_cache_meta:
+            fps = self.frame_cache_meta["fps"]
+            frame_width = self.frame_cache_meta["width"]
+            frame_height = self.frame_cache_meta["height"]
             total_frames = len(cached_frames)
             print(f"[FRAME CACHE] Reusing {total_frames} decoded frames, skipping video re-read")
         else:
+            cached_frames = None
             cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -511,9 +529,6 @@ class Refacer:
 
         output, already_encoded = self._open_video_writer(output_path, fps, frame_width, frame_height)
 
-        # Dynamic batch size based on VRAM
-        batch_size = self._calculate_optimal_batch_size(frame_width, frame_height, fps)
-        frames = []
         decoded_frames = [] if cached_frames is None else None
         frame_index = 0
         skip_rate = 10 if preview else 1
@@ -544,39 +559,33 @@ class Refacer:
                     continue
 
                 # Use light cache for detection
-                faces_in_frame = self.__get_faces_with_light_cache(frame, video_hash, frame_index, max_num=8)
+                faces_in_frame, was_hit = self.__get_faces_with_light_cache(frame, video_hash, frame_index, max_num=8)
 
-                # Track cache hits/misses
-                if self._get_light_cache(video_hash, frame_index) is not None:
+                if was_hit:
                     cache_hits += 1
                 else:
                     cache_misses += 1
 
-                # Process faces
+                # Process faces and write straight to the encoder — buffering
+                # hundreds of processed frames in RAM gained nothing (the
+                # writer buffers on its own) and peaked at gigabytes.
                 if not faces_in_frame:
                     processed_frame = frame
                 else:
                     processed_frame = self._process_faces_with_cached_data(frame, faces_in_frame)
 
-                frames.append(processed_frame)
-
-                if len(frames) > batch_size:
-                    for f in frames:
-                        output.write(f)
-                    frames = []
+                output.write(processed_frame)
 
                 frame_index += 1
                 pbar.update()
 
         if cached_frames is None:
             cap.release()
-        if frames:
-            for f in frames:
-                output.write(f)
         output.release()
 
         if decoded_frames:
-            self._store_cached_frames(video_hash, decoded_frames)
+            self._store_cached_frames(video_hash, decoded_frames,
+                                      meta={"fps": fps, "width": frame_width, "height": frame_height})
 
         self._profile_end("total_processing", start_total)
         
@@ -598,44 +607,14 @@ class Refacer:
         return 8.0  # Assume 8GB if unable to detect
 
     def _calculate_optimal_batch_size(self, frame_width, frame_height, fps):
-        """Calculate optimal batch size based on VRAM availability and frame properties.
-        
-        Optimized for Tesla T4 (16GB VRAM) but works for any GPU.
+        """How many decoded frames to buffer before handing a group to
+        reface_group (non-cached path only). This is NOT inference batching —
+        inference runs frame by frame regardless — so the buffer only bounds
+        RAM (a 1080p BGR frame is ~6MB) while giving the CPU-mode thread pool
+        enough work to overlap. The old VRAM-based formula measured nothing
+        real and could hold up to 1000 frames (~6GB) in RAM.
         """
-        try:
-            import torch
-            if torch.cuda.is_available():
-                # Get VRAM info
-                vram_total = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # GB
-                vram_allocated = torch.cuda.memory_allocated(0) / (1024**3)  # GB
-                vram_available = vram_total - vram_allocated
-                
-                # Calculate frame size in MB (RGB)
-                frame_size_mb = (frame_width * frame_height * 3) / (1024**2)
-                
-                # Use 70% of available VRAM for frames
-                vram_for_frames = vram_available * 1024 * 0.7  # MB
-                max_frames_by_vram = int(vram_for_frames / frame_size_mb)
-                
-                # Also consider FPS (batch should represent 1-2 seconds of video)
-                min_frames_by_fps = max(fps, 30)  # At least 1 second
-                max_frames_by_fps = fps * 2  # At most 2 seconds
-                
-                # Apply hard limits
-                min_batch = 100
-                max_batch = 1000
-                
-                # Calculate final batch size
-                batch_size = min(max_frames_by_vram, max_frames_by_fps)
-                batch_size = max(min(batch_size, max_batch), min_batch)
-                
-                print(f"[BATCH] Dynamic batch size: {batch_size} (VRAM: {vram_available:.1f}GB, Frame: {frame_size_mb:.1f}MB)")
-                return batch_size
-        except Exception as e:
-            print(f"[BATCH] Failed to calculate dynamic batch size: {e}")
-        
-        # Fallback to conservative default
-        return 300
+        return 100
 
     def _partial_face_blend(self, original_frame, swapped_frame, face):
         h_frame, w_frame = original_frame.shape[:2]
@@ -752,26 +731,62 @@ class Refacer:
 
         return mask
 
+    def _pipe_encoder_works(self, fps, frame_width, frame_height):
+        """Actually exercise the ffmpeg pipe once (encode a single black frame
+        to a temp file) before trusting it for a real job. Popen alone succeeds
+        even with an unusable encoder — the failure only surfaces on
+        write()/release(), after real work was already done. Result is cached
+        per (encoder, resolution) so the probe runs once, not per job.
+        """
+        key = (self.ffmpeg_video_encoder, frame_width, frame_height)
+        cached = self._pipe_probe_cache.get(key)
+        if cached is not None:
+            return cached
+        probe_fd, probe_path = tempfile.mkstemp(suffix='.mp4')
+        os.close(probe_fd)
+        ok = False
+        try:
+            probe = _FfmpegVideoWriter(
+                probe_path, fps, (frame_width, frame_height),
+                self.ffmpeg_video_encoder, self.ffmpeg_video_bitrate
+            )
+            probe.write(np.zeros((frame_height, frame_width, 3), dtype=np.uint8))
+            probe.release()
+            ok = True
+        except Exception as e:
+            print(f"[ENCODE] Pipe probe failed for {self.ffmpeg_video_encoder} "
+                  f"at {frame_width}x{frame_height}: {e}")
+        finally:
+            try:
+                os.remove(probe_path)
+            except OSError:
+                pass
+        self._pipe_probe_cache[key] = ok
+        return ok
+
     def _open_video_writer(self, output_path, fps, frame_width, frame_height):
         """Try a single direct-to-H.264 encode via ffmpeg pipe (no intermediate
-        mp4v). Falls back to the old cv2.VideoWriter + mp4v path if the pipe
-        can't be started (e.g. ffmpeg missing the configured encoder at runtime).
+        mp4v). Falls back to the old cv2.VideoWriter + mp4v path if the probe
+        encode fails (unusable encoder, incompatible flags, etc.).
 
         Returns (writer, already_encoded). When already_encoded is True, callers
         must pass already_encoded=True to __convert_video so the video stream is
         only muxed with audio (if any), not re-encoded a second time.
         """
-        try:
-            writer = _FfmpegVideoWriter(
-                output_path, fps, (frame_width, frame_height),
-                self.ffmpeg_video_encoder, self.ffmpeg_video_bitrate
-            )
-            return writer, True
-        except Exception as e:
-            print(f"[ENCODE] Direct H.264 pipe failed ({e}), falling back to mp4v + re-encode")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-            writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
-            return writer, False
+        if self._pipe_encoder_works(fps, frame_width, frame_height):
+            try:
+                writer = _FfmpegVideoWriter(
+                    output_path, fps, (frame_width, frame_height),
+                    self.ffmpeg_video_encoder, self.ffmpeg_video_bitrate
+                )
+                return writer, True
+            except Exception as e:
+                print(f"[ENCODE] Direct H.264 pipe failed ({e}), falling back to mp4v + re-encode")
+        else:
+            print("[ENCODE] Pipe probe failed, falling back to mp4v + re-encode")
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (frame_width, frame_height))
+        return writer, False
 
     def __download_with_progress(self, url, output_path):
         response = requests.get(url, stream=True)
@@ -888,9 +903,19 @@ class Refacer:
         self.face_swapper = INSwapper(model_path, sess_swap)
 
     def _compute_video_hash(self, video_path):
-        """Fast video fingerprinting using first and last 1MB plus file size."""
-        size = os.path.getsize(video_path)
-        
+        """Fast video fingerprinting using first and last 1MB plus file size.
+
+        Memoized by (path, mtime, size) — the multi-job flow calls this once
+        per job for the same unchanged file, and re-reading 2MB from disk per
+        job is wasted I/O on the CPU-starved Colab tier.
+        """
+        stat = os.stat(video_path)
+        memo_key = (video_path, stat.st_mtime_ns, stat.st_size)
+        cached_hash = self._video_hash_cache.get(memo_key)
+        if cached_hash is not None:
+            return cached_hash
+        size = stat.st_size
+
         # Read first and last 1MB (handle small files)
         with open(video_path, 'rb') as f:
             first_mb = f.read(1024*1024)
@@ -903,7 +928,10 @@ class Refacer:
             last_mb = f.read()
         
         hash_input = f"{size}-{first_mb}-{last_mb}".encode()
-        return hashlib.sha256(hash_input).hexdigest()
+        digest = hashlib.sha256(hash_input).hexdigest()
+        # Keep only the latest entry — the app works on one video at a time.
+        self._video_hash_cache = {memo_key: digest}
+        return digest
     
     def _get_cache_dir(self, video_hash):
         """Get cache directory for a specific video hash."""
@@ -1091,59 +1119,148 @@ class Refacer:
             return True
         return getattr(self, 'partial_reface_ratio', 0.0) > 0.0
 
+    @staticmethod
+    def _bbox_iou(a, b):
+        ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+        ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+        iw, ih = max(0.0, ix2 - ix1), max(0.0, iy2 - iy1)
+        inter = iw * ih
+        if inter <= 0:
+            return 0.0
+        area_a = (a[2] - a[0]) * (a[3] - a[1])
+        area_b = (b[2] - b[0]) * (b[3] - b[1])
+        return float(inter / (area_a + area_b - inter))
+
+    def _swap_one(self, frame, face, dest_face):
+        swapped = self.face_swapper.get(frame, face, dest_face, paste_back=True)
+        if self._should_partial_blend():
+            self.blend_height_ratio = self.partial_reface_ratio
+            return self._partial_face_blend(frame, swapped, face)
+        return swapped
+
     def _apply_swaps(self, frame, faces):
         """Apply face swaps to an already-detected+embedded list of faces.
 
         Shared by the cached and non-cached processing paths so a fix to the
         matching logic only needs to happen in one place.
+
+        When self._tracking_enabled is True (only set by the sequential video
+        paths — never by images or the threaded reface_group branch, where
+        frames are processed out of order), a lightweight IoU continuity state
+        is kept between consecutive frames so identities don't flicker. The
+        extra cost is a handful of rectangle comparisons per frame.
         """
         if not faces:
+            if self._tracking_enabled and self._match_tracks:
+                # Age tracks on empty frames too — otherwise misses freeze
+                # during a no-detection stretch (occlusion, cutaway) and a
+                # stale track could reactivate much later on a different
+                # person standing in the same screen region.
+                for r_idx in list(self._match_tracks):
+                    self._match_tracks[r_idx]["misses"] += 1
+                    if self._match_tracks[r_idx]["misses"] >= self.track_max_misses:
+                        del self._match_tracks[r_idx]
             return frame
 
         faces = sorted(faces, key=lambda face: face.bbox[0])
 
-        if self.multiple_faces_mode:
-            for idx, face in enumerate(faces):
-                if idx >= len(self.replacement_faces):
+        multi_position_mode = self.multiple_faces_mode or (
+            self.disable_similarity and len(self.replacement_faces) > 1
+        )
+
+        if multi_position_mode:
+            # Position-based modes: destination slots are assigned left to
+            # right, but a face overlapping a slot's previous-frame bbox keeps
+            # that slot — so two people crossing paths no longer trade
+            # destination faces the moment their horizontal order flips.
+            assignments = {}  # f_idx -> r_idx
+            if self._tracking_enabled and self._pos_tracks:
+                candidates = []
+                for r_idx, prev_bbox in self._pos_tracks.items():
+                    if r_idx >= len(self.replacement_faces):
+                        continue
+                    for f_idx, face in enumerate(faces):
+                        iou = self._bbox_iou(prev_bbox, face.bbox)
+                        if iou >= self.track_iou_threshold:
+                            candidates.append((iou, r_idx, f_idx))
+                candidates.sort(reverse=True)
+                used_slots = set()
+                for iou, r_idx, f_idx in candidates:
+                    if r_idx in used_slots or f_idx in assignments:
+                        continue
+                    assignments[f_idx] = r_idx
+                    used_slots.add(r_idx)
+            taken_slots = set(assignments.values())
+            free_slots = iter(
+                r for r in range(len(self.replacement_faces))
+                if r not in taken_slots
+            )
+            for f_idx in range(len(faces)):
+                if f_idx in assignments:
+                    continue
+                r_idx = next(free_slots, None)
+                if r_idx is None:
                     break
-                swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
-                if self._should_partial_blend():
-                    self.blend_height_ratio = self.partial_reface_ratio
-                    frame = self._partial_face_blend(frame, swapped, face)
-                else:
-                    frame = swapped
+                assignments[f_idx] = r_idx
+            for f_idx, r_idx in assignments.items():
+                frame = self._swap_one(frame, faces[f_idx], self.replacement_faces[r_idx][1])
+            if self._tracking_enabled:
+                self._pos_tracks = {r: faces[f].bbox for f, r in assignments.items()}
         elif self.disable_similarity:
-            if len(self.replacement_faces) > 1:
-                for idx, face in enumerate(faces):
-                    if idx >= len(self.replacement_faces):
-                        break
-                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[idx][1], paste_back=True)
-                    if self._should_partial_blend():
-                        self.blend_height_ratio = self.partial_reface_ratio
-                        frame = self._partial_face_blend(frame, swapped, face)
-                    else:
-                        frame = swapped
-            else:
-                for face in faces:
-                    swapped = self.face_swapper.get(frame, face, self.replacement_faces[0][1], paste_back=True)
-                    if self._should_partial_blend():
-                        self.blend_height_ratio = self.partial_reface_ratio
-                        frame = self._partial_face_blend(frame, swapped, face)
-                    else:
-                        frame = swapped
+            for face in faces:
+                frame = self._swap_one(frame, face, self.replacement_faces[0][1])
         else:
-            for rep_face in self.replacement_faces:
-                for i in range(len(faces) - 1, -1, -1):
-                    sim = self.rec_app.compute_sim(rep_face[0], faces[i].embedding)
+            # Score every (replacement, detected) pair and assign by highest
+            # similarity globally, instead of first-above-threshold in
+            # configuration/position order. Each replacement still swaps at
+            # most one face per frame and each detected face is swapped at
+            # most once; ties between replacements are now won by similarity,
+            # no longer by tab configuration order.
+            pairs = []
+            for r_idx, rep_face in enumerate(self.replacement_faces):
+                for f_idx, face in enumerate(faces):
+                    sim = self.rec_app.compute_sim(rep_face[0], face.embedding)
                     if sim >= rep_face[2]:
-                        swapped = self.face_swapper.get(frame, faces[i], rep_face[1], paste_back=True)
-                        if self._should_partial_blend():
-                            self.blend_height_ratio = self.partial_reface_ratio
-                            frame = self._partial_face_blend(frame, swapped, faces[i])
-                        else:
-                            frame = swapped
-                        del faces[i]
-                        break
+                        pairs.append((sim, r_idx, f_idx))
+            pairs.sort(key=lambda p: p[0], reverse=True)
+            used_reps, used_faces = set(), set()
+            for sim, r_idx, f_idx in pairs:
+                if r_idx in used_reps or f_idx in used_faces:
+                    continue
+                used_reps.add(r_idx)
+                used_faces.add(f_idx)
+                frame = self._swap_one(frame, faces[f_idx], self.replacement_faces[r_idx][1])
+                if self._tracking_enabled:
+                    self._match_tracks[r_idx] = {"bbox": faces[f_idx].bbox, "misses": 0}
+            if self._tracking_enabled:
+                # Continuity fallback: a replacement that matched in recent
+                # frames but dipped below its threshold this frame (motion
+                # blur, brief rotation, partial occlusion) keeps swapping the
+                # face at its previous position for up to track_max_misses
+                # frames, instead of flashing the original face back.
+                for r_idx, track in list(self._match_tracks.items()):
+                    if r_idx in used_reps:
+                        continue
+                    if track["misses"] >= self.track_max_misses:
+                        del self._match_tracks[r_idx]
+                        continue
+                    best_f, best_iou = None, 0.0
+                    for f_idx, face in enumerate(faces):
+                        if f_idx in used_faces:
+                            continue
+                        iou = self._bbox_iou(track["bbox"], face.bbox)
+                        if iou > best_iou:
+                            best_f, best_iou = f_idx, iou
+                    if best_f is not None and best_iou >= self.track_iou_threshold:
+                        used_reps.add(r_idx)
+                        used_faces.add(best_f)
+                        frame = self._swap_one(frame, faces[best_f], self.replacement_faces[r_idx][1])
+                        self._match_tracks[r_idx] = {
+                            "bbox": faces[best_f].bbox,
+                            "misses": track["misses"] + 1,
+                        }
+                    else:
+                        track["misses"] += 1
         return frame
 
     def _process_faces_with_cached_data(self, frame, faces):
@@ -1162,7 +1279,7 @@ class Refacer:
 
         # Prepare source faces (not cached - depends on source)
         self.prepare_faces(faces, disable_similarity, multiple_faces_mode)
-        self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
+        self._tracking_enabled = True
         self.partial_reface_ratio = partial_reface_ratio
         self.partial_blend_shape = partial_blend_shape
 
@@ -1192,9 +1309,6 @@ class Refacer:
         
         # Process frames using cached data
         total_frames = metadata["total_frames"]
-        # Dynamic batch size based on VRAM
-        batch_size = self._calculate_optimal_batch_size(metadata["width"], metadata["height"], metadata["fps"])
-        frames = []
         skip_rate = 10 if preview else 1
         
         with tqdm(total=total_frames, desc="Processing frames (cached)") as pbar:
@@ -1218,12 +1332,7 @@ class Refacer:
                 except (FileNotFoundError, KeyError):
                     # Cache miss for this frame, fall back to regular processing
                     print(f"[CACHE] Miss for frame {frame_idx}, falling back to regular processing...")
-                    processed_frame = self.process_faces(frame) if not self.first_face else self.process_first_face(frame)
-                    frames.append(processed_frame)
-                    if len(frames) >= batch_size:
-                        for f in frames:
-                            output.write(f)
-                        frames = []
+                    output.write(self.process_faces(frame))
                     pbar.update(1)
                     continue
                 
@@ -1247,20 +1356,9 @@ class Refacer:
                     faces_in_frame.append(face)
                 
                 # Process faces using cached data (swap only, no detection/embedding)
-                processed_frame = self._process_faces_with_cached_data(frame, faces_in_frame)
-                
-                frames.append(processed_frame)
-                
-                if len(frames) >= batch_size:
-                    for f in frames:
-                        output.write(f)
-                    frames = []
+                output.write(self._process_faces_with_cached_data(frame, faces_in_frame))
 
                 pbar.update(1)
-
-        # Write remaining frames
-        for f in frames:
-            output.write(f)
 
         cap.release()
         output.release()
@@ -1273,6 +1371,13 @@ class Refacer:
         self.replacement_faces = []
         self.disable_similarity = disable_similarity
         self.multiple_faces_mode = multiple_faces_mode
+
+        # Reset per-job identity tracking (see _apply_swaps). Disabled here so
+        # images and the threaded (out-of-order) video branch never track;
+        # sequential video paths re-enable it right after calling this.
+        self._tracking_enabled = False
+        self._pos_tracks = {}
+        self._match_tracks = {}
 
         for face in faces:
             if "destination" not in face or face["destination"] is None:
@@ -1296,7 +1401,6 @@ class Refacer:
                     feat_original = self.rec_app.get(face['origin'], kpss1[0])
                 else:
                     face_threshold = 0
-                    self.first_face = True
                     feat_original = None
 
                 self.replacement_faces.append((feat_original, _faces[0], face_threshold))
@@ -1324,9 +1428,6 @@ class Refacer:
 
         return ret
 
-    def process_first_face(self, frame):
-        return self.process_faces(frame)
-
     def process_faces(self, frame):
         faces = self.__get_faces(frame, max_num=8)
         if not faces:
@@ -1338,7 +1439,7 @@ class Refacer:
         return frame
 
     def reface_group(self, faces, frames, output):
-        worker_fn = self.process_first_face if self.first_face else self.process_faces
+        worker_fn = self.process_faces
 
         # Write each processed frame to disk as soon as it's ready instead of
         # materializing the whole batch (list(executor.map(...))) in RAM first —
@@ -1491,12 +1592,13 @@ class Refacer:
         else:
             # Use original non-cached implementation
             self.prepare_faces(faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode)
-            self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
+            # reface_group processes frames concurrently (out of order) outside
+            # CUDA mode — frame-to-frame tracking is only valid when serialized.
+            self._tracking_enabled = (self.mode == RefacerMode.CUDA)
             self.partial_reface_ratio = partial_reface_ratio
             self.partial_blend_shape = partial_blend_shape
 
             cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 10)  # Increase buffer size for smoother I/O
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             fps = cap.get(cv2.CAP_PROP_FPS)
             frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -1579,8 +1681,11 @@ class Refacer:
             in1 = ffmpeg.input(output_video_path)
             if already_encoded:
                 # Video is already H.264 from the direct pipe encode — just mux audio.
+                # shortest=None emits ffmpeg's -shortest flag: without it, audio
+                # longer than the video stream freezes the last frame until the
+                # audio ends instead of cutting at the video's end.
                 in2 = ffmpeg.input(video_path)
-                out = ffmpeg.output(in1.video, in2.audio, new_path, vcodec='copy', acodec='aac')
+                out = ffmpeg.output(in1.video, in2.audio, new_path, vcodec='copy', acodec='aac', shortest=None)
             else:
                 # Always re-encode through the GPU/H.264 encoder, not just when audio
                 # needs muxing — the OpenCV mp4v writer used upstream is lower quality
@@ -1588,17 +1693,22 @@ class Refacer:
                 out_kwargs = dict(video_bitrate=self.ffmpeg_video_bitrate, vcodec=self.ffmpeg_video_encoder)
                 if self.video_has_audio:
                     in2 = ffmpeg.input(video_path)
-                    out = ffmpeg.output(in1.video, in2.audio, new_path, **out_kwargs)
+                    out = ffmpeg.output(in1.video, in2.audio, new_path, shortest=None, **out_kwargs)
                 else:
                     out = ffmpeg.output(in1.video, new_path, **out_kwargs)
             out.run(overwrite_output=True, quiet=True)
+            # The pre-mux/pre-reencode intermediate is no longer needed and
+            # doubles disk usage per video on Colab's small disk.
+            try:
+                os.remove(output_video_path)
+            except OSError:
+                pass
         print(f"Refaced video saved at: {os.path.abspath(new_path)}")
         return new_path
 
     def reface_image(self, image_path, faces, disable_similarity=False, multiple_faces_mode=False,
                       partial_reface_ratio=0.0, partial_blend_shape="rect"):
          self.prepare_faces(faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode)
-         self.first_face = False if multiple_faces_mode else (faces[0].get("origin") is None or disable_similarity)
          self.partial_reface_ratio = partial_reface_ratio
          self.partial_blend_shape = partial_blend_shape
  
@@ -1625,7 +1735,7 @@ class Refacer:
                  for page in range(page_count):
                      pil_img.seek(page)
                      bgr_image = cv2.cvtColor(np.array(pil_img.convert('RGB')), cv2.COLOR_RGB2BGR)
-                     refaced_bgr = self.process_first_face(bgr_image.copy()) if self.first_face else self.process_faces(bgr_image.copy())
+                     refaced_bgr = self.process_faces(bgr_image.copy())
                      enhanced_bgr = enhance_image_memory(refaced_bgr)
                      enhanced_rgb = cv2.cvtColor(enhanced_bgr, cv2.COLOR_BGR2RGB)
                      enhanced_pil = Image.fromarray(enhanced_rgb)
@@ -1642,7 +1752,7 @@ class Refacer:
              if bgr_image is None:
                  raise ValueError("Failed to read input image")
  
-             refaced_bgr = self.process_first_face(bgr_image.copy()) if self.first_face else self.process_faces(bgr_image.copy())
+             refaced_bgr = self.process_faces(bgr_image.copy())
              refaced_rgb = cv2.cvtColor(refaced_bgr, cv2.COLOR_BGR2RGB)
              pil_img = Image.fromarray(refaced_rgb)
              filename = f"{original_name}_{timestamp}.jpg"
@@ -1681,7 +1791,8 @@ class Refacer:
         return cropped_faces
 
     def __try_ffmpeg_encoder(self, vcodec):
-        command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=1280x720:rate=30', '-vcodec', vcodec, 'testsrc.mp4']
+        # -f null: exercise the encoder without leaving a testsrc.mp4 in the CWD
+        command = ['ffmpeg', '-y', '-f', 'lavfi', '-i', 'testsrc=duration=1:size=1280x720:rate=30', '-vcodec', vcodec, '-f', 'null', '-']
         try:
             subprocess.run(command, check=True, capture_output=True).stderr
         except subprocess.CalledProcessError:

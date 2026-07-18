@@ -4,11 +4,19 @@
 # @Time          : 2021-05-04
 # @Function      : 
 
+import os
 import numpy as np
 import cv2
 import onnx
 import onnxruntime
 import face_align
+
+# Opt-in experiment (REFACER_POSE_ALIGN=1): align the recognition crop against
+# the best of 5 pose templates (profile→frontal→profile) instead of the single
+# frontal arcface template. May give more stable embeddings (and thus matching)
+# for 3/4-pose faces, but the ArcFace model was trained on arcface alignment —
+# validate visually before keeping it on. Affects matching only, never the swap.
+_ALIGN_MODE = 'non-arcface' if os.getenv('REFACER_POSE_ALIGN') == '1' else 'arcface'
 
 __all__ = [
     'ArcFaceONNX',
@@ -62,7 +70,7 @@ class ArcFaceONNX:
             self.session.set_providers(['CPUExecutionProvider'])
 
     def get(self, img, kps):
-        aimg = face_align.norm_crop(img, landmark=kps, image_size=self.input_size[0])
+        aimg = face_align.norm_crop(img, landmark=kps, image_size=self.input_size[0], mode=_ALIGN_MODE)
         embedding = self.get_feat(aimg).flatten()
         return embedding
 

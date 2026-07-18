@@ -86,7 +86,7 @@ def _enhance_img(img: np.ndarray, w: float = 0.5) -> np.ndarray:
     restored_img = _face_helper.paste_faces_to_input_image()
     return restored_img
 
-def enhance_image(input_image_path: str, w: float = 0.5) -> str:
+def enhance_image(input_image_path: str, w: float = 0.7) -> str:
     """
     Enhances an input image using CodeFormer and saves it with a '.enhanced.jpg' suffix.
     """
@@ -104,7 +104,7 @@ def enhance_image(input_image_path: str, w: float = 0.5) -> str:
     print(f"Enhanced image saved to: {output_path}")
     return str(output_path)
 
-def enhance_image_memory(img: np.ndarray, w: float = 0.5) -> np.ndarray:
+def enhance_image_memory(img: np.ndarray, w: float = 0.7) -> np.ndarray:
     """
     Enhances an input image entirely in memory and returns the enhanced image.
     """
