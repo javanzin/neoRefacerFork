@@ -252,9 +252,10 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
     """Build one job per destination face, keeping Multiple Faces as a single combined job.
 
     identity_profiles (optional): one entry per Face-slot; when a slot has an
-    uploaded .npz identity profile, it takes priority over that slot's
-    Destination Gallery (the gallery is also disabled in the UI when a
-    profile is uploaded, see Video Mode tab).
+    uploaded .npz identity profile, it is queued ALONGSIDE that slot's
+    Destination Gallery images (not instead of them) — a slot with 3 gallery
+    images plus a profile produces 4 independent jobs in Single Face/Faces By
+    Match mode, or all 4 combined into the same Multiple Faces job.
     """
     identity_profiles = identity_profiles or [None] * num_faces
 
@@ -267,7 +268,6 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
             if profile_face is not None:
                 faces.append({'origin': None, 'identity_profile': profile_face, 'threshold': 0.0})
                 labels.append(f'Face #{k + 1} (identity profile)')
-                continue
 
             dest_files = destinations[k]
             if dest_files is None or (isinstance(dest_files, list) and len(dest_files) == 0):
@@ -287,7 +287,8 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
             return []
         return [{'faces': faces, 'label': ', '.join(labels) if labels else 'Multiple faces'}]
 
-    # Single Face / Faces By Match: one independent job per destination face.
+    # Single Face / Faces By Match: one independent job per destination
+    # source (gallery image or identity profile), same Face-slot origin/threshold.
     jobs = []
     for k in range(num_faces):
         profile_face = _load_identity_profile_face(identity_profiles[k], slot_label=f'Face #{k + 1}')
@@ -311,6 +312,8 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
                 }],
                 'label': f'Face #{k + 1} (identity profile)'
             })
+
+        if not has_destination:
             continue
 
         if not isinstance(dest_files, list):
@@ -479,7 +482,10 @@ def _pluralize_count(count, singular_suffix="", plural_suffix="s"):
 
 def _populate_builder_from_files(builder, source_files):
     """Feeds each uploaded file into the builder as an image or video sample
-    source, based on its extension.
+    source, based on its extension. Files with an unrecognized extension
+    (common when a whole folder is dropped — .txt notes, .DS_Store, Thumbs.db)
+    are skipped outright instead of being force-fed to cv2.imread as if they
+    were images.
     """
     for f in source_files:
         path = _resolve_history_path(f)
@@ -490,9 +496,11 @@ def _populate_builder_from_files(builder, source_files):
         ext = os.path.splitext(path)[1].lower()
         if ext in _IDENTITY_VIDEO_EXTENSIONS:
             builder.add_video(path, label)
-        else:
+        elif ext in _IDENTITY_IMAGE_EXTENSIONS:
             frame = cv2.imread(path)
             builder.add_image(frame, label)
+        else:
+            builder.discarded.append({"source": label, "reason": f"tipo de arquivo não suportado ({ext or 'sem extensão'})"})
 
 def _format_extraction_status(profiles):
     status_lines = [
@@ -510,7 +518,7 @@ def _format_extraction_status(profiles):
         status_lines.extend(f"  - {d['source']}: {d['reason']}" for d in profiles[0]["discarded"])
     return "\n".join(status_lines)
 
-def extract_identity_profile(source_files):
+def extract_identity_profile(source_files, folder_files):
     """Builds one reusable identity profile (Face + centroid embedding) per
     person detected in the uploaded images/videos (greedy clustering by
     cosine similarity — see identity_profile.cluster_samples). Video mode
@@ -518,13 +526,20 @@ def extract_identity_profile(source_files):
     — no in-session sharing/gr.State is used across tabs, since Colab
     sessions are volatile and export is the primary persistence mechanism
     (see PLANO_IDENTIDADE_MULTI_FONTE.md).
+
+    source_files: loose files picked one by one (gr.File, file_count="multiple").
+    folder_files: an entire folder dropped/selected at once (gr.File,
+    file_count="directory") — the browser's directory picker already walks
+    subfolders recursively, so this is every file found anywhere under the
+    chosen folder, not just its top level.
     """
-    if not source_files:
+    all_files = list(source_files or []) + list(folder_files or [])
+    if not all_files:
         empty_dropdown = gr.update(choices=[], value=None)
         return "Nenhum arquivo enviado.", [], empty_dropdown, empty_dropdown, empty_dropdown, []
 
     builder = IdentityProfileBuilder.from_refacer(refacer)
-    _populate_builder_from_files(builder, source_files)
+    _populate_builder_from_files(builder, all_files)
 
     if not builder.samples:
         reasons = "; ".join(f"{d['source']}: {d['reason']}" for d in builder.discarded) or "motivo desconhecido"
@@ -553,6 +568,36 @@ def _get_selected_profile(profiles, selected_name):
         if profile["name"] == selected_name:
             return profile
     return None
+
+def rename_selected_profile(profiles, selected_name, new_name):
+    """Renames the currently selected profile (e.g. "Pessoa 1" -> a custom
+    name). The new name flows into the dropdown/gallery captions and into
+    the exported .npz filename (export_selected_profile already derives the
+    filename from the profile's current name).
+    """
+    if not profiles or not selected_name:
+        raise gr.Error("Nenhum perfil selecionado para renomear.")
+
+    new_name = (new_name or "").strip()
+    if not new_name:
+        raise gr.Error("Informe um nome válido.")
+
+    if new_name != selected_name and any(p["name"] == new_name for p in profiles):
+        raise gr.Error(f'Já existe um perfil chamado "{new_name}".')
+
+    profile = _get_selected_profile(profiles, selected_name)
+    if profile is None:
+        raise gr.Error("Perfil selecionado não encontrado.")
+
+    profile["name"] = new_name
+    choices = [p["name"] for p in profiles]
+    return (
+        _profiles_to_gallery(profiles),
+        gr.update(choices=choices, value=new_name),
+        gr.update(choices=choices, value=None),
+        gr.update(choices=choices, value=None),
+        profiles,
+    )
 
 def _profiles_to_gallery(profiles):
     gallery_items = []
@@ -881,12 +926,18 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             label="Confirmo que possuo autorização para processar este material.",
             value=False,
         )
-        identity_images = gr.File(
-            label="Imagens e/ou vídeos (múltiplos arquivos, podem conter várias pessoas)",
-            file_count="multiple",
-            file_types=sorted(_IDENTITY_IMAGE_EXTENSIONS | _IDENTITY_VIDEO_EXTENSIONS),
-            interactive=False,
-        )
+        with gr.Row():
+            identity_images = gr.File(
+                label="Imagens e/ou vídeos avulsos (múltiplos arquivos, podem conter várias pessoas)",
+                file_count="multiple",
+                file_types=sorted(_IDENTITY_IMAGE_EXTENSIONS | _IDENTITY_VIDEO_EXTENSIONS),
+                interactive=False,
+            )
+            identity_folder = gr.File(
+                label="Ou arraste uma pasta inteira (inclui subpastas)",
+                file_count="directory",
+                interactive=False,
+            )
         identity_extract_btn = gr.Button("Extrair Identidade(s)", variant="primary", interactive=False)
 
         identity_status = gr.Textbox(label="Status da extração", lines=8, interactive=False)
@@ -899,6 +950,10 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         identity_profile_state = gr.State([])
         identity_selected_profile = gr.Dropdown(label="Perfil ativo (para baixar/testar)", choices=[], value=None)
+
+        with gr.Row():
+            identity_rename_input = gr.Textbox(label="Novo nome para o perfil ativo", placeholder="ex.: João")
+            identity_rename_btn = gr.Button("Renomear", variant="secondary")
 
         with gr.Accordion("Corrigir agrupamento (mesclar/descartar perfis)", open=False):
             gr.Markdown(
@@ -938,14 +993,14 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         identity_cleanup_status = gr.Textbox(label="", interactive=False, show_label=False)
 
         identity_consent.change(
-            fn=lambda consent: (gr.update(interactive=consent), gr.update(interactive=consent)),
+            fn=lambda consent: (gr.update(interactive=consent), gr.update(interactive=consent), gr.update(interactive=consent)),
             inputs=[identity_consent],
-            outputs=[identity_images, identity_extract_btn],
+            outputs=[identity_images, identity_folder, identity_extract_btn],
         )
 
         identity_extract_btn.click(
             fn=extract_identity_profile,
-            inputs=[identity_images],
+            inputs=[identity_images, identity_folder],
             outputs=[
                 identity_status,
                 identity_gallery,
@@ -966,6 +1021,18 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             fn=preview_identity_swap,
             inputs=[identity_test_image, identity_profile_state, identity_selected_profile],
             outputs=[identity_test_output],
+        )
+
+        identity_rename_btn.click(
+            fn=rename_selected_profile,
+            inputs=[identity_profile_state, identity_selected_profile, identity_rename_input],
+            outputs=[
+                identity_gallery,
+                identity_selected_profile,
+                identity_merge_a,
+                identity_merge_b,
+                identity_profile_state,
+            ],
         )
 
         identity_merge_btn.click(
@@ -1059,7 +1126,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
                     destination = gr.Gallery(label="Destination face(s)", columns=4, height="auto", object_fit="contain", file_types=["image"])
                 threshold = gr.Slider(label="Threshold", minimum=0.0, maximum=1.0, value=0.2)
                 identity_profile_file = gr.File(
-                    label="Identity Profile (.npz) — opcional, substitui a galeria acima quando enviado",
+                    label="Identity Profile (.npz) — opcional, some-se à galeria acima na fila de jobs",
                     file_count="single",
                     file_types=[".npz"],
                 )
@@ -1068,12 +1135,6 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             thresholds_video.append(threshold)
             face_tabs_video.append(tab)
             identity_profile_video.append(identity_profile_file)
-
-            identity_profile_file.change(
-                fn=lambda f: gr.update(interactive=(f is None)),
-                inputs=[identity_profile_file],
-                outputs=[destination],
-            )
 
         face_mode_video.change(
             fn=lambda mode: toggle_tabs_and_faces(mode, face_tabs_video, origin_video),
