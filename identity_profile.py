@@ -33,6 +33,22 @@ MIN_DET_SCORE = 0.5
 MIN_FACE_AREA_RATIO = 0.01  # bbox precisa cobrir ao menos 1% da área do frame
 MIN_SHARPNESS = 60.0  # variância do Laplaciano no crop alinhado
 
+# Rostos pequenos são sempre upscaled para 112x112 antes de embedding/nitidez
+# (ver alignment abaixo), então um corte binário único por área descartava
+# rostos pequenos "bons" (nítidos, bem detectados) só por serem pequenos. Um
+# piso absoluto continua existindo (MIN_FACE_AREA_RATIO_HARD) porque nitidez
+# pós-upscale não captura tudo: o ArcFace foi treinado majoritariamente com
+# rostos que já nasciam próximos de 112x112, não upscaled agressivamente de
+# poucos pixels — abaixo do piso, o embedding tende a ficar pouco
+# discriminativo mesmo quando o crop "parece" nítido (upscale pode gerar
+# ringing/artefatos de compressão que o Laplaciano lê como borda real). Entre
+# o piso e MIN_FACE_AREA_RATIO, o rosto pequeno só é aceito com evidência
+# dupla de qualidade (score e nitidez bem acima do mínimo padrão) — uma
+# régua mais alta para compensar a menor quantidade de informação disponível.
+MIN_FACE_AREA_RATIO_HARD = 0.0025  # abaixo disso, descarta sempre, sem exceção
+MIN_DET_SCORE_COMPENSATED = 0.75  # exigido p/ rosto pequeno na faixa intermediária
+MIN_SHARPNESS_COMPENSATED = 90.0  # idem, ~1.5x o mínimo padrão
+
 # Threshold para separar pessoas distintas no clustering (não confundir com o
 # 0.2 default do slider "Faces By Match" — aquele é deliberadamente permissivo
 # para *confirmar* uma identidade já conhecida dentro do mesmo vídeo; aqui o
@@ -218,7 +234,8 @@ class IdentityProfileBuilder:
 
         frame_area = frame_bgr.shape[0] * frame_bgr.shape[1]
         bbox_area = max(0.0, (bbox[2] - bbox[0])) * max(0.0, (bbox[3] - bbox[1]))
-        if frame_area <= 0 or (bbox_area / frame_area) < MIN_FACE_AREA_RATIO:
+        face_area_ratio = bbox_area / frame_area if frame_area > 0 else 0.0
+        if frame_area <= 0 or face_area_ratio < MIN_FACE_AREA_RATIO_HARD:
             self.discarded.append({"source": source_label, "reason": "rosto pequeno demais no quadro"})
             return
 
@@ -243,6 +260,17 @@ class IdentityProfileBuilder:
                 "reason": f"imagem desfocada (nitidez {sharpness:.0f})",
             })
             return
+
+        if face_area_ratio < MIN_FACE_AREA_RATIO:
+            # Faixa intermediária: rosto pequeno só entra com evidência dupla
+            # de qualidade (score e nitidez bem acima do mínimo padrão), já
+            # que o upscale pro embedding tem menos margem de erro.
+            if det_score < MIN_DET_SCORE_COMPENSATED or sharpness < MIN_SHARPNESS_COMPENSATED:
+                self.discarded.append({
+                    "source": source_label,
+                    "reason": "rosto pequeno sem compensação suficiente de nitidez/confiança",
+                })
+                return
 
         face = Face(bbox=bbox, kps=kps, det_score=det_score)
         face.embedding = embedding
