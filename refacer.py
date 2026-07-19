@@ -1143,62 +1143,10 @@ class Refacer:
 
     def _swap_one(self, frame, face, dest_face):
         swapped = self.face_swapper.get(frame, face, dest_face, paste_back=True)
-        swapped = self._soften_forehead_seam(frame, swapped, face)
         if self._should_partial_blend():
             self.blend_height_ratio = self.partial_reface_ratio
             return self._partial_face_blend(frame, swapped, face)
         return swapped
-
-    # Fração do topo do bbox (a faixa da testa/linha do cabelo) onde o
-    # feathering extra é reintroduzido — ver _soften_forehead_seam.
-    FOREHEAD_SEAM_BAND_RATIO = 0.20
-
-    def _soften_forehead_seam(self, original_frame, swapped_frame, face):
-        """Disfarça a costura visível perto da testa/linha do cabelo em
-        identidades cuja proporção facial foge da média usada para calibrar o
-        template de alinhamento do INSwapper: a máscara interna do INSwapper
-        é ponderada pela diferença entre o rosto gerado e o original
-        (fake_diff) dentro do crop alinhado, não por landmarks anatômicos —
-        quando a testa real é mais alta/baixa que a média, o corte cai fora
-        do lugar e o feathering fixo da lib não cobre a distância extra,
-        deixando um degrau perceptível. Não há acesso a essa máscara interna
-        (ela é aplicada e descartada dentro de face_swapper.get()), então em
-        vez de tentar reproduzi-la, aplicamos um segundo blend raso, só na
-        faixa superior do bbox, misturando de volta um pouco do frame
-        original com um gradiente mais largo que o da lib — atenua o degrau
-        sem exigir detecção de onde ele efetivamente caiu (que precisaria de
-        landmarks de contorno/testa que o SCRFD de 5 pontos não fornece).
-        """
-        h_frame, w_frame = original_frame.shape[:2]
-
-        x1, y1, x2, y2 = map(int, face.bbox)
-        x1 = max(0, min(x1, w_frame - 1))
-        y1 = max(0, min(y1, h_frame - 1))
-        x2 = max(0, min(x2, w_frame))
-        y2 = max(0, min(y2, h_frame))
-
-        if x2 <= x1 or y2 <= y1:
-            return swapped_frame
-
-        w, h = x2 - x1, y2 - y1
-        band_h = max(1, int(h * self.FOREHEAD_SEAM_BAND_RATIO))
-        band_y2 = min(y1 + band_h, y2)
-
-        swap_band = swapped_frame[y1:band_y2, x1:x2].astype(np.float32)
-        orig_band = original_frame[y1:band_y2, x1:x2].astype(np.float32)
-
-        # Rampa suave 0 -> 1 (smoothstep) ao longo da faixa: no topo do bbox
-        # (onde o degrau costuma sobrar) pesa mais o frame original; na base
-        # da faixa já é praticamente o resultado do swap sem alteração.
-        band_size = band_y2 - y1
-        t = np.linspace(0.0, 1.0, band_size, dtype=np.float32)
-        swap_weight = (3 * t**2 - 2 * t**3)[:, np.newaxis, np.newaxis]
-
-        blended_band = swap_band * swap_weight + orig_band * (1.0 - swap_weight)
-
-        result = swapped_frame.copy()
-        result[y1:band_y2, x1:x2] = blended_band.astype(np.uint8)
-        return result
 
     def _apply_swaps(self, frame, faces):
         """Apply face swaps to an already-detected+embedded list of faces.
