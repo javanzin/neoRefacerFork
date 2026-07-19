@@ -25,6 +25,11 @@ print("\033[94m" + pyfiglet.Figlet(font='slant').renderText("NeoRefacer") + "\03
 # Video processing history
 video_history = []
 
+# Set by the "Cancel All" button, checked once per job in run()'s loop —
+# stops the queue between videos rather than mid-frame (killing a video
+# mid-encode would leave a corrupt/partial output file).
+cancel_requested = False
+
 def _resolve_history_path(value):
     if value is None:
         return None
@@ -230,7 +235,19 @@ def run_image(*vars):
 
     return refacer.reface_image(image_path, faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode, partial_reface_ratio=partial_reface_ratio)
 
-def _load_identity_profile_faces(profile_files, slot_label=""):
+def _identity_profile_choices(profile_files):
+    """Lists the basenames of a Face-slot's uploaded .npz file(s), for the
+    slot's "which profiles to use" gr.CheckboxGroup. Mirrors the
+    single-file-or-list-or-None shape gr.File(file_count="multiple") can hand
+    back, same as _load_identity_profile_faces.
+    """
+    if profile_files is None:
+        return []
+    if not isinstance(profile_files, list):
+        profile_files = [profile_files]
+    return [os.path.basename(_resolve_history_path(f) or "") for f in profile_files]
+
+def _load_identity_profile_faces(profile_files, slot_label="", selected_names=None):
     """Resolves a Face-slot's uploaded .npz file(s) into synthetic Faces.
 
     Accepts a single file, a list of files (file_count="multiple"), or None,
@@ -238,6 +255,12 @@ def _load_identity_profile_faces(profile_files, slot_label=""):
     each paired with a label naming that specific file (so multiple profiles
     queued from the same slot show up as distinct jobs in run()'s progress
     and video history, not an ambiguous repeated "identity profile" label).
+
+    selected_names (optional): basenames checked in that slot's "Perfis a
+    usar" CheckboxGroup — a file uploaded but left unchecked is skipped
+    without being removed from the gr.File, mirroring how it's still visible
+    but excluded from the current swap. None/empty means "use every
+    uploaded file" (keeps old callers, e.g. tests, working unfiltered).
 
     A corrupted/incompatible .npz must not abort every other configured
     Face-slot or sibling profile in the same slot: _build_video_face_jobs
@@ -255,32 +278,41 @@ def _load_identity_profile_faces(profile_files, slot_label=""):
         path = _resolve_history_path(profile_file)
         if not path or not os.path.exists(path):
             continue
+        basename = os.path.basename(path)
+        if selected_names and basename not in selected_names:
+            continue
         try:
             profile = import_profile(path)
         except ValueError as e:
             gr.Warning(f"Perfil de identidade inválido em {slot_label or 'um slot'} ({os.path.basename(path)}): {e}. Ignorando este arquivo.")
             continue
-        results.append((profile["face"], os.path.basename(path)))
+        results.append((profile["face"], basename))
     return results
 
-def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles=None):
+def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles=None, identity_profile_selections=None):
     """Build one job per destination face, keeping Multiple Faces as a single combined job.
 
     identity_profiles (optional): one entry per Face-slot, each either a
     single uploaded .npz or a list of them (file_count="multiple"); every
-    profile in a slot is queued ALONGSIDE that slot's Destination Gallery
-    images (not instead of them) — a slot with 3 gallery images plus 2
-    profiles produces 5 independent jobs in Single Face/Faces By Match mode,
-    or all 5 combined into the same Multiple Faces job.
+    *checked* profile in a slot is queued ALONGSIDE that slot's Destination
+    Gallery images (not instead of them) — a slot with 3 gallery images plus
+    2 checked profiles produces 5 independent jobs in Single Face/Faces By
+    Match mode, or all 5 combined into the same Multiple Faces job.
+
+    identity_profile_selections (optional): one entry per Face-slot, each the
+    list of basenames checked in that slot's "Perfis a usar" CheckboxGroup.
+    None/empty per-slot means "use every uploaded file in that slot"
+    (backward compatible with no selection UI at all).
     """
     identity_profiles = identity_profiles or [None] * num_faces
+    identity_profile_selections = identity_profile_selections or [None] * num_faces
 
     if multiple_faces_mode:
         # All destination faces are swapped together, by position, in one video.
         faces = []
         labels = []
         for k in range(num_faces):
-            for profile_face, profile_label in _load_identity_profile_faces(identity_profiles[k], slot_label=f'Face #{k + 1}'):
+            for profile_face, profile_label in _load_identity_profile_faces(identity_profiles[k], slot_label=f'Face #{k + 1}', selected_names=identity_profile_selections[k]):
                 faces.append({'origin': None, 'identity_profile': profile_face, 'threshold': 0.0})
                 labels.append(f'Face #{k + 1} ({profile_label})')
 
@@ -306,7 +338,7 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
     # source (gallery image or identity profile), same Face-slot origin/threshold.
     jobs = []
     for k in range(num_faces):
-        profile_faces = _load_identity_profile_faces(identity_profiles[k], slot_label=f'Face #{k + 1}')
+        profile_faces = _load_identity_profile_faces(identity_profiles[k], slot_label=f'Face #{k + 1}', selected_names=identity_profile_selections[k])
         dest_files = destinations[k]
         has_destination = dest_files is not None and not (isinstance(dest_files, list) and len(dest_files) == 0)
 
@@ -353,11 +385,15 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
     return jobs
 
 def run(progress=gr.Progress(track_tqdm=True), *vars):
+    global cancel_requested
+    cancel_requested = False
+
     video_path = vars[0]
     origins = vars[1:(num_faces+1)]
     destinations = vars[(num_faces+1):(num_faces*2)+1]
     thresholds = vars[(num_faces*2)+1:(num_faces*3)+1]
-    identity_profiles = vars[(num_faces*3)+1:-5]
+    identity_profiles = vars[(num_faces*3)+1:(num_faces*4)+1]
+    identity_profile_selections = vars[(num_faces*4)+1:-5]
     preview = vars[-5]
     face_mode = vars[-4]
     partial_reface_ratio = vars[-3]
@@ -368,7 +404,7 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
 
-    jobs = _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles)
+    jobs = _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles, identity_profile_selections)
 
     if not jobs:
         yield None, None
@@ -390,6 +426,10 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
 
     failed_jobs = []
     for k, job in enumerate(jobs):
+        if cancel_requested:
+            gr.Warning(f"Cancelado pelo usuário após {k}/{len(jobs)} jobs.")
+            break
+
         progress(k / len(jobs), desc=f"{job['label']} ({k + 1}/{len(jobs)})")
         try:
             mp4_path, gif_path = refacer.reface(
@@ -1128,6 +1168,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             partial_reface_ratio_video = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
             oval_mask_video = gr.Checkbox(label="Oval Mask (lip-to-chin, preserves cheeks)", value=False)
             video_btn = gr.Button("Reface Video", variant="primary")
+            cancel_video_btn = gr.Button("⏹ Cancelar Tudo", variant="stop")
 
         with gr.Row():
             rotate_left_btn = gr.Button("↺ Rotate Left", variant="secondary")
@@ -1158,6 +1199,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
 
         origin_video, destination_video, thresholds_video, face_tabs_video = [], [], [], []
         identity_profile_video = []
+        identity_profile_selection_video = []
 
         for i in range(num_faces):
             with gr.Tab(f"Face #{i+1}") as tab:
@@ -1170,11 +1212,48 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
                     file_count="multiple",
                     file_types=[".npz"],
                 )
+                identity_profile_select_all = gr.Checkbox(label="Marcar todos", value=True, visible=False)
+                identity_profile_selection = gr.CheckboxGroup(
+                    label="Perfis a usar neste swap",
+                    choices=[],
+                    value=[],
+                    visible=False,
+                )
+                # CheckboxGroup.value only reflects the currently *checked*
+                # items, not the full choice list — "Marcar todos" needs the
+                # latter (e.g. to re-check items the user unchecked earlier),
+                # so the full list is mirrored here on every upload.
+                identity_profile_choices_state = gr.State([])
             origin_video.append(origin)
             destination_video.append(destination)
             thresholds_video.append(threshold)
             face_tabs_video.append(tab)
             identity_profile_video.append(identity_profile_file)
+            identity_profile_selection_video.append(identity_profile_selection)
+
+            def _on_profiles_changed(profile_files):
+                choices = _identity_profile_choices(profile_files)
+                visible = len(choices) > 0
+                return (
+                    gr.update(choices=choices, value=list(choices), visible=visible),
+                    gr.update(value=True, visible=visible),
+                    choices,
+                )
+
+            identity_profile_file.change(
+                fn=_on_profiles_changed,
+                inputs=[identity_profile_file],
+                outputs=[identity_profile_selection, identity_profile_select_all, identity_profile_choices_state],
+            )
+
+            def _on_select_all_toggled(select_all, choices):
+                return gr.update(value=list(choices) if select_all else [])
+
+            identity_profile_select_all.change(
+                fn=_on_select_all_toggled,
+                inputs=[identity_profile_select_all, identity_profile_choices_state],
+                outputs=[identity_profile_selection],
+            )
 
             # A new gallery upload replaces the component's own value instead
             # of appending to it — mirror the accumulated list in a gr.State
@@ -1263,11 +1342,18 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             for mp4_path, gif_path in run(progress, *args):
                 yield mp4_path, gif_path, get_video_history()
 
-        video_btn.click(
+        video_event = video_btn.click(
             fn=run_with_history_update,
-            inputs=[video_input] + origin_video + destination_video + thresholds_video + identity_profile_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, oval_mask_video, use_cache_video],
+            inputs=[video_input] + origin_video + destination_video + thresholds_video + identity_profile_video + identity_profile_selection_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, oval_mask_video, use_cache_video],
             outputs=[video_output, gr.File(visible=False), history_display]
         )
+
+        def request_cancel():
+            global cancel_requested
+            cancel_requested = True
+            gr.Info("Cancelamento solicitado — a fila para após o job em andamento.")
+
+        cancel_video_btn.click(fn=request_cancel, inputs=[], outputs=[], cancels=[video_event])
 
     # --- System / Cache Settings (Global) ---
     with gr.Accordion("⚙️ System Settings", open=False):
