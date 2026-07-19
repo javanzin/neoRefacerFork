@@ -40,24 +40,92 @@ MIN_SHARPNESS = 60.0  # variância do Laplaciano no crop alinhado
 # que exige um corte mais alto. Ajustável visualmente na etapa de Revisão.
 CLUSTER_SIMILARITY_THRESHOLD = 0.32
 
+# _compute_centroid pondera amostras pela similaridade ao centroide corrente
+# ao longo de ROBUST_CENTROID_ITERATIONS passos, começando pela média simples.
+# Amostras "estranhas" ao grupo (oclusão por óculos escuros, mão na frente do
+# rosto, ângulo extremo, blur que passou pelo filtro de nitidez) puxam o
+# centroide para longe da identidade real na média simples; reponderar pela
+# similaridade ao centroide já calculado atenua esse puxão sem precisar saber
+# *por que* a amostra é diferente. Duas iterações bastam para convergir na
+# prática — a terceira mudaria pouco o resultado e dobraria o custo.
+ROBUST_CENTROID_ITERATIONS = 2
+
+# Piso subtraído da similaridade antes de virar peso (peso = max(0, sim -
+# piso), não a similaridade crua) — reponderação linear direta é branda
+# demais para suprimir outlier (sim 0.40 vs. 0.70 só dá razão de peso 0.57,
+# atenua mas não neutraliza). Similaridade cosseno intra-pessoa no ArcFace
+# w600k tipicamente fica em 0.35-0.8, então o piso fica abaixo da faixa
+# normal — a amostra típica não perde peso por ele, mas amostras realmente
+# destoantes (a razão de peso é o que sobra depois de subtrair o piso de
+# ambas) são muito mais suprimidas do que na ponderação crua. Mais permissivo
+# que CLUSTER_SIMILARITY_THRESHOLD (que separa pessoas *diferentes*): aqui
+# todas as amostras já são da mesma pessoa por construção (um único
+# build_profile/cluster), então o corte só precisa reconhecer outliers
+# claros, não fronteiras entre identidades.
+ROBUST_CENTROID_SIMILARITY_FLOOR = 0.30
+
 
 def _face_sharpness(aligned_crop_bgr):
     gray = cv2.cvtColor(aligned_crop_bgr, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
 
 
-def _compute_centroid(samples):
+def _simple_mean_centroid(samples):
     """Média de embeddings individualmente L2-normalizados, renormalizada no
-    final — usada tanto para o centroide de um cluster durante o clustering
-    quanto para o perfil final e para o merge de dois perfis.
+    final — usada como ponto de partida do centroide robusto e diretamente
+    por quem precisa da decisão "essa amostra é da mesma pessoa?" sem
+    suprimir nenhuma amostra (cluster_samples() e merge_profiles()).
     """
     embeddings = np.stack([s["embedding"] for s in samples])
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     normalized = embeddings / norms
+
     centroid = normalized.mean(axis=0)
     centroid_norm = np.linalg.norm(centroid)
     return centroid / centroid_norm if centroid_norm > 0 else centroid
+
+
+def _compute_centroid(samples, iterations=ROBUST_CENTROID_ITERATIONS):
+    """Centroide robusto: parte da média simples dos embeddings (L2-normalizados
+    individualmente) e refina por `iterations` passos, reponderando cada
+    amostra por max(0, similaridade_de_cosseno_ao_centroide - piso). Amostras
+    mais parecidas com o grupo pesam mais; outliers (ver
+    ROBUST_CENTROID_SIMILARITY_FLOOR) pesam ~0 sem ser removidos da lista.
+
+    Usada para o perfil final (build_profile/build_profiles) — não para a
+    decisão de clustering nem para merge_profiles(), que usam a média simples
+    direto (ver _simple_mean_centroid) para não suprimir amostras que já
+    foram confirmadas como da mesma pessoa.
+    """
+    embeddings = np.stack([s["embedding"] for s in samples])
+    norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    normalized = embeddings / norms
+
+    centroid = _simple_mean_centroid(samples)
+
+    if len(samples) <= 3:
+        # Com poucas amostras, "outlier" vira decisão por maioria simples
+        # (ex.: 2x1) sem base estatística real para distinguir ruído de
+        # variação legítima — mantém a média simples de sempre.
+        return centroid
+
+    for _ in range(iterations):
+        similarities = normalized @ centroid
+        weights = np.clip(similarities - ROBUST_CENTROID_SIMILARITY_FLOOR, 0.0, None)
+
+        if not np.any(weights > 0):
+            # Todas as amostras ficaram abaixo do piso (grupo muito
+            # heterogêneo) — mantém o centroide da iteração anterior em vez
+            # de zerar o resultado.
+            break
+
+        weighted = (normalized * weights[:, np.newaxis]).sum(axis=0) / weights.sum()
+        weighted_norm = np.linalg.norm(weighted)
+        centroid = weighted / weighted_norm if weighted_norm > 0 else centroid
+
+    return centroid
 
 
 def _build_profile_from_samples(samples, name, discarded=None):
@@ -234,14 +302,29 @@ class IdentityProfileBuilder:
         processamento. Se nenhum cluster existente passa o threshold, uma
         amostra abre um cluster novo.
 
+        A atribuição usa a MÉDIA SIMPLES (incremental, não o centroide
+        robusto de _compute_centroid) das amostras do cluster: aqui a
+        pergunta é "esta amostra é da mesma pessoa?", não "qual o melhor
+        vetor representativo desta pessoa?". Uma amostra com oclusão (óculos
+        escuros, por exemplo) ainda é da mesma pessoa e não deve perder peso
+        na decisão de pertencimento — se perdesse, o centroide do cluster se
+        afastaria da aparência "com oclusão" e um frame seguinte com a mesma
+        oclusão poderia falhar o threshold e abrir um cluster novo (a pessoa
+        "vira duas"), justamente o sintoma que o centroide robusto deveria
+        evitar. O centroide robusto entra depois, uma única vez por grupo já
+        fechado, em _build_profile_from_samples/build_profiles.
+
         Retorna list[list[sample]], na ordem de criação dos clusters (cluster
         0 = "Pessoa 1", etc.) — mera convenção de nomenclatura neutra, nunca
         inferida de metadado de arquivo.
         """
-        clusters = []  # list of {"centroid": np.ndarray, "samples": [sample, ...]}
+        clusters = []  # list of {"centroid": np.ndarray, "sum": np.ndarray, "samples": [sample, ...]}
 
         for sample in self.samples:
             emb = sample["embedding"]
+            norm = np.linalg.norm(emb)
+            normalized_emb = emb / norm if norm > 0 else emb
+
             best_idx, best_sim = -1, -1.0
             for idx, cluster in enumerate(clusters):
                 sim = self._recognizer.compute_sim(cluster["centroid"], emb)
@@ -251,14 +334,16 @@ class IdentityProfileBuilder:
             if best_idx >= 0 and best_sim >= threshold:
                 cluster = clusters[best_idx]
                 cluster["samples"].append(sample)
-                # Recentraliza o centroide do cluster a cada amostra nova, para
-                # que a atribuição das próximas amostras use o centroide
-                # atualizado, não o da primeira amostra do cluster.
-                cluster["centroid"] = _compute_centroid(cluster["samples"])
+                # Média incremental simples (O(1) por amostra) dos embeddings
+                # normalizados — não o centroide robusto, ver docstring acima.
+                cluster["sum"] = cluster["sum"] + normalized_emb
+                mean = cluster["sum"] / len(cluster["samples"])
+                mean_norm = np.linalg.norm(mean)
+                cluster["centroid"] = mean / mean_norm if mean_norm > 0 else mean
             else:
-                norm = np.linalg.norm(emb)
                 clusters.append({
-                    "centroid": emb / norm if norm > 0 else emb,
+                    "centroid": normalized_emb,
+                    "sum": normalized_emb.copy(),
                     "samples": [sample],
                 })
 
@@ -295,6 +380,15 @@ def merge_profiles(profile_a, profile_b, name=None):
     uma média dos dois centroides já prontos, que pesaria igualmente um
     cluster com 2 amostras e um com 20.
 
+    Usa média simples (não o centroide robusto de _compute_centroid): o
+    merge é uma correção manual — o usuário já olhou as amostras dos dois
+    clusters e decidiu que são a mesma pessoa. Um cluster separado por óculos
+    escuros é o caso típico que motiva o merge; suprimir essas amostras de
+    novo aqui (via reponderação por similaridade) anularia silenciosamente a
+    correção que o usuário acabou de pedir. A supressão de outliers já teve
+    sua chance em cluster_samples()/build_profiles() antes do usuário decidir
+    mesclar.
+
     Requer que ambos os perfis tenham a chave "samples" — perfis vindos de
     import_profile() não a têm (o .npz exportado guarda só o centroide, não
     as amostras individuais, por design de privacidade) e não podem ser
@@ -315,7 +409,7 @@ def merge_profiles(profile_a, profile_b, name=None):
         kps=representative["face"].kps,
         det_score=representative["face"].det_score,
     )
-    profile_face.embedding = _compute_centroid(combined_samples)
+    profile_face.embedding = _simple_mean_centroid(combined_samples)
 
     return {
         "name": name or profile_a["name"],
