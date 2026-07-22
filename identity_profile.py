@@ -20,8 +20,26 @@ from tqdm import tqdm
 # frames vizinhos são quase idênticos), então um passo fixo, mais agressivo
 # que o skip_rate de preview (10) usado no pipeline de swap, já dá amostras
 # suficientemente diversas com uma fração do custo de decode/detecção.
+#
+# Sem teto de frames por vídeo (removido o antigo MAX_FRAMES_PER_VIDEO=60):
+# um teto fixo cobria só os primeiros ~30s de qualquer vídeo mais longo
+# (60 amostras x 15 de stride), descartando ângulos que só aparecem depois
+# disso — numa entrevista de vários minutos, praticamente todo o material
+# nunca chegava a ser lido. Em vez de um teto artificial, quem controla o
+# custo agora é _is_near_duplicate: barato (downscale + diff de pixel) o
+# bastante para pular frames quase idênticos ANTES do custo caro de
+# detecção/embedding, então trechos parados (pessoa parada olhando pra
+# câmera) custam pouco mesmo sem limite de frames, e trechos com movimento
+# real (mudança de ângulo) continuam sendo amostrados.
 VIDEO_FRAME_STRIDE = 15
-MAX_FRAMES_PER_VIDEO = 60
+
+# Frame candidato é descartado (sem rodar detecção) se a diferença média de
+# pixel para o último frame ACEITO do mesmo vídeo, em escala de cinza e
+# reduzido, ficar abaixo deste limiar — valor baixo o bastante para não
+# confundir "pessoa parada" com "mudou de ângulo" (uma pequena guinada de
+# cabeça já basta pra passar).
+NEAR_DUPLICATE_DOWNSCALE_SIZE = (64, 64)
+NEAR_DUPLICATE_MEAN_DIFF_THRESHOLD = 2.0
 
 # Identifica o espaço vetorial do embedding para validar compatibilidade na
 # importação (refacer.py carrega w600k_r50.onnx do pacote buffalo_l). O
@@ -84,6 +102,24 @@ ROBUST_CENTROID_SIMILARITY_FLOOR = 0.30
 def _face_sharpness(aligned_crop_bgr):
     gray = cv2.cvtColor(aligned_crop_bgr, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+def _downscale_gray(frame_bgr):
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, NEAR_DUPLICATE_DOWNSCALE_SIZE)
+
+
+def _is_near_duplicate(frame_bgr, last_accepted_downscaled):
+    """Compara `frame_bgr` ao último frame aceito do mesmo vídeo (já reduzido
+    e em escala de cinza) por diferença média absoluta de pixel — muito mais
+    barato que detecção/embedding, então serve de filtro antes deles.
+    `last_accepted_downscaled` é None no primeiro frame candidato (nunca é
+    duplicata).
+    """
+    if last_accepted_downscaled is None:
+        return False
+    diff = cv2.absdiff(_downscale_gray(frame_bgr), last_accepted_downscaled)
+    return diff.mean() < NEAR_DUPLICATE_MEAN_DIFF_THRESHOLD
 
 
 def _simple_mean_centroid(samples):
@@ -283,11 +319,15 @@ class IdentityProfileBuilder:
         })
 
     def add_video(self, video_path, source_label):
-        """Amostra frames de um vídeo (passo fixo, teto de quadros) e alimenta
-        cada um em add_image — mesmo filtro de qualidade das imagens, sem
-        decodificar o vídeo inteiro nem mantê-lo todo em memória (diferente de
-        analyze_video_in_memory, que existe para o caminho de swap, não de
-        extração de identidade).
+        """Amostra frames de um vídeo (passo fixo, sem teto de quadros) e
+        alimenta cada um em add_image — mesmo filtro de qualidade das
+        imagens, sem decodificar o vídeo inteiro nem mantê-lo todo em memória
+        (diferente de analyze_video_in_memory, que existe para o caminho de
+        swap, não de extração de identidade).
+
+        Frames quase idênticos ao último frame aceito (ver
+        _is_near_duplicate) são pulados antes do custo de detecção/embedding
+        — cobre o vídeo inteiro sem gastar esse custo em trechos parados.
         """
         cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
         if not cap.isOpened():
@@ -296,10 +336,11 @@ class IdentityProfileBuilder:
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         frame_index = 0
-        frames_used = 0
+        last_accepted_downscaled = None
+        n_duplicates = 0
 
         with tqdm(total=total_frames, desc=f"Extraindo identidade de {source_label}") as pbar:
-            while cap.isOpened() and frames_used < MAX_FRAMES_PER_VIDEO:
+            while cap.isOpened():
                 flag, frame = cap.read()
                 if not flag:
                     break
@@ -309,12 +350,24 @@ class IdentityProfileBuilder:
                     pbar.update()
                     continue
 
+                if _is_near_duplicate(frame, last_accepted_downscaled):
+                    n_duplicates += 1
+                    frame_index += 1
+                    pbar.update()
+                    continue
+
+                last_accepted_downscaled = _downscale_gray(frame)
                 self.add_image(frame, f"{source_label} (frame {frame_index})")
-                frames_used += 1
                 frame_index += 1
                 pbar.update()
 
         cap.release()
+
+        if n_duplicates:
+            self.discarded.append({
+                "source": source_label,
+                "reason": f"{n_duplicates} frame{'s' if n_duplicates != 1 else ''} quase idêntico(s) ao anterior, pulado(s)",
+            })
 
     def build_profile(self, name="Pessoa 1"):
         return _build_profile_from_samples(self.samples, name, self.discarded)

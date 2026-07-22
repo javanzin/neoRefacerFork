@@ -1027,9 +1027,9 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             "resultados abaixo antes de confiar em um perfil. Use \"Mesclar Perfis\" se a "
             "mesma pessoa foi dividida em dois, ou \"Descartar Perfil\" para remover ruído "
             "— fusão indevida de pessoas diferentes ainda exige reextrair com material "
-            "separado. De vídeos, uma amostra de quadros é "
-            f"extraída automaticamente (a cada {identity_profile.VIDEO_FRAME_STRIDE} frames, "
-            f"até {identity_profile.MAX_FRAMES_PER_VIDEO} por vídeo)."
+            "separado. De vídeos, uma amostra de quadros é extraída automaticamente "
+            f"(a cada {identity_profile.VIDEO_FRAME_STRIDE} frames) ao longo do vídeo inteiro, "
+            "pulando quadros quase idênticos ao anterior para não repetir amostras à toa."
         )
         identity_consent = gr.Checkbox(
             label="Confirmo que possuo autorização para processar este material.",
