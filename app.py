@@ -996,7 +996,22 @@ def clear_identity_temp_files():
 # --- UI ---
 theme = gr.themes.Base(primary_hue="blue", secondary_hue="cyan")
 
-with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
+# gr.File já recebe progresso real de upload por arquivo (via SSE
+# /upload_progress), mas o Gradio 5.22 esconde essa barra individual com
+# estilo inline (visibility:hidden;height:0;width:0) — só sobra o texto
+# agregado "Uploading N file(s)...", sem indicar se travou ou está avançando.
+# Estilo inline sem !important perde para CSS externo com !important, então
+# isso reexibe a barra que já existe no DOM em vez de precisar de JS/fork do
+# componente.
+_UPLOAD_PROGRESS_CSS = """
+.wrap .file progress {
+    visibility: visible !important;
+    height: 4px !important;
+    width: 100% !important;
+}
+"""
+
+with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRESS_CSS) as demo:
     with open("icon.png", "rb") as f:
         icon_data = base64.b64encode(f.read()).decode()
     icon_html = f'<img src="data:image/png;base64,{icon_data}" style="width:40px;height:40px;margin-right:10px;">'
