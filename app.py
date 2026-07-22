@@ -290,23 +290,44 @@ def _load_identity_profile_faces(profile_files, slot_label="", selected_names=No
         results.append((profile["face"], basename))
     return results
 
+def _count_active_face_slots(destinations, identity_profiles):
+    """Conta quantos Face-slots têm algo configurado (destino na galeria e/ou
+    identity profile), sem decodificar nenhuma imagem — só para decidir se
+    Faces By Match deve enfileirar (1 slot ativo) ou combinar (2+ slots
+    ativos) em _build_video_face_jobs.
+    """
+    active = 0
+    for k in range(num_faces):
+        dest_files = destinations[k]
+        has_destination = dest_files is not None and not (isinstance(dest_files, list) and len(dest_files) == 0)
+        profile_files = identity_profiles[k]
+        has_profile = profile_files is not None and not (isinstance(profile_files, list) and len(profile_files) == 0)
+        if has_destination or has_profile:
+            active += 1
+    return active
+
 def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles=None, identity_profile_selections=None, combine_faces_mode=None):
-    """Build one job per destination face, except in Multiple Faces and Faces
-    By Match, which combine every configured face into a single job.
+    """Build one job per destination face, except in Multiple Faces (always)
+    and Faces By Match with 2+ active Face-slots, which combine every
+    configured face into a single job.
 
     combine_faces_mode defaults to multiple_faces_mode for backward
     compatibility (older callers, e.g. tests, only pass multiple_faces_mode).
-    Faces By Match must also combine everything into one job: it swaps every
-    matched face in the same video in a single pass, using similarity
-    matching instead of Multiple Faces' fixed by-position assignment — it is
-    not "one destination at a time" like Single Face.
+    Faces By Match only combines into one job when 2+ slots are configured
+    at once (multiple people swapped together in the same video pass, by
+    similarity match instead of Multiple Faces' fixed by-position
+    assignment). With exactly 1 active slot, Faces By Match instead queues —
+    same as Single Face — one job per candidate option in that slot (each
+    gallery image / identity profile is a separate take on the same person,
+    run one at a time so the user can pick the best result, not several
+    people swapped at once).
 
     identity_profiles (optional): one entry per Face-slot, each either a
     single uploaded .npz or a list of them (file_count="multiple"); every
     *checked* profile in a slot is queued ALONGSIDE that slot's Destination
     Gallery images (not instead of them) — a slot with 3 gallery images plus
-    2 checked profiles produces 5 independent jobs in Single Face mode, or
-    all 5 combined into the same job in Multiple Faces/Faces By Match mode.
+    2 checked profiles produces 5 independent jobs when queuing, or all 5
+    combined into the same job when combining.
 
     identity_profile_selections (optional): one entry per Face-slot, each the
     list of basenames checked in that slot's "Perfis a usar" CheckboxGroup.
@@ -317,6 +338,12 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
     identity_profile_selections = identity_profile_selections or [None] * num_faces
     if combine_faces_mode is None:
         combine_faces_mode = multiple_faces_mode
+    elif combine_faces_mode and not multiple_faces_mode:
+        # Faces By Match: só combina com 2+ slots ativos ao mesmo tempo (várias
+        # pessoas trocadas juntas). Com 1 slot só, ele tem exatamente o mesmo
+        # formato de Single Face (mesma origem/threshold, várias opções de
+        # destino candidatas) — enfileira em vez de combinar.
+        combine_faces_mode = _count_active_face_slots(destinations, identity_profiles) >= 2
 
     if combine_faces_mode:
         # All destination faces are swapped together, in one video: by fixed
@@ -619,6 +646,8 @@ def _dedupe_files_by_content(files, discarded=None):
         unique_files.append(f)
     return unique_files
 
+_PROGRESS_UPDATE_STRIDE = 50
+
 def _populate_builder_from_files(builder, source_files, progress=None):
     """Feeds each uploaded file into the builder as an image or video sample
     source, based on its extension. Files with an unrecognized extension
@@ -626,8 +655,10 @@ def _populate_builder_from_files(builder, source_files, progress=None):
     are skipped outright instead of being force-fed to cv2.imread as if they
     were images.
 
-    progress (optional): a gr.Progress instance, updated after each file so
-    the UI shows which file is being processed instead of sitting on a bare
+    progress (optional): a gr.Progress instance, updated every
+    _PROGRESS_UPDATE_STRIDE files (not every single one — with hundreds of
+    files, updating the UI per-file adds overhead without adding useful
+    granularity) so the UI shows overall advance instead of sitting on a bare
     spinner for the whole batch — videos in particular can take a while since
     every sampled frame goes through detection.
     """
@@ -638,7 +669,7 @@ def _populate_builder_from_files(builder, source_files, progress=None):
             continue
 
         label = os.path.basename(path)
-        if progress is not None:
+        if progress is not None and (i % _PROGRESS_UPDATE_STRIDE == 0 or i == total - 1):
             progress(i / total, desc=f"Processando {label} ({i + 1}/{total})")
 
         ext = os.path.splitext(path)[1].lower()
@@ -869,7 +900,8 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
             continue
 
         label = os.path.basename(path)
-        progress(i / total, desc=f"Buscando em {label} ({i + 1}/{total})")
+        if i % _PROGRESS_UPDATE_STRIDE == 0 or i == total - 1:
+            progress(i / total, desc=f"Buscando em {label} ({i + 1}/{total})")
 
         ext = os.path.splitext(path)[1].lower()
         if ext in _IDENTITY_VIDEO_EXTENSIONS:
