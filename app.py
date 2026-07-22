@@ -4,6 +4,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import gradio as gr
 from refacer import Refacer
+import identity_profile
 import argparse
 import ngrok
 import imageio
@@ -180,20 +181,55 @@ def load_face_image(value):
 
     return None
 
+def _find_first_video_frame_with_face(filepath, refacer_instance, max_faces):
+    """Amostra frames de um vídeo (via cv2.VideoCapture, sem decodificar tudo
+    de uma vez — ao contrário de load_first_frame/imageio, que abre o
+    container inteiro só para ler o frame 0) até achar um com pelo menos um
+    rosto detectável, ou esgotar o vídeo.
+
+    O frame 0 sozinho é frágil para auto-preencher a galeria: fade-in preto,
+    pessoa de costas/fora de quadro no início, ou qualquer coisa antes dela
+    "entrar em cena" faz a auto-detecção falhar mesmo com ótimos frames
+    segundos depois. Mesmo stride de identity_profile.VIDEO_FRAME_STRIDE
+    (~0.5s a 30fps) para achar candidatos rápido sem pular tanto que perca
+    aparições curtas.
+    """
+    cap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        return None
+
+    frame_index = 0
+    try:
+        while cap.isOpened():
+            flag, frame = cap.read()
+            if not flag:
+                return None
+
+            if frame_index % identity_profile.VIDEO_FRAME_STRIDE != 0:
+                frame_index += 1
+                continue
+
+            bboxes, _ = refacer_instance.face_detector.detect(frame, max_num=1, metric="max")
+            if bboxes.shape[0] > 0:
+                return frame
+
+            frame_index += 1
+    finally:
+        cap.release()
+
 def extract_faces_auto(filepath, refacer_instance, max_faces=5, isvideo=False):
     if filepath is None:
         return [None] * max_faces
 
-    if isvideo and os.path.getsize(filepath) > 5 * 1024 * 1024:
-        gr.Warning(
-            "Vídeo maior que 5MB: detecção automática de rosto pulada (não é falta de rosto "
-            "detectável). Preencha o(s) rosto(s) manualmente na galeria, se precisar."
-        )
-        return [None] * max_faces
-
-    frame = load_first_frame(filepath)
-    if frame is None:
-        return [None] * max_faces
+    if isvideo:
+        frame = _find_first_video_frame_with_face(filepath, refacer_instance, max_faces)
+        if frame is None:
+            return [None] * max_faces
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    else:
+        frame = load_first_frame(filepath)
+        if frame is None:
+            return [None] * max_faces
 
     while len(frame.shape) > 3:
         frame = frame[0]
@@ -595,7 +631,6 @@ def rotate_video(video_path, direction):
         return video_path
 
 # --- Identity Profile (multi-image / multi-video, single person) ---
-import identity_profile
 from identity_profile import IdentityProfileBuilder, export_profile, import_profile, merge_profiles, _build_profile_from_samples
 
 _IDENTITY_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
