@@ -289,15 +289,23 @@ def _load_identity_profile_faces(profile_files, slot_label="", selected_names=No
         results.append((profile["face"], basename))
     return results
 
-def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles=None, identity_profile_selections=None):
-    """Build one job per destination face, keeping Multiple Faces as a single combined job.
+def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles=None, identity_profile_selections=None, combine_faces_mode=None):
+    """Build one job per destination face, except in Multiple Faces and Faces
+    By Match, which combine every configured face into a single job.
+
+    combine_faces_mode defaults to multiple_faces_mode for backward
+    compatibility (older callers, e.g. tests, only pass multiple_faces_mode).
+    Faces By Match must also combine everything into one job: it swaps every
+    matched face in the same video in a single pass, using similarity
+    matching instead of Multiple Faces' fixed by-position assignment — it is
+    not "one destination at a time" like Single Face.
 
     identity_profiles (optional): one entry per Face-slot, each either a
     single uploaded .npz or a list of them (file_count="multiple"); every
     *checked* profile in a slot is queued ALONGSIDE that slot's Destination
     Gallery images (not instead of them) — a slot with 3 gallery images plus
-    2 checked profiles produces 5 independent jobs in Single Face/Faces By
-    Match mode, or all 5 combined into the same Multiple Faces job.
+    2 checked profiles produces 5 independent jobs in Single Face mode, or
+    all 5 combined into the same job in Multiple Faces/Faces By Match mode.
 
     identity_profile_selections (optional): one entry per Face-slot, each the
     list of basenames checked in that slot's "Perfis a usar" CheckboxGroup.
@@ -306,14 +314,22 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
     """
     identity_profiles = identity_profiles or [None] * num_faces
     identity_profile_selections = identity_profile_selections or [None] * num_faces
+    if combine_faces_mode is None:
+        combine_faces_mode = multiple_faces_mode
 
-    if multiple_faces_mode:
-        # All destination faces are swapped together, by position, in one video.
+    if combine_faces_mode:
+        # All destination faces are swapped together, in one video: by fixed
+        # position in Multiple Faces (origin/threshold irrelevant, so zeroed
+        # out), or by similarity match in Faces By Match, which needs each
+        # slot's own origin_image/threshold to tell the configured faces apart.
         faces = []
         labels = []
         for k in range(num_faces):
+            origin_image = load_face_image(origins[k]) if not multiple_faces_mode else None
+            face_threshold = thresholds[k] if not multiple_faces_mode else 0.0
+
             for profile_face, profile_label in _load_identity_profile_faces(identity_profiles[k], slot_label=f'Face #{k + 1}', selected_names=identity_profile_selections[k]):
-                faces.append({'origin': None, 'identity_profile': profile_face, 'threshold': 0.0})
+                faces.append({'origin': origin_image, 'identity_profile': profile_face, 'threshold': face_threshold})
                 labels.append(f'Face #{k + 1} ({profile_label})')
 
             dest_files = destinations[k]
@@ -325,7 +341,7 @@ def _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mod
                 destination_image = load_face_image(dest_file)
                 if destination_image is None:
                     continue
-                faces.append({'origin': None, 'destination': destination_image, 'threshold': 0.0})
+                faces.append({'origin': origin_image, 'destination': destination_image, 'threshold': face_threshold})
                 label = _resolve_history_path(dest_file)
                 if label:
                     labels.append(label)
@@ -403,8 +419,9 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
 
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
+    combine_faces_mode = (face_mode in ["Multiple Faces", "Faces By Match"])
 
-    jobs = _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles, identity_profile_selections)
+    jobs = _build_video_face_jobs(origins, destinations, thresholds, multiple_faces_mode, identity_profiles, identity_profile_selections, combine_faces_mode)
 
     if not jobs:
         yield None, None
