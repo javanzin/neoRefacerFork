@@ -185,7 +185,10 @@ def extract_faces_auto(filepath, refacer_instance, max_faces=5, isvideo=False):
         return [None] * max_faces
 
     if isvideo and os.path.getsize(filepath) > 5 * 1024 * 1024:
-        print("Video too large for auto-extract, skipping face extraction.")
+        gr.Warning(
+            "Vídeo maior que 5MB: detecção automática de rosto pulada (não é falta de rosto "
+            "detectável). Preencha o(s) rosto(s) manualmente na galeria, se precisar."
+        )
         return [None] * max_faces
 
     frame = load_first_frame(filepath)
