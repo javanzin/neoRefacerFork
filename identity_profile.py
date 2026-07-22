@@ -74,6 +74,13 @@ MIN_SHARPNESS_COMPENSATED = 90.0  # idem, ~1.5x o mínimo padrão
 # que exige um corte mais alto. Ajustável visualmente na etapa de Revisão.
 CLUSTER_SIMILARITY_THRESHOLD = 0.32
 
+# Threshold para find_matches_in_files: aqui a identidade já é conhecida (o
+# perfil-alvo, confirmado previamente pelo usuário) e o objetivo é *confirmar*
+# esse mesmo rosto em material novo, não separar pessoas diferentes — por
+# isso mais permissivo que CLUSTER_SIMILARITY_THRESHOLD, no mesmo espírito do
+# default do slider "Faces By Match" citado acima.
+TARGET_MATCH_SIMILARITY_THRESHOLD = 0.20
+
 # _compute_centroid pondera amostras pela similaridade ao centroide corrente
 # ao longo de ROBUST_CENTROID_ITERATIONS passos, começando pela média simples.
 # Amostras "estranhas" ao grupo (oclusão por óculos escuros, mão na frente do
@@ -256,24 +263,31 @@ class IdentityProfileBuilder:
         bbox = bboxes[0, 0:4]
         det_score = float(bboxes[0, 4])
         kps = kpss[0] if kpss is not None else None
+        self._add_face_candidate(frame_bgr, bbox, kps, det_score, source_label)
 
+    def _add_face_candidate(self, frame_bgr, bbox, kps, det_score, source_label):
+        """Núcleo de validação de qualidade + montagem de amostra
+        compartilhado entre add_image (1 rosto por frame, o mais proeminente)
+        e find_match_in_frame (N rostos por frame, todos os candidatos que
+        baterem com um perfil-alvo).
+        """
         if kps is None:
             self.discarded.append({"source": source_label, "reason": "sem landmarks (kps)"})
-            return
+            return None
 
         if det_score < MIN_DET_SCORE:
             self.discarded.append({
                 "source": source_label,
                 "reason": f"confiança de detecção baixa ({det_score:.2f})",
             })
-            return
+            return None
 
         frame_area = frame_bgr.shape[0] * frame_bgr.shape[1]
         bbox_area = max(0.0, (bbox[2] - bbox[0])) * max(0.0, (bbox[3] - bbox[1]))
         face_area_ratio = bbox_area / frame_area if frame_area > 0 else 0.0
         if frame_area <= 0 or face_area_ratio < MIN_FACE_AREA_RATIO_HARD:
             self.discarded.append({"source": source_label, "reason": "rosto pequeno demais no quadro"})
-            return
+            return None
 
         embedding = self._recognizer.get(frame_bgr, kps)
 
@@ -287,7 +301,7 @@ class IdentityProfileBuilder:
             # thumbnail. Discard outright instead of falling back to a
             # sharpness value that would always pass the check below.
             self.discarded.append({"source": source_label, "reason": "bbox inválida (sem crop)"})
-            return
+            return None
 
         sharpness = _face_sharpness(aligned)
         if sharpness < MIN_SHARPNESS:
@@ -295,7 +309,7 @@ class IdentityProfileBuilder:
                 "source": source_label,
                 "reason": f"imagem desfocada (nitidez {sharpness:.0f})",
             })
-            return
+            return None
 
         if face_area_ratio < MIN_FACE_AREA_RATIO:
             # Faixa intermediária: rosto pequeno só entra com evidência dupla
@@ -306,17 +320,19 @@ class IdentityProfileBuilder:
                     "source": source_label,
                     "reason": "rosto pequeno sem compensação suficiente de nitidez/confiança",
                 })
-                return
+                return None
 
         face = Face(bbox=bbox, kps=kps, det_score=det_score)
         face.embedding = embedding
 
-        self.samples.append({
+        sample = {
             "embedding": embedding,
             "face": face,
             "thumbnail": aligned,
             "source": source_label,
-        })
+        }
+        self.samples.append(sample)
+        return sample
 
     def add_video(self, video_path, source_label):
         """Amostra frames de um vídeo (passo fixo, sem teto de quadros) e
@@ -328,6 +344,14 @@ class IdentityProfileBuilder:
         Frames quase idênticos ao último frame aceito (ver
         _is_near_duplicate) são pulados antes do custo de detecção/embedding
         — cobre o vídeo inteiro sem gastar esse custo em trechos parados.
+        """
+        self._sample_video_frames(video_path, source_label, self.add_image)
+
+    def _sample_video_frames(self, video_path, source_label, on_frame):
+        """Núcleo de amostragem de vídeo (stride fixo + filtro de frame quase
+        idêntico) compartilhado entre add_video (extrai amostras de todas as
+        pessoas) e find_matches_in_video (extrai só as que baterem com um
+        perfil-alvo) — só muda o que cada um faz com o frame amostrado.
         """
         cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
         if not cap.isOpened():
@@ -357,7 +381,7 @@ class IdentityProfileBuilder:
                     continue
 
                 last_accepted_downscaled = _downscale_gray(frame)
-                self.add_image(frame, f"{source_label} (frame {frame_index})")
+                on_frame(frame, f"{source_label} (frame {frame_index})")
                 frame_index += 1
                 pbar.update()
 
@@ -368,6 +392,67 @@ class IdentityProfileBuilder:
                 "source": source_label,
                 "reason": f"{n_duplicates} frame{'s' if n_duplicates != 1 else ''} quase idêntico(s) ao anterior, pulado(s)",
             })
+
+    def find_match_in_frame(self, frame_bgr, source_label, target_face, threshold=TARGET_MATCH_SIMILARITY_THRESHOLD):
+        """Busca dirigida num único frame/imagem já decodificado: em vez de
+        extrair e depois separar por pessoa (add_image + cluster_samples),
+        procura diretamente por UMA identidade já conhecida (target_face, o
+        Face de um perfil já confirmado).
+
+        Detecta TODOS os rostos do frame (max_num=0, ao contrário de
+        add_image que só pega o mais proeminente), compara cada um ao
+        embedding do alvo e só chama _add_face_candidate (logo, só gasta os
+        filtros de qualidade) nos que baterem — descarta os demais sem
+        clusterizá-los. Muito mais barato que build_profiles() em material
+        com várias pessoas, já que não há comparação O(n²) entre todo mundo:
+        cada rosto candidato é comparado a 1 alvo só.
+
+        Retorna a lista de novas amostras aceitas neste frame (mesmo formato
+        de self.samples), já também acrescentadas a
+        self.samples/self.discarded.
+        """
+        target_embedding = target_face.embedding
+        matches = []
+
+        bboxes, kpss = self._detector.detect(frame_bgr, max_num=0)
+        if bboxes.shape[0] == 0:
+            self.discarded.append({"source": source_label, "reason": "nenhum rosto detectado"})
+            return matches
+
+        for i in range(bboxes.shape[0]):
+            bbox = bboxes[i, 0:4]
+            det_score = float(bboxes[i, 4])
+            kps = kpss[i] if kpss is not None else None
+            if kps is None:
+                continue
+
+            candidate_embedding = self._recognizer.get(frame_bgr, kps)
+            if self._recognizer.compute_sim(target_embedding, candidate_embedding) < threshold:
+                continue
+
+            label = f"{source_label} (rosto {i + 1})" if bboxes.shape[0] > 1 else source_label
+            sample = self._add_face_candidate(frame_bgr, bbox, kps, det_score, label)
+            if sample is not None:
+                matches.append(sample)
+
+        if not matches:
+            self.discarded.append({"source": source_label, "reason": "nenhum rosto bateu com o perfil-alvo"})
+
+        return matches
+
+    def find_matches_in_video(self, video_path, source_label, target_face, threshold=TARGET_MATCH_SIMILARITY_THRESHOLD):
+        """Aplica find_match_in_frame a cada frame amostrado de um vídeo
+        (mesmo stride/filtro de quase-duplicata de add_video, via
+        _sample_video_frames), em vez de extrair todas as pessoas do vídeo
+        para depois separar por similaridade.
+        """
+        matches = []
+        self._sample_video_frames(
+            video_path,
+            source_label,
+            lambda frame, label: matches.extend(self.find_match_in_frame(frame, label, target_face, threshold)),
+        )
+        return matches
 
     def build_profile(self, name="Pessoa 1"):
         return _build_profile_from_samples(self.samples, name, self.discarded)

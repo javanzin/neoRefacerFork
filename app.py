@@ -1,3 +1,4 @@
+import hashlib
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
@@ -565,7 +566,7 @@ def rotate_video(video_path, direction):
 
 # --- Identity Profile (multi-image / multi-video, single person) ---
 import identity_profile
-from identity_profile import IdentityProfileBuilder, export_profile, import_profile, merge_profiles
+from identity_profile import IdentityProfileBuilder, export_profile, import_profile, merge_profiles, _build_profile_from_samples
 
 _IDENTITY_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 _IDENTITY_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".gif"}
@@ -576,6 +577,47 @@ def _pluralize_count(count, singular_suffix="", plural_suffix="s"):
     own "(s)"/"(is)" logic.
     """
     return singular_suffix if count == 1 else plural_suffix
+
+def _hash_file(path, chunk_size=1024 * 1024):
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+def _dedupe_files_by_content(files, discarded=None):
+    """Filtra `files` (lista de valores gr.File já resolvidos por
+    _resolve_history_path) removendo entradas cujo CONTEÚDO já apareceu antes
+    na mesma lista — o mesmo arquivo enviado duas vezes (ex. avulso + dentro
+    de uma pasta, ou reenviado sem perceber) não deve virar duas amostras
+    idênticas. Compara por hash de conteúdo (não por nome, já que o mesmo
+    arquivo pode chegar com nomes diferentes de fontes diferentes, e nomes
+    iguais podem ser arquivos diferentes).
+
+    discarded (opcional): lista (estilo IdentityProfileBuilder.discarded)
+    onde cada duplicata descartada é registrada, para não desaparecer
+    silenciosamente do status de extração.
+    """
+    seen_hashes = set()
+    unique_files = []
+    for f in files:
+        path = _resolve_history_path(f)
+        if not path or not os.path.exists(path):
+            unique_files.append(f)
+            continue
+
+        file_hash = _hash_file(path)
+        if file_hash in seen_hashes:
+            if discarded is not None:
+                discarded.append({
+                    "source": os.path.basename(path),
+                    "reason": "arquivo duplicado (mesmo conteúdo de outro já enviado), ignorado",
+                })
+            continue
+
+        seen_hashes.add(file_hash)
+        unique_files.append(f)
+    return unique_files
 
 def _populate_builder_from_files(builder, source_files, progress=None):
     """Feeds each uploaded file into the builder as an image or video sample
@@ -648,6 +690,7 @@ def extract_identity_profile(source_files, folder_files, progress=gr.Progress())
         return "Nenhum arquivo enviado.", [], empty_dropdown, empty_dropdown, empty_dropdown, []
 
     builder = IdentityProfileBuilder.from_refacer(refacer)
+    all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded)
     _populate_builder_from_files(builder, all_files, progress=progress)
 
     if not builder.samples:
@@ -795,6 +838,75 @@ def export_selected_profile(profiles, selected_name):
     )
     export_profile(profile, export_path)
     return gr.update(value=export_path, visible=True)
+
+def find_profile_in_more_material(profiles, selected_name, source_files, folder_files, progress=gr.Progress()):
+    """Busca dirigida: procura apenas a pessoa do perfil já selecionado em
+    material novo (que pode ter várias pessoas), em vez de reextrair tudo e
+    separar por clustering de novo — muito mais barato quando você já sabe
+    quem está procurando (ver identity_profile.IdentityProfileBuilder.
+    find_match_in_frame/find_matches_in_video).
+
+    Os rostos encontrados são somados às amostras do perfil selecionado e o
+    centroide é recalculado, refinando o mesmo perfil em vez de criar um novo.
+    """
+    profile = _get_selected_profile(profiles, selected_name)
+    if profile is None:
+        raise gr.Error("Nenhum perfil selecionado. Extraia ou selecione um perfil primeiro.")
+
+    all_files = list(source_files or []) + list(folder_files or [])
+    if not all_files:
+        raise gr.Error("Nenhum arquivo enviado para buscar.")
+
+    builder = IdentityProfileBuilder.from_refacer(refacer)
+    all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded)
+    target_face = profile["face"]
+
+    total = len(all_files)
+    new_matches = []
+    for i, f in enumerate(all_files):
+        path = _resolve_history_path(f)
+        if not path or not os.path.exists(path):
+            continue
+
+        label = os.path.basename(path)
+        progress(i / total, desc=f"Buscando em {label} ({i + 1}/{total})")
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _IDENTITY_VIDEO_EXTENSIONS:
+            new_matches.extend(builder.find_matches_in_video(path, label, target_face))
+        elif ext in _IDENTITY_IMAGE_EXTENSIONS:
+            frame = cv2.imread(path)
+            if frame is None:
+                builder.discarded.append({"source": label, "reason": "imagem inválida"})
+                continue
+            new_matches.extend(builder.find_match_in_frame(frame, label, target_face))
+        else:
+            builder.discarded.append({"source": label, "reason": f"tipo de arquivo não suportado ({ext or 'sem extensão'})"})
+    progress(1.0, desc="Atualizando perfil...")
+
+    if not new_matches:
+        reasons = "; ".join(f"{d['source']}: {d['reason']}" for d in builder.discarded) or "motivo desconhecido"
+        raise gr.Error(f"Nenhuma correspondência encontrada para \"{selected_name}\". Descartes: {reasons}")
+
+    combined_samples = profile["samples"] + new_matches
+    updated_profile = _build_profile_from_samples(combined_samples, name=profile["name"], discarded=profile["discarded"] + builder.discarded)
+    new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
+
+    n_new = len(new_matches)
+    status = (
+        f"{n_new} nova{_pluralize_count(n_new, plural_suffix='s')} amostra{_pluralize_count(n_new)} de "
+        f"\"{selected_name}\" encontrada{_pluralize_count(n_new)} e adicionada{_pluralize_count(n_new)} ao perfil "
+        f"({updated_profile['n_samples']} amostra{_pluralize_count(updated_profile['n_samples'])} no total)."
+    )
+    choices = [p["name"] for p in new_profiles]
+    return (
+        status,
+        _profiles_to_gallery(new_profiles),
+        gr.update(choices=choices, value=selected_name),
+        gr.update(choices=choices, value=None),
+        gr.update(choices=choices, value=None),
+        new_profiles,
+    )
 
 def preview_identity_swap(test_image_file, profiles, selected_name):
     """Applies the selected in-session identity profile to a separate test
@@ -1065,6 +1177,27 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             identity_rename_input = gr.Textbox(label="Novo nome para o perfil ativo", placeholder="ex.: João")
             identity_rename_btn = gr.Button("Renomear", variant="secondary")
 
+        with gr.Accordion("Buscar esta pessoa em outro material", open=False):
+            gr.Markdown(
+                "Já sabe quem é a pessoa (perfil ativo acima)? Envie material novo (pode ter "
+                "**várias pessoas**, ex. uma entrevista) e o sistema procura só por ela, sem "
+                "reextrair e separar todo mundo do zero — mais rápido que gerar novos perfis "
+                "e mesclar depois. As correspondências encontradas são somadas ao perfil ativo."
+            )
+            with gr.Row():
+                identity_search_files = gr.File(
+                    label="Imagens e/ou vídeos para buscar (múltiplos arquivos)",
+                    file_count="multiple",
+                    file_types=sorted(_IDENTITY_IMAGE_EXTENSIONS | _IDENTITY_VIDEO_EXTENSIONS),
+                    interactive=False,
+                )
+                identity_search_folder = gr.File(
+                    label="Ou arraste uma pasta inteira (inclui subpastas)",
+                    file_count="directory",
+                    interactive=False,
+                )
+            identity_search_btn = gr.Button("Buscar Perfil Ativo no Material Acima", variant="secondary", interactive=False)
+
         with gr.Accordion("Corrigir agrupamento (mesclar/descartar perfis)", open=False):
             gr.Markdown(
                 "Se a separação automática dividiu a **mesma pessoa** em dois perfis "
@@ -1103,9 +1236,16 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
         identity_cleanup_status = gr.Textbox(label="", interactive=False, show_label=False)
 
         identity_consent.change(
-            fn=lambda consent: (gr.update(interactive=consent), gr.update(interactive=consent), gr.update(interactive=consent)),
+            fn=lambda consent: tuple(gr.update(interactive=consent) for _ in range(6)),
             inputs=[identity_consent],
-            outputs=[identity_images, identity_folder, identity_extract_btn],
+            outputs=[
+                identity_images,
+                identity_folder,
+                identity_extract_btn,
+                identity_search_files,
+                identity_search_folder,
+                identity_search_btn,
+            ],
         )
 
         identity_extract_btn.click(
@@ -1129,6 +1269,19 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             fn=export_selected_profile,
             inputs=[identity_profile_state, identity_selected_profile],
             outputs=[identity_export_file],
+        )
+
+        identity_search_btn.click(
+            fn=find_profile_in_more_material,
+            inputs=[identity_profile_state, identity_selected_profile, identity_search_files, identity_search_folder],
+            outputs=[
+                identity_status,
+                identity_gallery,
+                identity_selected_profile,
+                identity_merge_a,
+                identity_merge_b,
+                identity_profile_state,
+            ],
         )
 
         identity_test_btn.click(
