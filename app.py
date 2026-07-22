@@ -1035,18 +1035,19 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
             label="Confirmo que possuo autorização para processar este material.",
             value=False,
         )
-        with gr.Row():
-            identity_images = gr.File(
-                label="Imagens e/ou vídeos avulsos (múltiplos arquivos, podem conter várias pessoas)",
-                file_count="multiple",
-                file_types=sorted(_IDENTITY_IMAGE_EXTENSIONS | _IDENTITY_VIDEO_EXTENSIONS),
-                interactive=False,
-            )
-            identity_folder = gr.File(
-                label="Ou arraste uma pasta inteira (inclui subpastas)",
-                file_count="directory",
-                interactive=False,
-            )
+        with gr.Accordion("Arquivos enviados", open=True) as identity_files_accordion:
+            with gr.Row():
+                identity_images = gr.File(
+                    label="Imagens e/ou vídeos avulsos (múltiplos arquivos, podem conter várias pessoas)",
+                    file_count="multiple",
+                    file_types=sorted(_IDENTITY_IMAGE_EXTENSIONS | _IDENTITY_VIDEO_EXTENSIONS),
+                    interactive=False,
+                )
+                identity_folder = gr.File(
+                    label="Ou arraste uma pasta inteira (inclui subpastas)",
+                    file_count="directory",
+                    interactive=False,
+                )
         identity_extract_btn = gr.Button("Extrair Identidade(s)", variant="primary", interactive=False)
 
         identity_status = gr.Textbox(label="Status da extração", lines=8, interactive=False)
@@ -1118,6 +1119,10 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer") as demo:
                 identity_merge_b,
                 identity_profile_state,
             ],
+        ).then(
+            fn=lambda: gr.update(open=False),
+            inputs=None,
+            outputs=[identity_files_accordion],
         )
 
         identity_export_btn.click(
