@@ -181,11 +181,29 @@ def load_face_image(value):
 
     return None
 
-def _find_first_video_frame_with_face(filepath, refacer_instance, max_faces):
+# Teto de amostras tentadas em _find_first_video_frame_with_face antes de
+# desistir: sem isso, um vídeo longo sem NENHUM rosto detectável decodificaria
+# o vídeo inteiro e rodaria uma inferência de detecção a cada frame amostrado
+# até o fim — pode travar o handler síncrono de video_input.change por um
+# tempo real em vídeos de vários minutos. 200 amostras a
+# identity_profile.VIDEO_FRAME_STRIDE (15 frames, ~0.5s a 30fps) cobre ~100s
+# de vídeo, generoso o bastante pro sujeito "entrar em cena" sem custo
+# ilimitado.
+_AUTO_DETECT_MAX_SAMPLES = 200
+
+# Mesmo piso de identity_profile.MIN_FACE_AREA_RATIO: sem isso, um rosto
+# minúsculo de fundo (pôster, foto num quadro, figurante distante) no
+# primeiro frame candidato vence o sujeito principal que só entra em quadro
+# (maior, nítido) alguns frames depois — o cenário de auto-detecção ruim que
+# esta função existe para evitar.
+_AUTO_DETECT_MIN_FACE_AREA_RATIO = identity_profile.MIN_FACE_AREA_RATIO
+
+def _find_first_video_frame_with_face(filepath, refacer_instance):
     """Amostra frames de um vídeo (via cv2.VideoCapture, sem decodificar tudo
     de uma vez — ao contrário de load_first_frame/imageio, que abre o
     container inteiro só para ler o frame 0) até achar um com pelo menos um
-    rosto detectável, ou esgotar o vídeo.
+    rosto detectável de tamanho razoável, ou esgotar o vídeo/o teto de
+    amostras.
 
     O frame 0 sozinho é frágil para auto-preencher a galeria: fade-in preto,
     pessoa de costas/fora de quadro no início, ou qualquer coisa antes dela
@@ -196,11 +214,13 @@ def _find_first_video_frame_with_face(filepath, refacer_instance, max_faces):
     """
     cap = cv2.VideoCapture(filepath, cv2.CAP_FFMPEG)
     if not cap.isOpened():
+        cap.release()
         return None
 
     frame_index = 0
+    samples_tried = 0
     try:
-        while cap.isOpened():
+        while cap.isOpened() and samples_tried < _AUTO_DETECT_MAX_SAMPLES:
             flag, frame = cap.read()
             if not flag:
                 return None
@@ -209,11 +229,18 @@ def _find_first_video_frame_with_face(filepath, refacer_instance, max_faces):
                 frame_index += 1
                 continue
 
+            samples_tried += 1
             bboxes, _ = refacer_instance.face_detector.detect(frame, max_num=1, metric="max")
             if bboxes.shape[0] > 0:
-                return frame
+                bbox = bboxes[0, 0:4]
+                frame_area = frame.shape[0] * frame.shape[1]
+                bbox_area = max(0.0, (bbox[2] - bbox[0])) * max(0.0, (bbox[3] - bbox[1]))
+                face_area_ratio = bbox_area / frame_area if frame_area > 0 else 0.0
+                if face_area_ratio >= _AUTO_DETECT_MIN_FACE_AREA_RATIO:
+                    return frame
 
             frame_index += 1
+        return None
     finally:
         cap.release()
 
@@ -222,7 +249,7 @@ def extract_faces_auto(filepath, refacer_instance, max_faces=5, isvideo=False):
         return [None] * max_faces
 
     if isvideo:
-        frame = _find_first_video_frame_with_face(filepath, refacer_instance, max_faces)
+        frame = _find_first_video_frame_with_face(filepath, refacer_instance)
         if frame is None:
             return [None] * max_faces
         frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
