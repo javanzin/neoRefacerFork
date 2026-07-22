@@ -577,19 +577,28 @@ def _pluralize_count(count, singular_suffix="", plural_suffix="s"):
     """
     return singular_suffix if count == 1 else plural_suffix
 
-def _populate_builder_from_files(builder, source_files):
+def _populate_builder_from_files(builder, source_files, progress=None):
     """Feeds each uploaded file into the builder as an image or video sample
     source, based on its extension. Files with an unrecognized extension
     (common when a whole folder is dropped — .txt notes, .DS_Store, Thumbs.db)
     are skipped outright instead of being force-fed to cv2.imread as if they
     were images.
+
+    progress (optional): a gr.Progress instance, updated after each file so
+    the UI shows which file is being processed instead of sitting on a bare
+    spinner for the whole batch — videos in particular can take a while since
+    every sampled frame goes through detection.
     """
-    for f in source_files:
+    total = len(source_files)
+    for i, f in enumerate(source_files):
         path = _resolve_history_path(f)
         if not path or not os.path.exists(path):
             continue
 
         label = os.path.basename(path)
+        if progress is not None:
+            progress(i / total, desc=f"Processando {label} ({i + 1}/{total})")
+
         ext = os.path.splitext(path)[1].lower()
         if ext in _IDENTITY_VIDEO_EXTENSIONS:
             builder.add_video(path, label)
@@ -598,6 +607,9 @@ def _populate_builder_from_files(builder, source_files):
             builder.add_image(frame, label)
         else:
             builder.discarded.append({"source": label, "reason": f"tipo de arquivo não suportado ({ext or 'sem extensão'})"})
+
+    if progress is not None:
+        progress(1.0, desc="Agrupando por pessoa...")
 
 def _format_extraction_status(profiles):
     status_lines = [
@@ -615,7 +627,7 @@ def _format_extraction_status(profiles):
         status_lines.extend(f"  - {d['source']}: {d['reason']}" for d in profiles[0]["discarded"])
     return "\n".join(status_lines)
 
-def extract_identity_profile(source_files, folder_files):
+def extract_identity_profile(source_files, folder_files, progress=gr.Progress()):
     """Builds one reusable identity profile (Face + centroid embedding) per
     person detected in the uploaded images/videos (greedy clustering by
     cosine similarity — see identity_profile.cluster_samples). Video mode
@@ -636,7 +648,7 @@ def extract_identity_profile(source_files, folder_files):
         return "Nenhum arquivo enviado.", [], empty_dropdown, empty_dropdown, empty_dropdown, []
 
     builder = IdentityProfileBuilder.from_refacer(refacer)
-    _populate_builder_from_files(builder, all_files)
+    _populate_builder_from_files(builder, all_files, progress=progress)
 
     if not builder.samples:
         reasons = "; ".join(f"{d['source']}: {d['reason']}" for d in builder.discarded) or "motivo desconhecido"
