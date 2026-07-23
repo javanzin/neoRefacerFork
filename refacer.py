@@ -727,35 +727,40 @@ class Refacer:
         if nose_y < mouth_corner_y:
             top_y = max(top_y, nose_y + (mouth_corner_y - nose_y) * 0.65)
 
-        # Half-width of the preserved band, from mouth width alone plus a
-        # margin so the mouth corners themselves stay inside the solid core
-        # instead of sitting right on the transition edge.
+        # Half-width of the always-preserved core, from mouth width alone plus
+        # a margin so the mouth corners themselves stay inside it rather than
+        # sitting inside the transition.
         half_width = mouth_width * 0.5 + mouth_width * 0.35
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
 
-        # Transition width scales with mouth size (fixed px would be too soft
-        # on small/distant faces and too hard on large/close ones), clamped to
-        # a sane px range.
-        band = float(np.clip(mouth_width * 0.25, 8.0, 40.0))
+        # Vertical edges (upper-lip line, chin line) keep the original
+        # smoothstep straddling the edge: dist_y==0 is the boundary, +/- band/2
+        # is fully inside/outside. This axis was already sized correctly.
+        band_y = 20.0
 
-        def edge_alpha(dist_inside):
-            # dist_inside > 0 means inside the preserved core; the transition
-            # band straddles the edge (dist_inside == 0), matching the rect
-            # cutoff's original smoothstep treatment.
+        def straddling_alpha(dist_inside, band):
             t = np.clip((band / 2 - dist_inside) / band, 0.0, 1.0)
             return 3 * t**2 - 2 * t**3
 
-        # Distance inside the rectangle on each axis independently, then take
-        # the minimum across axes: alpha->0 (preserved) only where the point
-        # is inside on BOTH axes; as soon as either axis exits, alpha rises
-        # toward 1 (swap shown) — this keeps the excluded region a rectangle
-        # instead of the union/intersection producing rounded corners.
-        dist_x = half_width - np.abs(xx - mouth_cx)
         dist_y = np.minimum(yy - top_y, chin_y - yy)
-        dist_inside = np.minimum(dist_x, dist_y)
+        alpha_y = straddling_alpha(dist_y, band_y)
 
-        alpha = edge_alpha(dist_inside)
+        # Horizontal (cheek) edges: the fade that was "too visible" starting
+        # right at the mouth-width boundary. Fix is to guarantee the full
+        # half_width core stays 100% preserved (alpha_x==0 for all
+        # dist_x >= 0) and only start softening OUTSIDE the core, over a wide
+        # band — so cheeks fade in/out gradually instead of appearing to
+        # "pop" at a visible edge a fixed short distance from the mouth.
+        band_x = float(np.clip(mouth_width * 1.1, 40.0, 160.0))
+        dist_x = half_width - np.abs(xx - mouth_cx)
+        t_x = np.clip(-dist_x / band_x, 0.0, 1.0)
+        alpha_x = 3 * t_x**2 - 2 * t_x**3
+
+        # Preserved (alpha low) only where BOTH axes say preserved; take the
+        # stronger swap signal (max of the two alphas) so the rectangle shape
+        # is kept rather than blended into an ellipse-like falloff.
+        alpha = np.maximum(alpha_x, alpha_y)
         mask = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
 
         return mask
