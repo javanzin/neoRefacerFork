@@ -747,11 +747,28 @@ class Refacer:
         dist_y = np.minimum(yy - top_y, chin_y - yy)
         dist_inside = np.minimum(dist_x, dist_y)
 
+        def smoothstep(dist, band):
+            t = np.clip(-dist / band, 0.0, 1.0)
+            return 3 * t**2 - 2 * t**3
+
         # Fade band scales with mouth size, wide enough to be gradual rather
         # than a fast ramp (this is what was "too visible" originally).
         band = float(np.clip(mouth_width * 1.1, 40.0, 160.0))
-        t = np.clip(-dist_inside / band, 0.0, 1.0)
-        alpha = 3 * t**2 - 2 * t**3
+        alpha = smoothstep(dist_inside, band)
+
+        # The band above is wide enough that, applied upward (toward the
+        # nose), it would fade for up to `band` px above top_y — eating into
+        # the nose-clearance margin top_y was explicitly clamped to preserve,
+        # and partially un-swapping the nose tip. Recompute alpha for the
+        # above-top_y region alone with a band capped to the actual
+        # top_y-to-nose gap, and use it (it is always >= the wide-band alpha
+        # there, i.e. more "swapped") wherever we're above top_y.
+        if nose_y < top_y:
+            band_up = min(band, max(top_y - nose_y, 1.0))
+            dist_above = np.minimum(dist_x, yy - top_y)
+            alpha_above = smoothstep(dist_above, band_up)
+            alpha = np.where(yy < top_y, np.maximum(alpha, alpha_above), alpha)
+
         mask = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
 
         return mask
