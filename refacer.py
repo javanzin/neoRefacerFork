@@ -734,33 +734,24 @@ class Refacer:
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
 
-        # Vertical edges (upper-lip line, chin line) keep the original
-        # smoothstep straddling the edge: dist_y==0 is the boundary, +/- band/2
-        # is fully inside/outside. This axis was already sized correctly.
-        band_y = 20.0
-
-        def straddling_alpha(dist_inside, band):
-            t = np.clip((band / 2 - dist_inside) / band, 0.0, 1.0)
-            return 3 * t**2 - 2 * t**3
-
-        dist_y = np.minimum(yy - top_y, chin_y - yy)
-        alpha_y = straddling_alpha(dist_y, band_y)
-
-        # Horizontal (cheek) edges: the fade that was "too visible" starting
-        # right at the mouth-width boundary. Fix is to guarantee the full
-        # half_width core stays 100% preserved (alpha_x==0 for all
-        # dist_x >= 0) and only start softening OUTSIDE the core, over a wide
-        # band — so cheeks fade in/out gradually instead of appearing to
-        # "pop" at a visible edge a fixed short distance from the mouth.
-        band_x = float(np.clip(mouth_width * 1.1, 40.0, 160.0))
+        # Single distance-to-outside-the-rect field (min over all 4 edges),
+        # so the fade wraps the whole rectangle perimeter as one soft edge
+        # instead of vertical/horizontal edges being computed and combined
+        # separately — a per-axis max() previously let the (deliberately
+        # narrow) vertical band dominate almost the entire frame height,
+        # since it only reads as a rectangle within the mouth's own vertical
+        # span; everywhere else (real cheek height, well above/below the
+        # mouth) the vertical axis alone decided the result, collapsing the
+        # shape into a plain horizontal cutoff with no visible side fade.
         dist_x = half_width - np.abs(xx - mouth_cx)
-        t_x = np.clip(-dist_x / band_x, 0.0, 1.0)
-        alpha_x = 3 * t_x**2 - 2 * t_x**3
+        dist_y = np.minimum(yy - top_y, chin_y - yy)
+        dist_inside = np.minimum(dist_x, dist_y)
 
-        # Preserved (alpha low) only where BOTH axes say preserved; take the
-        # stronger swap signal (max of the two alphas) so the rectangle shape
-        # is kept rather than blended into an ellipse-like falloff.
-        alpha = np.maximum(alpha_x, alpha_y)
+        # Fade band scales with mouth size, wide enough to be gradual rather
+        # than a fast ramp (this is what was "too visible" originally).
+        band = float(np.clip(mouth_width * 1.1, 40.0, 160.0))
+        t = np.clip(-dist_inside / band, 0.0, 1.0)
+        alpha = 3 * t**2 - 2 * t**3
         mask = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
 
         return mask
