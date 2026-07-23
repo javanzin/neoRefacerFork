@@ -734,40 +734,40 @@ class Refacer:
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
 
-        # Single distance-to-outside-the-rect field (min over all 4 edges),
-        # so the fade wraps the whole rectangle perimeter as one soft edge
-        # instead of vertical/horizontal edges being computed and combined
-        # separately — a per-axis max() previously let the (deliberately
-        # narrow) vertical band dominate almost the entire frame height,
-        # since it only reads as a rectangle within the mouth's own vertical
-        # span; everywhere else (real cheek height, well above/below the
-        # mouth) the vertical axis alone decided the result, collapsing the
-        # shape into a plain horizontal cutoff with no visible side fade.
-        dist_x = half_width - np.abs(xx - mouth_cx)
-        dist_y = np.minimum(yy - top_y, chin_y - yy)
-        dist_inside = np.minimum(dist_x, dist_y)
-
-        def smoothstep(dist, band):
-            t = np.clip(-dist / band, 0.0, 1.0)
-            return 3 * t**2 - 2 * t**3
-
         # Fade band scales with mouth size, wide enough to be gradual rather
         # than a fast ramp (this is what was "too visible" originally).
-        band = float(np.clip(mouth_width * 1.1, 40.0, 160.0))
-        alpha = smoothstep(dist_inside, band)
+        band = float(np.clip(mouth_width * 1.8, 70.0, 220.0))
 
-        # The band above is wide enough that, applied upward (toward the
-        # nose), it would fade for up to `band` px above top_y — eating into
-        # the nose-clearance margin top_y was explicitly clamped to preserve,
-        # and partially un-swapping the nose tip. Recompute alpha for the
-        # above-top_y region alone with a band capped to the actual
-        # top_y-to-nose gap, and use it (it is always >= the wide-band alpha
-        # there, i.e. more "swapped") wherever we're above top_y.
+        def box_sdf_alpha(top, band_width):
+            # Exact euclidean signed distance to the outside of the
+            # rectangle [mouth_cx-half_width, mouth_cx+half_width] x
+            # [top, chin_y], smoothstepped over band_width. Handles corners
+            # correctly (e.g. above-and-beside the mouth): a plain
+            # min(dist_x, dist_y) — tried before — is wrong there, since it
+            # lets whichever axis is "more outside" decide alone and ignores
+            # the other axis, which both flattened the cheek fade into a
+            # horizontal cutoff and let the fade creep past the nose.
+            dx = np.abs(xx - mouth_cx) - half_width
+            dy = np.maximum(top - yy, yy - chin_y)
+            ax, ay = np.maximum(dx, 0.0), np.maximum(dy, 0.0)
+            dist = np.hypot(ax, ay) + np.minimum(np.maximum(dx, dy), 0.0)
+            t = np.clip(dist / band_width, 0.0, 1.0)
+            return 3 * t**2 - 2 * t**3
+
+        alpha = box_sdf_alpha(top_y, band)
+
+        # The wide band, applied as-is, would fade for up to `band` px above
+        # top_y — reaching past the nose keypoint and partially un-swapping
+        # it. Independently compute a second alpha from a box whose top sits
+        # exactly `band_up` below the nose line (so alpha reaches exactly 1.0
+        # AT the nose row) using a band no wider than the actual
+        # top_y-to-nose gap, and only let it push alpha up (never down) in
+        # the region above top_y. Below top_y this second pass is unused, so
+        # the wide-band cheek/chin fade computed above is untouched there.
         if nose_y < top_y:
-            band_up = min(band, max(top_y - nose_y, 1.0))
-            dist_above = np.minimum(dist_x, yy - top_y)
-            alpha_above = smoothstep(dist_above, band_up)
-            alpha = np.where(yy < top_y, np.maximum(alpha, alpha_above), alpha)
+            band_up = max(top_y - nose_y, 1.0)
+            alpha_nose = box_sdf_alpha(nose_y + band_up, band_up)
+            alpha = np.where(yy < top_y, np.maximum(alpha, alpha_nose), alpha)
 
         mask = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
 
