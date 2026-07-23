@@ -685,16 +685,19 @@ class Refacer:
 
     def _mouth_chin_oval_mask(self, face, crop_x1, crop_y1, w, h):
         """Opt-in shape (partial_blend_shape="oval"): swap everywhere EXCEPT a
-        narrow ellipse spanning upper-lip-to-chin, centered on the mouth. Cheeks
-        stay outside the ellipse at all times and are therefore always
-        preserved, unlike the wide face-contour ellipse discussed and discarded
-        earlier (which had to guess where cheek/jaw occlusions were). Residual
-        risk is limited to occlusions that land inside the narrow mouth/chin
-        band itself.
+        horizontal band spanning upper-lip-to-chin, as wide as the mouth (plus
+        margin) but NOT the full frame width. This is the fix for the plain
+        rect cutoff's cheek fade: that shape draws its transition band across
+        the ENTIRE frame width at a fixed height, so the soft edge always
+        crosses the cheeks. Narrowing the band horizontally to just the mouth
+        region means the transition band only ever crosses mouth/chin/jawline,
+        never the cheeks, while still being a straight-edged rectangle rather
+        than an ellipse (an ellipse's curved sides cut across the nose and lip
+        corners well before reaching the cheeks — that was tried and rejected).
 
-        Falls back to the rect cutoff if kps is unavailable (5-point kps only
-        has eyes/nose/mouth-corners — no chin landmark to size the ellipse
-        against, so we approximate the chin as the bbox base).
+        Falls back to the full-width rect cutoff if kps is unavailable
+        (5-point kps only has eyes/nose/mouth-corners — no chin landmark to
+        size the band against, so we approximate the chin as the bbox base).
         """
         if face.kps is None or len(face.kps) < 5:
             return self._rect_cutoff_mask(w, h)
@@ -706,41 +709,53 @@ class Refacer:
         nose_y = float(face.kps[2][1]) - crop_y1
 
         chin_y = float(h)  # bbox base as chin approximation (no chin landmark in 5-pt kps)
-        if chin_y <= mouth_corner_y:
+        if chin_y <= mouth_corner_y or mouth_width <= 0:
             return self._rect_cutoff_mask(w, h)
 
         # mouth_corner_y sits at the corner-of-mouth line (roughly where the
         # lips meet), not the top of the upper lip. Push the top edge UP by a
         # fraction of the mouth width (no upper-lip landmark in 5-pt kps, so
         # mouth width is the only local scale reference available) so the
-        # ellipse covers the whole upper lip, clamped so it stays a margin
-        # below the nose keypoint and never reaches/touches it.
+        # band covers the whole upper lip, clamped so it stays a margin below
+        # the nose keypoint and never reaches/touches it. Image y grows
+        # downward, so the nose floor is a lower bound on top_y: take the
+        # LARGER (lower on screen, more restrictive) of the two candidates via
+        # max(), not min(). Skip the clamp entirely if the nose keypoint is
+        # at/below the mouth line (degenerate detection) rather than let it
+        # push top_y down past the mouth corners.
         top_y = mouth_corner_y - mouth_width * 0.55
-        if nose_y > mouth_corner_y:
-            top_y = max(top_y, nose_y + (mouth_corner_y - nose_y) * 0.35)
+        if nose_y < mouth_corner_y:
+            top_y = max(top_y, nose_y + (mouth_corner_y - nose_y) * 0.65)
 
-        center_y = (top_y + chin_y) / 2.0
-        semi_axis_y = (chin_y - top_y) / 2.0
-        # Width from mouth width alone (not from a fraction of the vertical
-        # axis — that previously inflated the ellipse wide enough to reach
-        # into the cheeks and made the soft-edge band swallow the solid
-        # "always preserved" core, so the swap visibly bled through).
-        semi_axis_x = mouth_width * 0.55
+        # Half-width of the preserved band, from mouth width alone plus a
+        # margin so the mouth corners themselves stay inside the solid core
+        # instead of sitting right on the transition edge.
+        half_width = mouth_width * 0.5 + mouth_width * 0.35
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-        normalized = ((xx - mouth_cx) / semi_axis_x) ** 2 + ((yy - center_y) / semi_axis_y) ** 2
 
-        # Smoothstep falloff over a band around the ellipse edge (normalized==1).
-        # Inside the ellipse (normalized -> 0): alpha -> 0, original is preserved
-        # (mouth/chin/cheek gap). Outside the ellipse (normalized -> large):
-        # alpha -> 1, swap is shown everywhere else (eyes, forehead, nose, and
-        # the rest of the face) — inverse of the rect cutoff's "below the line
-        # is preserved" default, since here only the ellipse itself is excluded.
-        # A narrower band (vs. the previous 0.35) keeps a solid fully-preserved
-        # core at the ellipse center instead of blending it away entirely.
-        band = 0.2
-        t = np.clip((normalized - (1.0 - band)) / (2 * band), 0.0, 1.0)
-        alpha = 3 * t**2 - 2 * t**3
+        # Transition width scales with mouth size (fixed px would be too soft
+        # on small/distant faces and too hard on large/close ones), clamped to
+        # a sane px range.
+        band = float(np.clip(mouth_width * 0.25, 8.0, 40.0))
+
+        def edge_alpha(dist_inside):
+            # dist_inside > 0 means inside the preserved core; the transition
+            # band straddles the edge (dist_inside == 0), matching the rect
+            # cutoff's original smoothstep treatment.
+            t = np.clip((band / 2 - dist_inside) / band, 0.0, 1.0)
+            return 3 * t**2 - 2 * t**3
+
+        # Distance inside the rectangle on each axis independently, then take
+        # the minimum across axes: alpha->0 (preserved) only where the point
+        # is inside on BOTH axes; as soon as either axis exits, alpha rises
+        # toward 1 (swap shown) — this keeps the excluded region a rectangle
+        # instead of the union/intersection producing rounded corners.
+        dist_x = half_width - np.abs(xx - mouth_cx)
+        dist_y = np.minimum(yy - top_y, chin_y - yy)
+        dist_inside = np.minimum(dist_x, dist_y)
+
+        alpha = edge_alpha(dist_inside)
         mask = np.repeat(alpha[:, :, np.newaxis], 3, axis=2)
 
         return mask
