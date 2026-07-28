@@ -775,33 +775,33 @@ class Refacer:
         if nose_y < mouth_corner_y:
             top_y = max(top_y, nose_y + (mouth_corner_y - nose_y) * 0.65)
 
-        # Half-width of the always-preserved core, from mouth width alone plus
-        # a margin so the mouth corners themselves stay inside it rather than
-        # sitting inside the transition. Capped relative to face width: an
-        # open mouth (talking/smiling, common in video) can otherwise push
-        # the core to 80-90% of the face width, leaving almost no room for
-        # the lateral fade band and making the rectangle look like a
-        # full-width horizontal cutoff (the exact problem this shape exists
-        # to avoid).
-        half_width = min(mouth_width * 0.5 + mouth_width * 0.35, w * 0.45)
+        # Half-width of the always-preserved core. The rectangle's VERTICAL
+        # edges must live INSIDE the crop for the shape to read as a
+        # rectangle at all: the blend only happens within the bbox crop, so
+        # any part of core+fade that falls outside the crop's x-range simply
+        # doesn't exist visually — the previous cap (w*0.45, core up to 90%
+        # of the crop) pushed the vertical edges out of the crop entirely,
+        # leaving only the horizontal transition visible, which is exactly
+        # the "same as reface ratio" symptom reported. Cap the core at 60%
+        # of the crop width (30% per side) so at least 20% of the width per
+        # side remains for a visible lateral fade.
+        half_width = min(mouth_width * 0.5 + mouth_width * 0.35, w * 0.30)
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
 
         # Fade band scales with mouth size, wide enough to be gradual rather
-        # than a fast ramp (this is what was "too visible" originally). But
-        # it must also fit within the lateral space actually available
-        # between the core's edge and the crop border — on a face filling
-        # most of the frame (common in webcam/selfie framing), that space
-        # can be much narrower than the 220px cap, and a band wider than the
-        # space it fades over saturates (hits alpha=0) almost immediately,
-        # looking like an abrupt cutoff instead of a gradual fade (exactly
-        # the "line got sharper" symptom reported after adding the
-        # half_width cap). Clamp the band to the smaller of the two lateral
-        # gaps (mouth_cx may not be centered in the crop) so the smoothstep
-        # always completes across real image, never gets compressed against
-        # the edge.
-        lateral_space = max(min(mouth_cx - half_width, w - mouth_cx - half_width), 1.0)
-        band = float(np.clip(min(mouth_width * 1.8, lateral_space), 70.0, 220.0))
+        # than a fast ramp — but it must FIT in the lateral space actually
+        # available between the core's edge and the crop border, or the
+        # smoothstep saturates against the edge and reads as an abrupt
+        # cutoff. NOTE: no fixed lower bound here — a previous version
+        # clamped with clip(..., 70, 220), and that 70px floor silently
+        # re-inflated the band above the available space whenever the space
+        # was narrower than 70px (the common talking-face case), fully
+        # negating the lateral_space limit. With band == lateral_space the
+        # fade reaches exactly alpha=1.0 AT the crop border, seamlessly
+        # matching the fully-swapped region outside the crop.
+        lateral_space = max(min(mouth_cx - half_width, w - mouth_cx - half_width), 8.0)
+        band = float(min(mouth_width * 1.8, 220.0, lateral_space))
 
         def box_sdf_alpha(top, band_width):
             # Exact euclidean signed distance to the outside of the
