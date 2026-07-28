@@ -777,8 +777,13 @@ class Refacer:
 
         # Half-width of the always-preserved core, from mouth width alone plus
         # a margin so the mouth corners themselves stay inside it rather than
-        # sitting inside the transition.
-        half_width = mouth_width * 0.5 + mouth_width * 0.35
+        # sitting inside the transition. Capped relative to face width: an
+        # open mouth (talking/smiling, common in video) can otherwise push
+        # the core to 80-90% of the face width, leaving almost no room for
+        # the lateral fade band and making the rectangle look like a
+        # full-width horizontal cutoff (the exact problem this shape exists
+        # to avoid).
+        half_width = min(mouth_width * 0.5 + mouth_width * 0.35, w * 0.45)
 
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
 
