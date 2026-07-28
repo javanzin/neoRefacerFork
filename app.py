@@ -2101,7 +2101,17 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             cancel_requested = True
             gr.Info("Cancelamento solicitado — a fila para após o job em andamento.")
 
-        cancel_video_btn.click(fn=request_cancel, inputs=[], outputs=[], cancels=[video_event])
+        # Não usa cancels=[video_event]: esse parâmetro pede ao Gradio para
+        # cancelar a asyncio Task do job via task.cancel() e esperar
+        # (await asyncio.gather) ela morrer antes de responder ao /cancel.
+        # run() é síncrono e só verifica cancel_requested entre jobs
+        # (nunca durante um reface() em andamento) — a CancelledError nunca
+        # chega a ser entregue enquanto o código síncrono está rodando, então
+        # o /cancel fica pendurado esperando indefinidamente, travando o
+        # servidor inteiro (inclusive outros botões, como Limpar Histórico).
+        # Sinalizar cancel_requested=True é suficiente: o loop em run() já
+        # para sozinho no próximo job, sem depender do cancelamento do Gradio.
+        cancel_video_btn.click(fn=request_cancel, inputs=[], outputs=[])
 
     # --- System / Cache Settings (Global) ---
     with gr.Accordion("⚙️ System Settings", open=False):
