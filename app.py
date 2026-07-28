@@ -11,6 +11,9 @@ import imageio
 import cv2
 import numpy as np
 from PIL import Image
+from pillow_heif import register_heif_opener
+
+register_heif_opener()
 import tempfile
 import base64
 import pyfiglet
@@ -672,8 +675,19 @@ from identity_profile import (
     build_anchor_sample,
 )
 
-_IDENTITY_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
+_IDENTITY_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".heic", ".heif"}
 _IDENTITY_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".gif"}
+_HEIF_EXTENSIONS = {".heic", ".heif"}
+
+def _imread_identity(path):
+    """cv2.imread para a maioria dos formatos; HEIC/HEIF (fotos de iPhone,
+    não decodificadas nativamente pelo OpenCV) passam por Pillow+pillow-heif
+    e são convertidas para BGR antes de entrar no pipeline existente.
+    """
+    if os.path.splitext(path)[1].lower() in _HEIF_EXTENSIONS:
+        with Image.open(path) as img:
+            return cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR)
+    return cv2.imread(path)
 
 def _pluralize_count(count, singular_suffix="", plural_suffix="s"):
     """`f"{count} amostra{_pluralize_count(count)}"` style helper — shared by
@@ -765,7 +779,7 @@ def _populate_builder_from_files(builder, source_files, progress=None):
         if ext in _IDENTITY_VIDEO_EXTENSIONS:
             builder.add_video(path, label)
         elif ext in _IDENTITY_IMAGE_EXTENSIONS:
-            frame = cv2.imread(path)
+            frame = _imread_identity(path)
             builder.add_image(frame, label)
         else:
             builder.discarded.append({"source": label, "reason": f"tipo de arquivo não suportado ({ext or 'sem extensão'})"})
@@ -1007,7 +1021,7 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
         if ext in _IDENTITY_VIDEO_EXTENSIONS:
             new_matches.extend(builder.find_matches_in_video(path, label, target_face))
         elif ext in _IDENTITY_IMAGE_EXTENSIONS:
-            frame = cv2.imread(path)
+            frame = _imread_identity(path)
             if frame is None:
                 builder.discarded.append({"source": label, "reason": "imagem inválida"})
                 continue
@@ -1172,7 +1186,7 @@ def continue_imported_profile(imported_profile, candidate_profile, source_files,
         if ext in _IDENTITY_VIDEO_EXTENSIONS:
             new_matches.extend(builder.find_matches_in_video(path, label, target_face))
         elif ext in _IDENTITY_IMAGE_EXTENSIONS:
-            frame = cv2.imread(path)
+            frame = _imread_identity(path)
             if frame is None:
                 builder.discarded.append({"source": label, "reason": "imagem inválida"})
                 continue
