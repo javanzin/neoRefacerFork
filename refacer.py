@@ -788,8 +788,20 @@ class Refacer:
         yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
 
         # Fade band scales with mouth size, wide enough to be gradual rather
-        # than a fast ramp (this is what was "too visible" originally).
-        band = float(np.clip(mouth_width * 1.8, 70.0, 220.0))
+        # than a fast ramp (this is what was "too visible" originally). But
+        # it must also fit within the lateral space actually available
+        # between the core's edge and the crop border — on a face filling
+        # most of the frame (common in webcam/selfie framing), that space
+        # can be much narrower than the 220px cap, and a band wider than the
+        # space it fades over saturates (hits alpha=0) almost immediately,
+        # looking like an abrupt cutoff instead of a gradual fade (exactly
+        # the "line got sharper" symptom reported after adding the
+        # half_width cap). Clamp the band to the smaller of the two lateral
+        # gaps (mouth_cx may not be centered in the crop) so the smoothstep
+        # always completes across real image, never gets compressed against
+        # the edge.
+        lateral_space = max(min(mouth_cx - half_width, w - mouth_cx - half_width), 1.0)
+        band = float(np.clip(min(mouth_width * 1.8, lateral_space), 70.0, 220.0))
 
         def box_sdf_alpha(top, band_width):
             # Exact euclidean signed distance to the outside of the
