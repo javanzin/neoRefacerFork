@@ -105,6 +105,18 @@ ROBUST_CENTROID_ITERATIONS = 2
 # claros, não fronteiras entre identidades.
 ROBUST_CENTROID_SIMILARITY_FLOOR = 0.30
 
+# Peso máximo que uma foto âncora (upload manual, opcional) pode ter na
+# combinação final com o centroide já calculado. Interpolação convexa
+# (ver _apply_anchor): 0 = âncora sem nenhum efeito, 1 = âncora substitui
+# totalmente o centroide (descartaria o benefício de ter várias referências,
+# o oposto do que a âncora deveria fazer). ~0.35 desloca o resultado bem
+# menos que a distância típica de similaridade intra-pessoa do ArcFace w600k
+# (0.35-0.8, mesma faixa citada acima para ROBUST_CENTROID_SIMILARITY_FLOOR)
+# — a âncora ganha influência real sem sair da vizinhança de identidade que o
+# pipeline já considera normal. Valor de partida qualitativo, não validado
+# por experimento; ajustável visualmente via preview_identity_swap.
+ANCHOR_MAX_WEIGHT = 0.35
+
 
 def _face_sharpness(aligned_crop_bgr):
     gray = cv2.cvtColor(aligned_crop_bgr, cv2.COLOR_BGR2GRAY)
@@ -187,17 +199,117 @@ def _compute_centroid(samples, iterations=ROBUST_CENTROID_ITERATIONS):
     return centroid
 
 
-def _build_profile_from_samples(samples, name, discarded=None):
+def _group_samples_by_origin(samples):
+    """Agrupa `samples` pela origem estruturada (`origin`, ver _add_face_candidate)
+    em vez de tentar recuperá-la por parsing do `source` formatado para
+    exibição (que carrega sufixos como " (frame 123)"). Amostras "legadas"
+    sem a chave `origin` (ex. dict construído manualmente por um teste ou por
+    código externo) caem de volta em `source` inteiro — nunca quebra, só deixa
+    de agrupar corretamente.
+
+    Retorna um dict comum (não OrderedDict — dict já preserva ordem de
+    inserção desde Python 3.7), origem -> list[sample], na ordem de primeira
+    aparição, só para determinismo em teste/debug.
+    """
+    groups = {}
+    for s in samples:
+        groups.setdefault(s.get("origin", s["source"]), []).append(s)
+    return groups
+
+
+def _origin_centroids_as_pseudo_samples(samples):
+    """Um "pseudo-sample" (dict só com `embedding`) por origem distinta,
+    cada um sendo o centroide simples (sem supressão de outlier) daquela
+    origem — reaproveita _simple_mean_centroid em vez de duplicar a lógica de
+    normalização. Alimentar isso de volta em _compute_centroid faz a
+    supressão de outlier operar sobre origens, não sobre frames individuais.
+    """
+    groups = _group_samples_by_origin(samples)
+    return [{"embedding": _simple_mean_centroid(group_samples)} for group_samples in groups.values()]
+
+
+def _compute_balanced_centroid(samples):
+    """Centroide robusto (mesma supressão de outlier de _compute_centroid),
+    mas operando sobre um centroide por origem em vez das amostras cruas —
+    um vídeo de centenas de frames vira 1 pseudo-sample, equalizando sua
+    contribuição à de uma foto avulsa (que já é, por definição, sua própria
+    origem com 1 amostra).
+
+    Com uma única origem, o resultado é a MESMA DIREÇÃO dominante de
+    _compute_centroid(samples), mas não necessariamente bit-a-bit idêntico:
+    com 1 pseudo-sample (a origem única), a função cai no atalho "<=3
+    amostras" e retorna a média simples direto, sem as iterações de
+    reponderação que _compute_centroid(samples) aplicaria caso houvesse mais
+    de 3 amostras cruas — reponderar 1 pseudo-sample contra si mesmo não
+    mudaria o resultado de qualquer forma (toda amostra teria peso 1), então
+    a única diferença observável é de arredondamento de ponto flutuante
+    (ver test_single_origin_matches_current_behavior), não de direção.
+    """
+    return _compute_centroid(_origin_centroids_as_pseudo_samples(samples))
+
+
+def _compute_balanced_mean(samples):
+    """Variante de _compute_balanced_centroid SEM supressão de outlier —
+    usada por merge_profiles, que deliberadamente evita suprimir qualquer
+    amostra (ver docstring de merge_profiles). Ainda assim equaliza a
+    contribuição por origem antes da média final.
+    """
+    return _simple_mean_centroid(_origin_centroids_as_pseudo_samples(samples))
+
+
+def _apply_anchor(base_centroid, anchor_embedding, anchor_weight):
+    """Combina `base_centroid` (já calculado) com o embedding de uma foto
+    âncora via interpolação convexa: anchor_weight já é diretamente a fração
+    máxima de influência da âncora (0 = sem efeito, 1 = substitui
+    completamente o centroide base) — não há dois pesos livres para
+    normalizar depois. anchor_weight é sempre clampado a
+    [0, ANCHOR_MAX_WEIGHT] aqui (defesa em profundidade: a UI já deveria
+    limitar o slider a essa faixa, mas o núcleo não deveria confiar só nisso).
+    """
+    anchor_weight = float(np.clip(anchor_weight, 0.0, ANCHOR_MAX_WEIGHT))
+    anchor_norm = np.linalg.norm(anchor_embedding)
+    anchor_normalized = anchor_embedding / anchor_norm if anchor_norm > 0 else anchor_embedding
+
+    combined = (1 - anchor_weight) * base_centroid + anchor_weight * anchor_normalized
+    combined_norm = np.linalg.norm(combined)
+    return combined / combined_norm if combined_norm > 0 else combined
+
+
+def _build_profile_from_samples(
+    samples,
+    name,
+    discarded=None,
+    balance_by_origin=False,
+    anchor_sample=None,
+    anchor_weight=ANCHOR_MAX_WEIGHT,
+):
     """Núcleo puro (sem estado de instância) de build_profile/build_profiles:
     agrega uma lista de amostras num único perfil. Recebe `samples` e
     `discarded` diretamente em vez de um IdentityProfileBuilder inteiro, para
     não precisar de um objeto parcialmente inicializado (via __new__) só para
     montar o perfil de um cluster já separado.
+
+    balance_by_origin (default False, para não mudar o comportamento hoje já
+    validado): se True, agrega via _compute_balanced_centroid (1 centroide
+    por origem/arquivo antes da combinação final) em vez do _compute_centroid
+    direto sobre todas as amostras — evita que um vídeo com muito mais frames
+    que as demais origens domine o perfil só por volume bruto. Com False
+    (default), o caminho de código é idêntico ao de antes desta opção
+    existir.
+
+    anchor_sample (opcional, default None): amostra de uma foto âncora
+    (upload manual dedicado, fora do fluxo de extração normal — ver
+    build_anchor_sample), aplicada como uma etapa SEPARADA depois do
+    centroide (balanceado ou não) já calculado. Com None (default), não tem
+    nenhum efeito — nem o cálculo de _apply_anchor roda.
     """
     if not samples:
         raise ValueError("Nenhuma amostra válida para construir o perfil de identidade.")
 
-    centroid = _compute_centroid(samples)
+    centroid = _compute_balanced_centroid(samples) if balance_by_origin else _compute_centroid(samples)
+    if anchor_sample is not None:
+        centroid = _apply_anchor(centroid, anchor_sample["embedding"], anchor_weight)
+
     representative = max(samples, key=lambda s: s["face"].det_score)
 
     profile_face = Face(
@@ -250,7 +362,13 @@ class IdentityProfileBuilder:
         """
         return cls(refacer.face_detector, refacer.rec_app)
 
-    def add_image(self, frame_bgr, source_label):
+    def add_image(self, frame_bgr, source_label, origin=None):
+        """origin (opcional): identificador cru da origem (ex. nome do
+        arquivo, sem sufixos como "(frame N)") usado para balanceamento por
+        origem (ver _build_profile_from_samples/balance_by_origin). Se
+        omitido, a própria imagem é sua origem (source_label já é o nome cru
+        neste caso — não há sufixo a remover).
+        """
         if frame_bgr is None:
             self.discarded.append({"source": source_label, "reason": "imagem inválida"})
             return
@@ -263,13 +381,18 @@ class IdentityProfileBuilder:
         bbox = bboxes[0, 0:4]
         det_score = float(bboxes[0, 4])
         kps = kpss[0] if kpss is not None else None
-        self._add_face_candidate(frame_bgr, bbox, kps, det_score, source_label)
+        self._add_face_candidate(frame_bgr, bbox, kps, det_score, source_label, origin=origin if origin is not None else source_label)
 
-    def _add_face_candidate(self, frame_bgr, bbox, kps, det_score, source_label):
+    def _add_face_candidate(self, frame_bgr, bbox, kps, det_score, source_label, origin):
         """Núcleo de validação de qualidade + montagem de amostra
         compartilhado entre add_image (1 rosto por frame, o mais proeminente)
         e find_match_in_frame (N rostos por frame, todos os candidatos que
         baterem com um perfil-alvo).
+
+        origin identifica a origem "crua" da amostra (nome do arquivo/vídeo,
+        sem os sufixos de exibição que source_label pode carregar como
+        "(frame N)"/"(rosto N)") — usado só para balanceamento por origem,
+        nunca para exibição.
         """
         if kps is None:
             self.discarded.append({"source": source_label, "reason": "sem landmarks (kps)"})
@@ -330,6 +453,7 @@ class IdentityProfileBuilder:
             "face": face,
             "thumbnail": aligned,
             "source": source_label,
+            "origin": origin,
         }
         self.samples.append(sample)
         return sample
@@ -344,8 +468,16 @@ class IdentityProfileBuilder:
         Frames quase idênticos ao último frame aceito (ver
         _is_near_duplicate) são pulados antes do custo de detecção/embedding
         — cobre o vídeo inteiro sem gastar esse custo em trechos parados.
+
+        Todos os frames deste vídeo compartilham a mesma `origin` (o
+        `source_label` cru recebido aqui, sem o sufixo "(frame N)" que o
+        label de exibição ganha) — usado só para balanceamento por origem.
         """
-        self._sample_video_frames(video_path, source_label, self.add_image)
+        self._sample_video_frames(
+            video_path,
+            source_label,
+            lambda frame, display_label: self.add_image(frame, display_label, origin=source_label),
+        )
 
     def _sample_video_frames(self, video_path, source_label, on_frame):
         """Núcleo de amostragem de vídeo (stride fixo + filtro de frame quase
@@ -393,7 +525,7 @@ class IdentityProfileBuilder:
                 "reason": f"{n_duplicates} frame{'s' if n_duplicates != 1 else ''} quase idêntico(s) ao anterior, pulado(s)",
             })
 
-    def find_match_in_frame(self, frame_bgr, source_label, target_face, threshold=TARGET_MATCH_SIMILARITY_THRESHOLD):
+    def find_match_in_frame(self, frame_bgr, source_label, target_face, threshold=TARGET_MATCH_SIMILARITY_THRESHOLD, origin=None):
         """Busca dirigida num único frame/imagem já decodificado: em vez de
         extrair e depois separar por pessoa (add_image + cluster_samples),
         procura diretamente por UMA identidade já conhecida (target_face, o
@@ -410,9 +542,14 @@ class IdentityProfileBuilder:
         Retorna a lista de novas amostras aceitas neste frame (mesmo formato
         de self.samples), já também acrescentadas a
         self.samples/self.discarded.
+
+        origin (opcional): mesmo papel de add_image — identificador cru da
+        origem, para balanceamento por origem. Se omitido, usa source_label
+        (imagem avulsa: ela é sua própria origem).
         """
         target_embedding = target_face.embedding
         matches = []
+        origin = origin if origin is not None else source_label
 
         bboxes, kpss = self._detector.detect(frame_bgr, max_num=0)
         if bboxes.shape[0] == 0:
@@ -431,7 +568,7 @@ class IdentityProfileBuilder:
                 continue
 
             label = f"{source_label} (rosto {i + 1})" if bboxes.shape[0] > 1 else source_label
-            sample = self._add_face_candidate(frame_bgr, bbox, kps, det_score, label)
+            sample = self._add_face_candidate(frame_bgr, bbox, kps, det_score, label, origin=origin)
             if sample is not None:
                 matches.append(sample)
 
@@ -444,18 +581,25 @@ class IdentityProfileBuilder:
         """Aplica find_match_in_frame a cada frame amostrado de um vídeo
         (mesmo stride/filtro de quase-duplicata de add_video, via
         _sample_video_frames), em vez de extrair todas as pessoas do vídeo
-        para depois separar por similaridade.
+        para depois separar por similaridade. Todos os frames deste vídeo
+        compartilham a mesma origin (o nome cru do vídeo), para balanceamento
+        por origem.
         """
         matches = []
         self._sample_video_frames(
             video_path,
             source_label,
-            lambda frame, label: matches.extend(self.find_match_in_frame(frame, label, target_face, threshold)),
+            lambda frame, label: matches.extend(
+                self.find_match_in_frame(frame, label, target_face, threshold, origin=source_label)
+            ),
         )
         return matches
 
-    def build_profile(self, name="Pessoa 1"):
-        return _build_profile_from_samples(self.samples, name, self.discarded)
+    def build_profile(self, name="Pessoa 1", balance_by_origin=False, anchor_sample=None, anchor_weight=ANCHOR_MAX_WEIGHT):
+        return _build_profile_from_samples(
+            self.samples, name, self.discarded,
+            balance_by_origin=balance_by_origin, anchor_sample=anchor_sample, anchor_weight=anchor_weight,
+        )
 
     def cluster_samples(self, threshold=CLUSTER_SIMILARITY_THRESHOLD):
         """Separa self.samples em grupos por pessoa (greedy, sem lib de
@@ -515,17 +659,22 @@ class IdentityProfileBuilder:
 
         return [c["samples"] for c in clusters]
 
-    def build_profiles(self, threshold=CLUSTER_SIMILARITY_THRESHOLD):
+    def build_profiles(self, threshold=CLUSTER_SIMILARITY_THRESHOLD, balance_by_origin=False):
         """Separa as amostras em clusters por pessoa e constrói um perfil
         (centroide + Face sintético) por cluster, nomeados "Pessoa 1",
         "Pessoa 2"... na ordem de criação dos clusters.
+
+        balance_by_origin (default False): repassado a _build_profile_from_samples
+        — ver docstring lá para o que muda. Âncora não se aplica aqui: ela é
+        escolhida pelo usuário depois de já ver os perfis extraídos (ver
+        apply_anchor_to_profile).
         """
         if not self.samples:
             raise ValueError("Nenhuma amostra válida para construir perfis de identidade.")
 
         groups = self.cluster_samples(threshold=threshold)
         profiles = [
-            _build_profile_from_samples(group, name=f"Pessoa {i + 1}")
+            _build_profile_from_samples(group, name=f"Pessoa {i + 1}", balance_by_origin=balance_by_origin)
             for i, group in enumerate(groups)
         ]
 
@@ -539,7 +688,7 @@ class IdentityProfileBuilder:
         return profiles
 
 
-def merge_profiles(profile_a, profile_b, name=None):
+def merge_profiles(profile_a, profile_b, name=None, balance_by_origin=False):
     """Combina dois perfis (tipicamente 'Pessoa X' e 'Pessoa Y' que o
     clustering separou por engano, mas são a mesma pessoa) num único perfil,
     recalculando o centroide a partir da união das amostras de ambos — não é
@@ -554,6 +703,12 @@ def merge_profiles(profile_a, profile_b, name=None):
     correção que o usuário acabou de pedir. A supressão de outliers já teve
     sua chance em cluster_samples()/build_profiles() antes do usuário decidir
     mesclar.
+
+    balance_by_origin (default False): se True, usa _compute_balanced_mean
+    (equaliza a contribuição por origem/arquivo) em vez de _simple_mean_centroid
+    puro — mas continua SEM supressão de outlier (_compute_centroid), pela
+    mesma razão do parágrafo acima: balancear por origem não é o mesmo que
+    suprimir amostras, e o merge não deve fazer a segunda coisa.
 
     Requer que ambos os perfis tenham a chave "samples" — perfis vindos de
     import_profile() não a têm (o .npz exportado guarda só o centroide, não
@@ -575,7 +730,9 @@ def merge_profiles(profile_a, profile_b, name=None):
         kps=representative["face"].kps,
         det_score=representative["face"].det_score,
     )
-    profile_face.embedding = _simple_mean_centroid(combined_samples)
+    profile_face.embedding = (
+        _compute_balanced_mean(combined_samples) if balance_by_origin else _simple_mean_centroid(combined_samples)
+    )
 
     return {
         "name": name or profile_a["name"],
@@ -586,6 +743,53 @@ def merge_profiles(profile_a, profile_b, name=None):
         "n_discarded": profile_a["n_discarded"] + profile_b["n_discarded"],
         "discarded": profile_a["discarded"] + profile_b["discarded"],
     }
+
+
+def build_anchor_sample(detector, recognizer, frame_bgr, source_label):
+    """Processa uma foto âncora (upload manual dedicado, opcional) pelo mesmo
+    caminho de qualidade/embedding do resto do pipeline (via um
+    IdentityProfileBuilder efêmero, só para reaproveitar _add_face_candidate
+    sem duplicar a validação de nitidez/score/tamanho) — uma âncora de má
+    qualidade não deve ser aceita silenciosamente.
+
+    Retorna a amostra aceita (dict com "embedding", compatível com
+    anchor_sample de apply_anchor_to_profile) ou None se rejeitada, e a lista
+    de descartes (mesmo formato de IdentityProfileBuilder.discarded) para o
+    chamador reportar o motivo ao usuário.
+    """
+    builder = IdentityProfileBuilder(detector, recognizer)
+    builder.add_image(frame_bgr, source_label)
+    anchor_sample = builder.samples[0] if builder.samples else None
+    return anchor_sample, builder.discarded
+
+
+def apply_anchor_to_profile(profile, anchor_sample=None, anchor_weight=ANCHOR_MAX_WEIGHT, balance_by_origin=False):
+    """Reaplica (ou remove, com anchor_sample=None) a foto âncora sobre um
+    perfil já construído, recalculando a partir de profile["samples"] em vez
+    de acumular — chamar duas vezes seguidas com âncoras diferentes não
+    duplica amostras nem cresce n_samples.
+
+    balance_by_origin deve refletir a mesma opção usada para construir o
+    perfil originalmente (ver _build_profile_from_samples), para que reaplicar
+    a âncora não mude silenciosamente essa outra escolha.
+
+    Requer profile["samples"] — perfis importados de .npz não os têm (mesma
+    limitação de merge_profiles), então não podem receber uma âncora.
+    """
+    if "samples" not in profile:
+        raise ValueError(
+            "Não é possível aplicar âncora: perfis importados de um arquivo .npz não "
+            "retêm as amostras individuais. Âncora só funciona em perfis extraídos na sessão atual."
+        )
+
+    return _build_profile_from_samples(
+        profile["samples"],
+        name=profile["name"],
+        discarded=profile["discarded"],
+        balance_by_origin=balance_by_origin,
+        anchor_sample=anchor_sample,
+        anchor_weight=anchor_weight,
+    )
 
 
 def export_profile(profile, output_path):

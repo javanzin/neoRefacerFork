@@ -658,7 +658,16 @@ def rotate_video(video_path, direction):
         return video_path
 
 # --- Identity Profile (multi-image / multi-video, single person) ---
-from identity_profile import IdentityProfileBuilder, export_profile, import_profile, merge_profiles, _build_profile_from_samples
+from identity_profile import (
+    IdentityProfileBuilder,
+    export_profile,
+    import_profile,
+    merge_profiles,
+    _build_profile_from_samples,
+    ANCHOR_MAX_WEIGHT,
+    apply_anchor_to_profile,
+    build_anchor_sample,
+)
 
 _IDENTITY_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp"}
 _IDENTITY_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".gif"}
@@ -765,7 +774,7 @@ def _format_extraction_status(profiles):
         status_lines.extend(f"  - {d['source']}: {d['reason']}" for d in profiles[0]["discarded"])
     return "\n".join(status_lines)
 
-def extract_identity_profile(source_files, folder_files, progress=gr.Progress()):
+def extract_identity_profile(source_files, folder_files, balance_by_origin=False, progress=gr.Progress()):
     """Builds one reusable identity profile (Face + centroid embedding) per
     person detected in the uploaded images/videos (greedy clustering by
     cosine similarity — see identity_profile.cluster_samples). Video mode
@@ -779,6 +788,8 @@ def extract_identity_profile(source_files, folder_files, progress=gr.Progress())
     file_count="directory") — the browser's directory picker already walks
     subfolders recursively, so this is every file found anywhere under the
     chosen folder, not just its top level.
+    balance_by_origin: opt-in (checkbox), default off — see
+    identity_profile._build_profile_from_samples for what changes.
     """
     all_files = list(source_files or []) + list(folder_files or [])
     if not all_files:
@@ -793,7 +804,7 @@ def extract_identity_profile(source_files, folder_files, progress=gr.Progress())
         reasons = "; ".join(f"{d['source']}: {d['reason']}" for d in builder.discarded) or "motivo desconhecido"
         raise gr.Error(f"Nenhuma amostra de rosto válida foi extraída. Descartes: {reasons}")
 
-    profiles = builder.build_profiles()
+    profiles = builder.build_profiles(balance_by_origin=balance_by_origin)
     status = _format_extraction_status(profiles)
     choices = [profile["name"] for profile in profiles]
 
@@ -857,7 +868,7 @@ def _profiles_to_gallery(profiles):
         gallery_items.append((thumbnail_rgb, caption))
     return gallery_items
 
-def merge_selected_profiles(profiles, name_a, name_b):
+def merge_selected_profiles(profiles, name_a, name_b, balance_by_origin=False):
     """Combines two clustered profiles into one — the mitigation for the
     clustering greedily splitting the same person into two profiles (e.g.
     with/without glasses, very different pose/lighting between samples).
@@ -878,7 +889,7 @@ def merge_selected_profiles(profiles, name_a, name_b):
         raise gr.Error("Perfil selecionado não encontrado.")
 
     try:
-        merged = merge_profiles(profile_a, profile_b, name=profile_a["name"])
+        merged = merge_profiles(profile_a, profile_b, name=profile_a["name"], balance_by_origin=balance_by_origin)
     except ValueError as e:
         raise gr.Error(str(e))
     remaining = [p for p in profiles if p["name"] not in (name_a, name_b)]
@@ -935,7 +946,7 @@ def export_selected_profile(profiles, selected_name):
     export_profile(profile, export_path)
     return gr.update(value=export_path, visible=True)
 
-def find_profile_in_more_material(profiles, selected_name, source_files, folder_files, progress=gr.Progress()):
+def find_profile_in_more_material(profiles, selected_name, source_files, folder_files, balance_by_origin=False, progress=gr.Progress()):
     """Busca dirigida: procura apenas a pessoa do perfil já selecionado em
     material novo (que pode ter várias pessoas), em vez de reextrair tudo e
     separar por clustering de novo — muito mais barato quando você já sabe
@@ -986,7 +997,10 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
         raise gr.Error(f"Nenhuma correspondência encontrada para \"{selected_name}\". Descartes: {reasons}")
 
     combined_samples = profile["samples"] + new_matches
-    updated_profile = _build_profile_from_samples(combined_samples, name=profile["name"], discarded=profile["discarded"] + builder.discarded)
+    updated_profile = _build_profile_from_samples(
+        combined_samples, name=profile["name"], discarded=profile["discarded"] + builder.discarded,
+        balance_by_origin=balance_by_origin,
+    )
     new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
 
     n_new = len(new_matches)
@@ -1042,6 +1056,41 @@ def preview_identity_swap(test_image_file, profiles, selected_name):
         refacer.partial_blend_shape = "rect"
         swapped = refacer.process_faces(frame.copy())
     return cv2.cvtColor(swapped, cv2.COLOR_BGR2RGB)
+
+def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_weight, balance_by_origin=False):
+    """Aplica (ou remove, se anchor_image_file estiver vazio) uma foto âncora
+    manual sobre o perfil ativo — upload separado e opcional, processado
+    pelos mesmos filtros de qualidade do resto do pipeline (ver
+    identity_profile.build_anchor_sample). Nunca escolhida entre as amostras
+    já coletadas do perfil.
+    """
+    profile = _get_selected_profile(profiles, selected_name)
+    if profile is None:
+        raise gr.Error("Nenhum perfil selecionado. Extraia ou selecione um perfil primeiro.")
+
+    path = _resolve_history_path(anchor_image_file)
+    if not path or not os.path.exists(path):
+        # Nenhuma imagem enviada: remove a âncora, se houver, restaurando o
+        # centroide base (balanceado ou não, conforme o checkbox).
+        updated_profile = apply_anchor_to_profile(profile, anchor_sample=None, balance_by_origin=balance_by_origin)
+        new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
+        return "Âncora removida. Perfil restaurado ao centroide base.", new_profiles
+
+    frame = cv2.imread(path)
+    if frame is None:
+        raise gr.Error("Não foi possível ler a imagem da foto âncora.")
+
+    anchor_sample, anchor_discarded = build_anchor_sample(refacer.face_detector, refacer.rec_app, frame, os.path.basename(path))
+    if anchor_sample is None:
+        reasons = "; ".join(f"{d['reason']}" for d in anchor_discarded) or "motivo desconhecido"
+        raise gr.Error(f"Foto âncora rejeitada pelos filtros de qualidade: {reasons}. Perfil segue sem âncora.")
+
+    updated_profile = apply_anchor_to_profile(
+        profile, anchor_sample=anchor_sample, anchor_weight=anchor_weight, balance_by_origin=balance_by_origin,
+    )
+    new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
+    status = f"Âncora ativa ({os.path.basename(path)}), influência {anchor_weight:.0%} (teto {ANCHOR_MAX_WEIGHT:.0%})."
+    return status, new_profiles
 
 def _reset_profile_dropdown(profiles):
     """Resets a profile-selection dropdown's choices after the profile list
@@ -1259,6 +1308,19 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             label="Confirmo que possuo autorização para processar este material.",
             value=False,
         )
+        identity_balance_by_origin = gr.Checkbox(
+            label="Balancear contribuição por arquivo de origem",
+            value=False,
+            info=(
+                "Opcional, desligado por padrão. Sem isso, cada frame/foto pesa igual — um vídeo "
+                "com muitos quadros pode dominar o perfil sobre poucas fotos avulsas. Ligado: cada "
+                "vídeo produz 1 centroide próprio (usando todos os seus quadros válidos) e cada "
+                "foto avulsa continua com sua própria contribuição, equilibrando por arquivo em vez "
+                "de por quantidade bruta de amostras. Se houver muitas fotos avulsas e poucos "
+                "vídeos, o(s) vídeo(s) podem passar a pesar menos que o conjunto de fotos — "
+                "compare os dois resultados antes de confiar."
+            ),
+        )
         with gr.Accordion("Arquivos enviados", open=True) as identity_files_accordion:
             with gr.Row():
                 identity_images = gr.File(
@@ -1284,6 +1346,24 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
 
         identity_profile_state = gr.State([])
         identity_selected_profile = gr.Dropdown(label="Perfil ativo (para baixar/testar)", choices=[], value=None)
+
+        with gr.Accordion("Foto âncora (opcional) — uma foto que já funcionava bem sozinha", open=False):
+            gr.Markdown(
+                "Envie **manualmente** uma foto separada (não faz parte do material acima) que "
+                "você já sabe, por experiência, que funcionava bem sozinha para um destino "
+                "específico. Ela não substitui o perfil — só ganha uma influência extra, limitada, "
+                "somada ao perfil já calculado. Totalmente opcional: sem upload aqui, o perfil "
+                "ativo funciona exatamente como sem essa foto."
+            )
+            identity_anchor_image = gr.Image(label="Foto âncora", type="filepath")
+            identity_anchor_weight = gr.Slider(
+                label="Influência da foto âncora",
+                minimum=0.0,
+                maximum=identity_profile.ANCHOR_MAX_WEIGHT,
+                value=identity_profile.ANCHOR_MAX_WEIGHT * 0.6,
+                step=0.01,
+            )
+            identity_anchor_status = gr.Textbox(label="", interactive=False, show_label=False)
 
         with gr.Row():
             identity_rename_input = gr.Textbox(label="Novo nome para o perfil ativo", placeholder="ex.: João")
@@ -1362,7 +1442,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
 
         identity_extract_btn.click(
             fn=extract_identity_profile,
-            inputs=[identity_images, identity_folder],
+            inputs=[identity_images, identity_folder, identity_balance_by_origin],
             outputs=[
                 identity_status,
                 identity_gallery,
@@ -1385,7 +1465,10 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
 
         identity_search_btn.click(
             fn=find_profile_in_more_material,
-            inputs=[identity_profile_state, identity_selected_profile, identity_search_files, identity_search_folder],
+            inputs=[
+                identity_profile_state, identity_selected_profile, identity_search_files, identity_search_folder,
+                identity_balance_by_origin,
+            ],
             outputs=[
                 identity_status,
                 identity_gallery,
@@ -1416,7 +1499,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
 
         identity_merge_btn.click(
             fn=merge_selected_profiles,
-            inputs=[identity_profile_state, identity_merge_a, identity_merge_b],
+            inputs=[identity_profile_state, identity_merge_a, identity_merge_b, identity_balance_by_origin],
             outputs=[
                 identity_status,
                 identity_gallery,
@@ -1428,6 +1511,24 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             fn=_reset_profile_dropdown,
             inputs=[identity_profile_state],
             outputs=[identity_merge_b],
+        )
+
+        identity_anchor_image.change(
+            fn=apply_identity_anchor,
+            inputs=[
+                identity_profile_state, identity_selected_profile, identity_anchor_image,
+                identity_anchor_weight, identity_balance_by_origin,
+            ],
+            outputs=[identity_anchor_status, identity_profile_state],
+        )
+
+        identity_anchor_weight.release(
+            fn=apply_identity_anchor,
+            inputs=[
+                identity_profile_state, identity_selected_profile, identity_anchor_image,
+                identity_anchor_weight, identity_balance_by_origin,
+            ],
+            outputs=[identity_anchor_status, identity_profile_state],
         )
 
         identity_discard_btn.click(
