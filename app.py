@@ -1694,6 +1694,8 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
         
         video_input.change(fn=lambda _: 0.0, inputs=video_input, outputs=partial_reface_ratio_video)
 
+        video_input.change(fn=lambda _: refacer.clear_video_analysis_cache(), inputs=video_input, outputs=None)
+
         def handle_rotate_left(video_path):
             rotated = rotate_video(video_path, 'left')
             return gr.update(value=rotated)

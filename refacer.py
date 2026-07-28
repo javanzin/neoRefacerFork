@@ -189,6 +189,15 @@ class Refacer:
         # notebook well before an OOM would show up in this process, so budget
         # only a fraction of total RAM instead of an absolute constant.
         self.in_memory_analysis_max_mb = min(4000, (self.total_mem / (1024 * 1024)) * 0.25)
+
+        # Cache of analyze_video_in_memory()'s full result (frames + detections +
+        # embeddings), keyed by (video_hash, preview). Each click of "Run" is a
+        # separate app.py call — adding one more face job re-invokes
+        # analyze_video_in_memory() from scratch even though the target video
+        # hasn't changed, so without this the entire decode+detect+embed pass
+        # was silently repeated every time. Only one video is kept at a time.
+        self._analysis_cache_key = None
+        self._analysis_cache_result = None
     
     def _profile_start(self, name):
         """Start profiling a section."""
@@ -312,7 +321,20 @@ class Refacer:
         self.frame_cache = {}
         self.frame_cache_video_hash = None
         self.frame_cache_meta = None
-    
+
+    def clear_video_analysis_cache(self):
+        """Drop every in-RAM cache tied to a specific target video (light
+        detection cache, decoded-frame cache, analyze_video_in_memory result).
+        Call this when the user uploads/rotates the target video so the freed
+        RAM isn't held onto for a video no longer in use — a new video also
+        gets a different hash on its own, so this is a memory-hygiene cleanup,
+        not something a stale cache-hit depends on for correctness.
+        """
+        self._clear_light_cache()
+        self._clear_frame_cache()
+        self._analysis_cache_key = None
+        self._analysis_cache_result = None
+
     def __get_faces_with_light_cache(self, frame, video_hash, frame_idx, max_num=8):
         """Get faces with lightweight in-memory cache for detection only.
 
@@ -380,12 +402,20 @@ class Refacer:
 
         This is meant for the multi-job-same-video scenario driven by app.py
         (one job per configured face, same target video, same process): the
-        orchestrator calls this once and passes the result to reface() for
-        every job as a normal function argument, instead of stashing it on
-        `self` behind a hash-keyed cache with memory accounting. The data lives
-        only as long as the caller's local variable, so it is freed by the GC
-        as soon as all jobs for that video are done.
+        orchestrator calls this once per run() invocation and passes the
+        result to reface() for every job in that run as a normal function
+        argument. It is ALSO cached on self, keyed by (video_hash, preview):
+        clicking "Run" again for the same video (e.g. after adding one more
+        face) is a brand new run() call, and without this cache it would
+        silently redo the full decode+detect+embed pass from scratch every
+        time despite the target video being unchanged.
         """
+        video_hash = self._compute_video_hash(video_path)
+        cache_key = (video_hash, preview)
+        if self._analysis_cache_key == cache_key and self._analysis_cache_result is not None:
+            print(f"[IN-MEMORY ANALYSIS] Reusing cached analysis for this video ({len(self._analysis_cache_result['entries'])} frames), skipping decode+detect+embed")
+            return self._analysis_cache_result
+
         cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -450,12 +480,15 @@ class Refacer:
 
         cap.release()
 
-        return {
+        result = {
             "entries": entries,
             "fps": fps,
             "frame_width": frame_width,
             "frame_height": frame_height,
         }
+        self._analysis_cache_key = cache_key
+        self._analysis_cache_result = result
+        return result
 
     def reface_with_precomputed(self, video_path, faces, output_path, precomputed,
                                 preview=False, disable_similarity=False,
