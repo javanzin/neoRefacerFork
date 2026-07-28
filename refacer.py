@@ -675,16 +675,16 @@ class Refacer:
         shape = getattr(self, 'partial_blend_shape', 'rect')
 
         # Detector bboxes (InsightFace/RetinaFace) routinely end at/above the
-        # jawline, not at the physical chin — the oval mask's rectangle uses
-        # the bbox base as its chin approximation (no chin landmark in 5-pt
-        # kps), so a short bbox crops the frame before the real chin and the
-        # mask can never reach it, showing up as the same horizontal cutoff
-        # the oval shape was built to avoid. Extend y2 downward by a margin
-        # proportional to mouth width (the only local scale reference
-        # available) so the crop itself includes the chin. Only for "oval":
-        # "rect" sizes its cutoff off blend_height_ratio relative to the
-        # bbox on purpose.
-        if shape == 'oval' and face.kps is not None and len(face.kps) >= 5:
+        # jawline, not at the physical chin — the mouth-rect mask's rectangle
+        # uses the bbox base as its chin approximation (no chin landmark in
+        # 5-pt kps), so a short bbox crops the frame before the real chin and
+        # the mask can never reach it, showing up as the same horizontal
+        # cutoff the mouth-rect shape was built to avoid. Extend y2 downward
+        # by a margin proportional to mouth width (the only local scale
+        # reference available) so the crop itself includes the chin. Only
+        # for "mouth_rect": "rect" sizes its cutoff off blend_height_ratio
+        # relative to the bbox on purpose.
+        if shape == 'mouth_rect' and face.kps is not None and len(face.kps) >= 5:
             mouth_width = abs(float(face.kps[4][0]) - float(face.kps[3][0]))
             chin_margin = int(mouth_width * 0.4)
             y2 = min(y2 + chin_margin, h_frame)
@@ -694,8 +694,8 @@ class Refacer:
 
         swap_crop = swapped_frame[y1:y2, x1:x2].copy()
         orig_crop = original_frame[y1:y2, x1:x2].copy()
-        if shape == 'oval':
-            mask = self._mouth_chin_oval_mask(face, x1, y1, w, h)
+        if shape == 'mouth_rect':
+            mask = self._mouth_chin_rect_mask(face, x1, y1, w, h)
         else:
             mask = self._rect_cutoff_mask(w, h)
 
@@ -731,8 +731,8 @@ class Refacer:
 
         return mask
 
-    def _mouth_chin_oval_mask(self, face, crop_x1, crop_y1, w, h):
-        """Opt-in shape (partial_blend_shape="oval"): swap everywhere EXCEPT a
+    def _mouth_chin_rect_mask(self, face, crop_x1, crop_y1, w, h):
+        """Opt-in shape (partial_blend_shape="mouth_rect"): swap everywhere EXCEPT a
         horizontal band spanning upper-lip-to-chin, as wide as the mouth (plus
         margin) but NOT the full frame width. This is the fix for the plain
         rect cutoff's cheek fade: that shape draws its transition band across
@@ -1204,13 +1204,13 @@ class Refacer:
     def _should_partial_blend(self):
         """Whether _partial_face_blend should run at all.
 
-        The "oval" shape sizes itself from mouth keypoints, not from
+        The "mouth_rect" shape sizes itself from mouth keypoints, not from
         blend_height_ratio, so it must not be gated behind the "Reface Ratio"
         slider being > 0 — otherwise leaving that slider at its 0.0 default
-        (as it is unless the user drags it) silently disables the oval mask
-        checkbox too, making it look like a no-op.
+        (as it is unless the user drags it) silently disables the mouth-rect
+        mask checkbox too, making it look like a no-op.
         """
-        if getattr(self, 'partial_blend_shape', 'rect') == 'oval':
+        if getattr(self, 'partial_blend_shape', 'rect') == 'mouth_rect':
             return True
         return getattr(self, 'partial_reface_ratio', 0.0) > 0.0
 
@@ -1579,11 +1579,11 @@ class Refacer:
             disable_similarity: If True, disable face similarity matching
             multiple_faces_mode: If True, use multiple faces mode
             partial_reface_ratio: Ratio for partial face blending (0-0.5). Only used
-                when partial_blend_shape="rect"; ignored in "oval" mode, which sizes
-                itself from the mouth keypoints instead.
+                when partial_blend_shape="rect"; ignored in "mouth_rect" mode, which
+                sizes itself from the mouth keypoints instead.
             partial_blend_shape: "rect" (default, straight horizontal cutoff) or
-                "oval" (opt-in narrow ellipse from upper lip to chin, preserving
-                cheeks — see REVIEW_GERAL_VIDEO.md achado #discutido).
+                "mouth_rect" (opt-in narrow rectangle from upper lip to chin,
+                preserving cheeks — see REVIEW_GERAL_VIDEO.md achado #discutido).
             use_cache: If True, use cached target analysis for faster processing (disabled by default)
             precomputed: Optional dict from analyze_video_in_memory(), reused across
                 multiple faces/jobs for the same video within the same run. When

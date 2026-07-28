@@ -507,9 +507,9 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
     preview = vars[-5]
     face_mode = vars[-4]
     partial_reface_ratio = vars[-3]
-    oval_mask = vars[-2]
+    mouth_rect_mask = vars[-2]
     use_cache = vars[-1]
-    partial_blend_shape = "oval" if oval_mask else "rect"
+    partial_blend_shape = "mouth_rect" if mouth_rect_mask else "rect"
 
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
     multiple_faces_mode = (face_mode == "Multiple Faces")
@@ -1049,9 +1049,10 @@ def preview_identity_swap(test_image_file, profiles, selected_name):
             multiple_faces_mode=False,
         )
         # partial_reface_ratio/partial_blend_shape are instance state left
-        # over from any earlier video reface in this session (oval mask,
-        # reface ratio) — reset them so the preview shows a plain full-face
-        # swap, matching what the user is actually judging the profile against.
+        # over from any earlier video reface in this session (mouth-rect
+        # mask, reface ratio) — reset them so the preview shows a plain
+        # full-face swap, matching what the user is actually judging the
+        # profile against.
         refacer.partial_reface_ratio = 0.0
         refacer.partial_blend_shape = "rect"
         swapped = refacer.process_faces(frame.copy())
@@ -1566,7 +1567,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
                 label="Replacement Mode"
             )
             partial_reface_ratio_video = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
-            oval_mask_video = gr.Checkbox(label="Oval Mask (lip-to-chin, preserves cheeks)", value=False)
+            mouth_rect_mask_video = gr.Checkbox(label="Mouth Rect Mask (lip-to-chin, preserves cheeks)", value=False)
             video_btn = gr.Button("Reface Video", variant="primary")
             cancel_video_btn = gr.Button("⏹ Cancelar Tudo", variant="stop")
 
@@ -1746,7 +1747,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
 
         video_event = video_btn.click(
             fn=run_with_history_update,
-            inputs=[video_input] + origin_video + destination_video + thresholds_video + identity_profile_video + identity_profile_selection_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, oval_mask_video, use_cache_video],
+            inputs=[video_input] + origin_video + destination_video + thresholds_video + identity_profile_video + identity_profile_selection_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, mouth_rect_mask_video, use_cache_video],
             outputs=[video_output, gr.File(visible=False), history_display]
         )
 
