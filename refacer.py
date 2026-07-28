@@ -639,13 +639,28 @@ class Refacer:
             print(f"Invalid bbox: {x1},{y1},{x2},{y2}")
             return swapped_frame
 
+        shape = getattr(self, 'partial_blend_shape', 'rect')
+
+        # Detector bboxes (InsightFace/RetinaFace) routinely end at/above the
+        # jawline, not at the physical chin — the oval mask's rectangle uses
+        # the bbox base as its chin approximation (no chin landmark in 5-pt
+        # kps), so a short bbox crops the frame before the real chin and the
+        # mask can never reach it, showing up as the same horizontal cutoff
+        # the oval shape was built to avoid. Extend y2 downward by a margin
+        # proportional to mouth width (the only local scale reference
+        # available) so the crop itself includes the chin. Only for "oval":
+        # "rect" sizes its cutoff off blend_height_ratio relative to the
+        # bbox on purpose.
+        if shape == 'oval' and face.kps is not None and len(face.kps) >= 5:
+            mouth_width = abs(float(face.kps[4][0]) - float(face.kps[3][0]))
+            chin_margin = int(mouth_width * 0.4)
+            y2 = min(y2 + chin_margin, h_frame)
+
         w = x2 - x1
         h = y2 - y1
 
         swap_crop = swapped_frame[y1:y2, x1:x2].copy()
         orig_crop = original_frame[y1:y2, x1:x2].copy()
-
-        shape = getattr(self, 'partial_blend_shape', 'rect')
         if shape == 'oval':
             mask = self._mouth_chin_oval_mask(face, x1, y1, w, h)
         else:
