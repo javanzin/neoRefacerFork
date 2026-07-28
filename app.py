@@ -660,8 +660,11 @@ def rotate_video(video_path, direction):
 # --- Identity Profile (multi-image / multi-video, single person) ---
 from identity_profile import (
     IdentityProfileBuilder,
+    candidate_as_imported_profile,
     export_profile,
     import_profile,
+    imported_profile_known_hashes,
+    merge_imported_profile,
     merge_profiles,
     _build_profile_from_samples,
     ANCHOR_MAX_WEIGHT,
@@ -686,7 +689,7 @@ def _hash_file(path, chunk_size=1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
 
-def _dedupe_files_by_content(files, discarded=None):
+def _dedupe_files_by_content(files, discarded=None, origin_hashes=None):
     """Filtra `files` (lista de valores gr.File já resolvidos por
     _resolve_history_path) removendo entradas cujo CONTEÚDO já apareceu antes
     na mesma lista — o mesmo arquivo enviado duas vezes (ex. avulso + dentro
@@ -698,6 +701,16 @@ def _dedupe_files_by_content(files, discarded=None):
     discarded (opcional): lista (estilo IdentityProfileBuilder.discarded)
     onde cada duplicata descartada é registrada, para não desaparecer
     silenciosamente do status de extração.
+
+    origin_hashes (opcional): dict basename -> hash de conteúdo, preenchido
+    com o hash de cada arquivo mantido (não duplicado) — este é o único
+    ponto do pipeline onde o arquivo original ainda está acessível em disco
+    (upload temporário do Gradio), então é aqui que o hash precisa ser
+    capturado para viajar com o profile (ver export_selected_profile) em vez
+    de ser descartado junto com esta função — a app não tem banco, então o
+    hash só sobrevive se for guardado em memória (profile["origin_hashes"],
+    dentro do mesmo gr.State que já guarda o profile inteiro na sessão), não
+    por ser recalculável depois (o path do upload é efêmero).
     """
     seen_hashes = set()
     unique_files = []
@@ -718,6 +731,8 @@ def _dedupe_files_by_content(files, discarded=None):
 
         seen_hashes.add(file_hash)
         unique_files.append(f)
+        if origin_hashes is not None:
+            origin_hashes[os.path.basename(path)] = file_hash
     return unique_files
 
 _PROGRESS_UPDATE_STRIDE = 50
@@ -797,7 +812,8 @@ def extract_identity_profile(source_files, folder_files, balance_by_origin=False
         return "Nenhum arquivo enviado.", [], empty_dropdown, empty_dropdown, empty_dropdown, []
 
     builder = IdentityProfileBuilder.from_refacer(refacer)
-    all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded)
+    origin_hashes = {}
+    all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded, origin_hashes=origin_hashes)
     _populate_builder_from_files(builder, all_files, progress=progress)
 
     if not builder.samples:
@@ -805,6 +821,12 @@ def extract_identity_profile(source_files, folder_files, balance_by_origin=False
         raise gr.Error(f"Nenhuma amostra de rosto válida foi extraída. Descartes: {reasons}")
 
     profiles = builder.build_profiles(balance_by_origin=balance_by_origin)
+    for profile in profiles:
+        # Cópia própria por perfil — o dict origin_hashes é reconstruído a
+        # cada extração e nada hoje muta profile["origin_hashes"] in-place,
+        # mas compartilhar o MESMO objeto entre N perfis é uma armadilha para
+        # qualquer mutação futura (uma escrita num perfil vazaria para todos).
+        profile["origin_hashes"] = dict(origin_hashes)
     status = _format_extraction_status(profiles)
     choices = [profile["name"] for profile in profiles]
 
@@ -892,6 +914,7 @@ def merge_selected_profiles(profiles, name_a, name_b, balance_by_origin=False):
         merged = merge_profiles(profile_a, profile_b, name=profile_a["name"], balance_by_origin=balance_by_origin)
     except ValueError as e:
         raise gr.Error(str(e))
+    merged["origin_hashes"] = {**profile_a.get("origin_hashes", {}), **profile_b.get("origin_hashes", {})}
     remaining = [p for p in profiles if p["name"] not in (name_a, name_b)]
     new_profiles = remaining + [merged]
 
@@ -943,7 +966,7 @@ def export_selected_profile(profiles, selected_name):
         "./tmp",
         f"identity_profile_{selected_name.replace(' ', '_')}_{int(time.time() * 1000)}.npz",
     )
-    export_profile(profile, export_path)
+    export_profile(profile, export_path, content_hashes=profile.get("origin_hashes"))
     return gr.update(value=export_path, visible=True)
 
 def find_profile_in_more_material(profiles, selected_name, source_files, folder_files, balance_by_origin=False, progress=gr.Progress()):
@@ -965,7 +988,8 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
         raise gr.Error("Nenhum arquivo enviado para buscar.")
 
     builder = IdentityProfileBuilder.from_refacer(refacer)
-    all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded)
+    new_origin_hashes = {}
+    all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded, origin_hashes=new_origin_hashes)
     target_face = profile["face"]
 
     total = len(all_files)
@@ -1001,6 +1025,7 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
         combined_samples, name=profile["name"], discarded=profile["discarded"] + builder.discarded,
         balance_by_origin=balance_by_origin,
     )
+    updated_profile["origin_hashes"] = {**profile.get("origin_hashes", {}), **new_origin_hashes}
     new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
 
     n_new = len(new_matches)
@@ -1018,6 +1043,194 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
         gr.update(choices=choices, value=None),
         new_profiles,
     )
+
+def import_identity_profile_file(npz_file):
+    """Carrega um perfil .npz já exportado (v1 ou v2) para dentro da sessão
+    atual, guardando-o num gr.State próprio (identity_imported_profile_state)
+    — separado de identity_profile_state, que guarda perfis com "samples"
+    (extraídos/mesclados nesta sessão). Um perfil importado nunca tem
+    "samples" (só o(s) centroide(s), por design — ver import_profile), então
+    misturá-lo na mesma lista quebraria merge_profiles/apply_anchor_to_profile,
+    que assumem "samples" presente.
+
+    Perfil v1 (sem "origins") é carregado normalmente e pode ser visto/testado,
+    mas não pode continuar incrementalmente (ver continue_imported_profile) —
+    só reextração completa serve para ele (ver PLANO_IDENTITY_EVOLUTIVO.md,
+    seção 5).
+    """
+    path = _resolve_history_path(npz_file)
+    if not path or not os.path.exists(path):
+        return "Nenhum arquivo de perfil enviado.", None
+
+    try:
+        profile = import_profile(path)
+    except ValueError as e:
+        raise gr.Error(str(e))
+
+    has_origins = "origins" in profile
+    n_origins = len(profile.get("origins", []))
+    status = (
+        f'Perfil "{profile["name"]}" importado ({profile["n_samples"]} amostra{_pluralize_count(profile["n_samples"])} '
+        f'ao todo, formato v{profile.get("profile_format_version", 1)}).'
+    )
+    if has_origins:
+        origin_word = "origem" if n_origins == 1 else "origens"
+        status += (
+            f" Suporta continuação incremental ({n_origins} {origin_word} conhecida(s)) "
+            "— envie mídia nova abaixo."
+        )
+    else:
+        status += (
+            " Formato antigo, sem dados por origem: não é possível continuar incrementalmente "
+            "(reextraia do zero com o material completo se quiser adicionar mídia nova)."
+        )
+    return status, profile
+
+
+def continue_imported_profile(imported_profile, candidate_profile, source_files, folder_files, progress=gr.Progress()):
+    """Continua um perfil IMPORTADO (v2) com mídia nova, gerando uma
+    candidata sem reprocessar o material original — ver
+    identity_profile.merge_imported_profile e PLANO_IDENTITY_EVOLUTIVO.md,
+    seção 4 (fluxo de atualização incremental).
+
+    Passos (mesma ordem do plano):
+    1. Dedup: arquivo cujo hash já é conhecido na base (v_N importada, ou a
+       candidata já gerada nesta sessão — ver abaixo) é ignorado.
+    2. Validação de identidade: só rostos que baterem com o perfil-alvo
+       (find_match_in_frame/find_matches_in_video, reuso direto — mesmo
+       mecanismo de "Buscar esta pessoa em outro material") entram como
+       amostra nova; o restante do frame é descartado sem virar amostra.
+    3. Candidata gerada via merge_imported_profile, retornada para
+       comparação (preview_identity_swap) antes de confirmar/descartar — não
+       sobrescreve o perfil importado original.
+
+    candidate_profile (opcional): se já existe uma candidata gerada nesta
+    sessão (usuário clicou "Gerar Candidata" antes e ainda não confirmou/
+    descartou), ela é usada como BASE em vez de imported_profile — sem isso,
+    cada clique reiniciaria a partir da v_N original e o material das
+    rodadas anteriores ainda não confirmadas desapareceria silenciosamente.
+    A candidata é convertida de volta a uma estrutura com "origins" (via
+    candidate_as_imported_profile) antes de continuar.
+    """
+    if imported_profile is None:
+        raise gr.Error("Importe um perfil .npz primeiro.")
+
+    base_profile = candidate_as_imported_profile(candidate_profile) if candidate_profile is not None else imported_profile
+    if "origins" not in base_profile:
+        raise gr.Error(
+            "Este perfil foi exportado no formato antigo (sem dados por origem) e não pode "
+            "ser continuado incrementalmente. Reextraia do zero com o material completo."
+        )
+
+    all_files = list(source_files or []) + list(folder_files or [])
+    if not all_files:
+        raise gr.Error("Nenhum arquivo enviado.")
+
+    builder = IdentityProfileBuilder.from_refacer(refacer)
+    known_hashes = imported_profile_known_hashes(base_profile)
+    new_origin_hashes = {}
+    all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded, origin_hashes=new_origin_hashes)
+
+    # Dedup contra a base (v_N ou candidata em progresso): arquivo cujo
+    # conteúdo já é uma origem conhecida é ignorado ANTES de reprocessar
+    # (mesmo espírito de _dedupe_files_by_content, mas comparando contra
+    # origens de uma versão anterior já exportada/gerada, não contra outros
+    # arquivos desta mesma leva).
+    files_to_process = []
+    for f in all_files:
+        path = _resolve_history_path(f)
+        if not path or not os.path.exists(path):
+            files_to_process.append(f)
+            continue
+        label = os.path.basename(path)
+        file_hash = new_origin_hashes.get(label)
+        if file_hash and file_hash in known_hashes:
+            builder.discarded.append({
+                "source": label,
+                "reason": "já presente no perfil base (mesmo conteúdo), ignorado",
+            })
+            continue
+        files_to_process.append(f)
+
+    if not files_to_process:
+        reasons = "; ".join(f"{d['source']}: {d['reason']}" for d in builder.discarded) or "motivo desconhecido"
+        raise gr.Error(f"Nenhum arquivo novo para processar. Descartes: {reasons}")
+
+    target_face = base_profile["face"]
+    total = len(files_to_process)
+    new_matches = []
+    for i, f in enumerate(files_to_process):
+        path = _resolve_history_path(f)
+        if not path or not os.path.exists(path):
+            continue
+
+        label = os.path.basename(path)
+        if i % _PROGRESS_UPDATE_STRIDE == 0 or i == total - 1:
+            progress(i / total, desc=f"Buscando em {label} ({i + 1}/{total})")
+
+        ext = os.path.splitext(path)[1].lower()
+        if ext in _IDENTITY_VIDEO_EXTENSIONS:
+            new_matches.extend(builder.find_matches_in_video(path, label, target_face))
+        elif ext in _IDENTITY_IMAGE_EXTENSIONS:
+            frame = cv2.imread(path)
+            if frame is None:
+                builder.discarded.append({"source": label, "reason": "imagem inválida"})
+                continue
+            new_matches.extend(builder.find_match_in_frame(frame, label, target_face))
+        else:
+            builder.discarded.append({"source": label, "reason": f"tipo de arquivo não suportado ({ext or 'sem extensão'})"})
+    progress(1.0, desc="Gerando candidata...")
+
+    if not new_matches:
+        reasons = "; ".join(f"{d['source']}: {d['reason']}" for d in builder.discarded) or "motivo desconhecido"
+        raise gr.Error(
+            f'Nenhuma correspondência com "{base_profile["name"]}" encontrada no material novo. '
+            f"Descartes: {reasons}"
+        )
+
+    candidate = merge_imported_profile(base_profile, new_matches, new_discarded=builder.discarded)
+    candidate["origin_hashes"] = {**(candidate_profile.get("origin_hashes", {}) if candidate_profile else {}), **new_origin_hashes}
+
+    n_new = len(new_matches)
+    n_legacy = len(candidate["legacy_origins"])
+    status = (
+        f"Candidata gerada: {n_new} nova{_pluralize_count(n_new, plural_suffix='s')} "
+        f"amostra{_pluralize_count(n_new)} incorporada{_pluralize_count(n_new)} "
+        f"({candidate['n_samples']} amostra{_pluralize_count(candidate['n_samples'])} no total, "
+        f"{n_legacy} {'origem' if n_legacy == 1 else 'origens'} legada(s) preservada(s)). "
+        "Compare com o perfil original antes de confirmar/exportar."
+    )
+    return status, candidate
+
+
+def _swap_face_on_frame(face):
+    """Núcleo compartilhado de preview_identity_swap/preview_candidate_vs_imported:
+    aplica um Face (de um profile["face"]) a um frame já decodificado,
+    isolado do resto do pipeline (reset de partial_reface_ratio/
+    partial_blend_shape, ver docstring original abaixo).
+    """
+    def _run(frame_bgr):
+        # refacer is a single global instance also used by the video/image
+        # reface pipeline (run()/run_image()) — hold swap_lock for the whole
+        # prepare_faces+process_faces span so a concurrent video reface from
+        # another tab can't mutate self.replacement_faces mid-preview.
+        with refacer.swap_lock:
+            refacer.prepare_faces(
+                [{"identity_profile": face, "threshold": 0.0}],
+                disable_similarity=True,
+                multiple_faces_mode=False,
+            )
+            # partial_reface_ratio/partial_blend_shape are instance state left
+            # over from any earlier video reface in this session (mouth-rect
+            # mask, reface ratio) — reset them so the preview shows a plain
+            # full-face swap, matching what the user is actually judging the
+            # profile against.
+            refacer.partial_reface_ratio = 0.0
+            refacer.partial_blend_shape = "rect"
+            swapped = refacer.process_faces(frame_bgr.copy())
+        return cv2.cvtColor(swapped, cv2.COLOR_BGR2RGB)
+    return _run
+
 
 def preview_identity_swap(test_image_file, profiles, selected_name):
     """Applies the selected in-session identity profile to a separate test
@@ -1038,25 +1251,47 @@ def preview_identity_swap(test_image_file, profiles, selected_name):
     if frame is None:
         raise gr.Error("Não foi possível ler a imagem de teste.")
 
-    # refacer is a single global instance also used by the video/image reface
-    # pipeline (run()/run_image()) — hold swap_lock for the whole
-    # prepare_faces+process_faces span so a concurrent video reface from
-    # another tab can't mutate self.replacement_faces mid-preview.
-    with refacer.swap_lock:
-        refacer.prepare_faces(
-            [{"identity_profile": profile["face"], "threshold": 0.0}],
-            disable_similarity=True,
-            multiple_faces_mode=False,
-        )
-        # partial_reface_ratio/partial_blend_shape are instance state left
-        # over from any earlier video reface in this session (mouth-rect
-        # mask, reface ratio) — reset them so the preview shows a plain
-        # full-face swap, matching what the user is actually judging the
-        # profile against.
-        refacer.partial_reface_ratio = 0.0
-        refacer.partial_blend_shape = "rect"
-        swapped = refacer.process_faces(frame.copy())
-    return cv2.cvtColor(swapped, cv2.COLOR_BGR2RGB)
+    return _swap_face_on_frame(profile["face"])(frame)
+
+
+def preview_candidate_vs_imported(test_image_file, imported_profile, candidate_profile):
+    """Compara visualmente o perfil importado (v_N) com a candidata gerada
+    por continue_imported_profile (v_N+1) no mesmo destino de teste — passo
+    8 do fluxo de atualização incremental (PLANO_IDENTITY_EVOLUTIVO.md),
+    antes de decidir confirmar (exportar a candidata) ou descartar (manter
+    só a v_N já exportada).
+    """
+    if imported_profile is None:
+        raise gr.Error("Importe um perfil .npz primeiro.")
+    if candidate_profile is None:
+        raise gr.Error("Gere uma candidata primeiro (adicione mídia nova acima).")
+
+    path = _resolve_history_path(test_image_file)
+    if not path or not os.path.exists(path):
+        raise gr.Error("Envie uma imagem de teste (o rosto que será substituído pelo perfil).")
+
+    frame = cv2.imread(path)
+    if frame is None:
+        raise gr.Error("Não foi possível ler a imagem de teste.")
+
+    swap = _swap_face_on_frame
+    return swap(imported_profile["face"])(frame), swap(candidate_profile["face"])(frame)
+
+
+def confirm_candidate_profile(candidate_profile):
+    """Confirma a candidata: exporta como novo .npz (v_N+1), sem sobrescrever
+    o arquivo v_N original — "confirmar" aqui é só "gerar o próximo arquivo
+    para baixar", nunca há estado servidor para promover (ver item 9 do
+    fluxo no plano)."""
+    if candidate_profile is None:
+        raise gr.Error("Nenhuma candidata para confirmar. Adicione mídia nova a um perfil importado primeiro.")
+
+    export_path = os.path.join(
+        "./tmp",
+        f"identity_profile_{candidate_profile['name'].replace(' ', '_')}_{int(time.time() * 1000)}.npz",
+    )
+    export_profile(candidate_profile, export_path, content_hashes=candidate_profile.get("origin_hashes"))
+    return gr.update(value=export_path, visible=True)
 
 def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_weight, balance_by_origin=False):
     """Aplica (ou remove, se anchor_image_file estiver vazio) uma foto âncora
@@ -1074,6 +1309,7 @@ def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_wei
         # Nenhuma imagem enviada: remove a âncora, se houver, restaurando o
         # centroide base (balanceado ou não, conforme o checkbox).
         updated_profile = apply_anchor_to_profile(profile, anchor_sample=None, balance_by_origin=balance_by_origin)
+        updated_profile["origin_hashes"] = profile.get("origin_hashes", {})
         new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
         return "Âncora removida. Perfil restaurado ao centroide base.", new_profiles
 
@@ -1089,6 +1325,7 @@ def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_wei
     updated_profile = apply_anchor_to_profile(
         profile, anchor_sample=anchor_sample, anchor_weight=anchor_weight, balance_by_origin=balance_by_origin,
     )
+    updated_profile["origin_hashes"] = profile.get("origin_hashes", {})
     new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
     status = f"Âncora ativa ({os.path.basename(path)}), influência {anchor_weight:.0%} (teto {ANCHOR_MAX_WEIGHT:.0%})."
     return status, new_profiles
@@ -1425,20 +1662,69 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             identity_test_output = gr.Image(label="Resultado do swap com o perfil", interactive=False)
         identity_test_btn = gr.Button("Testar Perfil Selecionado", variant="secondary")
 
+        with gr.Accordion("Continuar um perfil já exportado (versionamento incremental)", open=False):
+            gr.Markdown(
+                "Já tem um perfil `.npz` de uma sessão anterior e só quer adicionar mídia nova, "
+                "sem reenviar tudo de novo? Importe o arquivo, envie só o material adicional, "
+                "compare a candidata com o perfil original e decida se confirma (baixa um novo "
+                "`.npz`) ou descarta. Só funciona com perfis exportados no formato novo "
+                "(v2) — perfis antigos (sem dados por origem) precisam ser reextraídos do zero "
+                "com o material completo."
+            )
+            identity_import_file = gr.File(label="Perfil .npz para continuar", file_types=[".npz"], interactive=False)
+            identity_import_status = gr.Textbox(label="", interactive=False, show_label=False)
+            identity_imported_profile_state = gr.State(None)
+            identity_candidate_profile_state = gr.State(None)
+
+            with gr.Row():
+                identity_continue_files = gr.File(
+                    label="Mídia nova (múltiplos arquivos)",
+                    file_count="multiple",
+                    file_types=sorted(_IDENTITY_IMAGE_EXTENSIONS | _IDENTITY_VIDEO_EXTENSIONS),
+                    interactive=False,
+                )
+                identity_continue_folder = gr.File(
+                    label="Ou arraste uma pasta inteira (inclui subpastas)",
+                    file_count="directory",
+                    interactive=False,
+                )
+            identity_continue_btn = gr.Button("Gerar Candidata com Mídia Nova", variant="secondary", interactive=False)
+            identity_continue_status = gr.Textbox(label="", interactive=False, show_label=False)
+
+            gr.Markdown(
+                "**Compare antes de decidir**: mesma foto de teste (outro rosto, não o do perfil) "
+                "aplicada com o perfil original e com a candidata, lado a lado."
+            )
+            identity_candidate_test_image = gr.Image(label="Imagem de teste (outro rosto)", type="filepath")
+            with gr.Row():
+                identity_candidate_output_original = gr.Image(label="Resultado com o perfil ORIGINAL (v_N)", interactive=False)
+                identity_candidate_output_candidate = gr.Image(label="Resultado com a CANDIDATA (v_N+1)", interactive=False)
+            identity_candidate_compare_btn = gr.Button("Comparar Original vs. Candidata", variant="secondary")
+
+            with gr.Row():
+                identity_candidate_confirm_btn = gr.Button("✅ Confirmar Candidata (Baixar novo .npz)", variant="primary")
+                identity_candidate_discard_btn = gr.Button("Descartar Candidata", variant="secondary")
+            identity_candidate_export_file = gr.File(label="Novo perfil de identidade (.npz)", visible=False, interactive=False)
+
         identity_cleanup_btn = gr.Button("🗑️ Apagar arquivos temporários de identidade", variant="secondary")
         identity_cleanup_status = gr.Textbox(label="", interactive=False, show_label=False)
 
+        _identity_consent_gated_components = [
+            identity_images,
+            identity_folder,
+            identity_extract_btn,
+            identity_search_files,
+            identity_search_folder,
+            identity_search_btn,
+            identity_import_file,
+            identity_continue_files,
+            identity_continue_folder,
+            identity_continue_btn,
+        ]
         identity_consent.change(
-            fn=lambda consent: tuple(gr.update(interactive=consent) for _ in range(6)),
+            fn=lambda consent: tuple(gr.update(interactive=consent) for _ in _identity_consent_gated_components),
             inputs=[identity_consent],
-            outputs=[
-                identity_images,
-                identity_folder,
-                identity_extract_btn,
-                identity_search_files,
-                identity_search_folder,
-                identity_search_btn,
-            ],
+            outputs=_identity_consent_gated_components,
         )
 
         identity_extract_btn.click(
@@ -1484,6 +1770,51 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             fn=preview_identity_swap,
             inputs=[identity_test_image, identity_profile_state, identity_selected_profile],
             outputs=[identity_test_output],
+        )
+
+        identity_import_file.change(
+            fn=import_identity_profile_file,
+            inputs=[identity_import_file],
+            outputs=[identity_import_status, identity_imported_profile_state],
+        )
+
+        identity_continue_btn.click(
+            fn=continue_imported_profile,
+            inputs=[
+                identity_imported_profile_state, identity_candidate_profile_state,
+                identity_continue_files, identity_continue_folder,
+            ],
+            outputs=[identity_continue_status, identity_candidate_profile_state],
+        )
+
+        identity_candidate_compare_btn.click(
+            fn=preview_candidate_vs_imported,
+            inputs=[identity_candidate_test_image, identity_imported_profile_state, identity_candidate_profile_state],
+            outputs=[identity_candidate_output_original, identity_candidate_output_candidate],
+        )
+
+        identity_candidate_confirm_btn.click(
+            fn=confirm_candidate_profile,
+            inputs=[identity_candidate_profile_state],
+            outputs=[identity_candidate_export_file],
+        )
+
+        identity_candidate_discard_btn.click(
+            fn=lambda: (
+                None,
+                "Candidata descartada. O perfil original (v_N) segue intacto para baixar/continuar.",
+                gr.update(value=None, visible=False),
+                None,
+                None,
+            ),
+            inputs=None,
+            outputs=[
+                identity_candidate_profile_state,
+                identity_continue_status,
+                identity_candidate_export_file,
+                identity_candidate_output_original,
+                identity_candidate_output_candidate,
+            ],
         )
 
         identity_rename_btn.click(

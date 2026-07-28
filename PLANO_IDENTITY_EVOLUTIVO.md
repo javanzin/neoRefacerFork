@@ -1,7 +1,6 @@
 # Plano Técnico — Identity Evolutivo (versionamento incremental de perfis)
 
-Status: **planejamento apenas — nenhum código foi alterado**.
-Escopo: evolução futura, **não implementada nesta sessão**. Depende do balanceamento por origem opcional (`balance_by_origin`, já implementado em `identity_profile.py`) como pré-requisito estrutural.
+Status: **implementado** (formato v2, fluxo de continuação incremental e UI de import/continuar/comparar/confirmar). Passou por code review adversarial (achou e corrigiu uma RCE via `allow_pickle=True`, viés de peso em `merge_imported_profile`, gate de consentimento, acumulação de candidata entre rodadas — ver histórico do módulo). Ainda **não validado em ambiente real** (Colab/Lightning.ai com dependências completas) — validado até aqui só via testes unitários de `identity_profile.py`.
 **Requisito não negociável**: perfis `.npz` já exportados no formato atual devem continuar funcionando exatamente como hoje no Video Mode (upload direto no Face-slot, import via `import_profile`, swap via `prepare_faces`/`INSwapper`) — o novo formato é aditivo, nunca substitui nem invalida o antigo. Ver seção 5.
 Projeto: NeoRefacer (app de estudos pessoal, sem relação com os repositórios CETESB/GPLA da configuração global).
 

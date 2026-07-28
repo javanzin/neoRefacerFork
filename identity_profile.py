@@ -47,6 +47,16 @@ NEAR_DUPLICATE_MEAN_DIFF_THRESHOLD = 2.0
 # produz saída anormal (confirmado na documentação oficial do insightface).
 EMBEDDING_MODEL_ID = "buffalo_l/w600k_r50"
 
+# Versão do formato de exportação do .npz. v1 (implícito, sem esta chave):
+# só o centroide final, sem dados por origem — perfis exportados antes desta
+# versão continuam sendo lidos normalmente por import_profile (ver seção 5 de
+# PLANO_IDENTITY_EVOLUTIVO.md, "requisito não negociável" de retrocompatibilidade).
+# v2: adiciona centroides por origem + hash de conteúdo + contagem por origem,
+# permitindo importar um perfil já exportado e continuar a extração
+# incrementalmente (ver merge_imported_profile) sem reprocessar o material
+# original do zero.
+PROFILE_FORMAT_VERSION = 2
+
 MIN_DET_SCORE = 0.5
 MIN_FACE_AREA_RATIO = 0.01  # bbox precisa cobrir ao menos 1% da área do frame
 MIN_SHARPNESS = 60.0  # variância do Laplaciano no crop alinhado
@@ -226,6 +236,34 @@ def _origin_centroids_as_pseudo_samples(samples):
     """
     groups = _group_samples_by_origin(samples)
     return [{"embedding": _simple_mean_centroid(group_samples)} for group_samples in groups.values()]
+
+
+def _origin_summaries(samples, content_hashes=None):
+    """Um resumo por origem distinta — nome, centroide simples (mesmo cálculo
+    de _origin_centroids_as_pseudo_samples) e contagem de amostras — usado
+    para persistir centroides por origem no formato de exportação v2 (ver
+    export_profile/PROFILE_FORMAT_VERSION).
+
+    content_hashes (opcional): dict origin -> hash de conteúdo (SHA-256 do
+    arquivo original, calculado por quem chama — este módulo não lê arquivos
+    do disco por conta própria, ver docstring do módulo). Origem sem hash
+    conhecido (ex. perfil originado de merge/âncora, sem arquivo de origem
+    direto) grava string vazia.
+
+    Retorna list[dict] com "origin", "centroid", "n_samples", "content_hash",
+    na ordem de primeira aparição (mesma ordem de _group_samples_by_origin).
+    """
+    content_hashes = content_hashes or {}
+    groups = _group_samples_by_origin(samples)
+    return [
+        {
+            "origin": origin,
+            "centroid": _simple_mean_centroid(group_samples),
+            "n_samples": len(group_samples),
+            "content_hash": content_hashes.get(origin, ""),
+        }
+        for origin, group_samples in groups.items()
+    ]
 
 
 def _compute_balanced_centroid(samples):
@@ -792,11 +830,33 @@ def apply_anchor_to_profile(profile, anchor_sample=None, anchor_weight=ANCHOR_MA
     )
 
 
-def export_profile(profile, output_path):
-    """Grava o perfil em .npz — apenas o centroide final, nunca as amostras individuais."""
+def export_profile(profile, output_path, content_hashes=None):
+    """Grava o perfil em .npz.
+
+    Sempre grava o centroide final (compatível com o formato v1 lido por
+    versões antigas do import_profile e por qualquer consumidor externo que
+    só olhe embedding/bbox/kps/det_score/name/n_samples — nenhum campo do
+    formato v1 foi removido ou renomeado).
+
+    Quando profile["samples"] está disponível (perfil extraído/mesclado na
+    sessão atual — perfis vindos de um import_profile não o têm, ver
+    merge_profiles), grava ADICIONALMENTE um centroide por origem (nome,
+    centroide, n_samples, hash de conteúdo) sob profile_format_version=2 —
+    isso é o que permite reimportar o perfil depois e continuar a extração
+    incrementalmente (ver merge_imported_profile) sem reprocessar o material
+    original. Sem "samples" (perfil já importado sendo reexportado sem
+    modificação, ex. só renomeado), grava apenas o formato v1: não há como
+    reconstruir centroides por origem sem as amostras, e forçar
+    profile_format_version=2 sem dados por origem quebraria a suposição de
+    merge_imported_profile de que v2 sempre tem ao menos uma origem.
+
+    content_hashes (opcional): dict origin -> hash de conteúdo (SHA-256 do
+    arquivo original — calculado por quem chama, tipicamente app.py reusando
+    o mesmo hash já calculado para deduplicação). Origem sem hash conhecido
+    grava string vazia (ver _origin_summaries).
+    """
     face = profile["face"]
-    np.savez(
-        output_path,
+    fields = dict(
         embedding=face.embedding.astype(np.float32),
         bbox=np.asarray(face.bbox, dtype=np.float32),
         kps=np.asarray(face.kps, dtype=np.float32) if face.kps is not None else np.zeros((5, 2), dtype=np.float32),
@@ -806,6 +866,30 @@ def export_profile(profile, output_path):
         embedding_model=EMBEDDING_MODEL_ID,
         created_at=np.int64(int(time.time())),
     )
+
+    samples = profile.get("samples")
+    origin_summaries = None
+    if "legacy_origins" in profile:
+        origin_summaries = _combined_origin_summaries(profile, content_hashes=content_hashes)
+    elif samples:
+        origin_summaries = _origin_summaries(samples, content_hashes=content_hashes)
+
+    if origin_summaries:
+        # dtype=str (não object): arrays de string de comprimento variável
+        # fazem roundtrip completo em .npz com dtype unicode nativo — dtype=object
+        # gravaria via pickle, o que forçaria import_profile a usar
+        # allow_pickle=True e abriria execução de código arbitrário ao importar
+        # um .npz malicioso (allow_pickle é uma flag global do arquivo inteiro,
+        # não por chave — qualquer array object no arquivo seria despicklado).
+        fields.update(
+            profile_format_version=np.int32(PROFILE_FORMAT_VERSION),
+            origin_names=np.asarray([s["origin"] for s in origin_summaries], dtype=str),
+            origin_centroids=np.stack([s["centroid"].astype(np.float32) for s in origin_summaries]),
+            origin_n_samples=np.asarray([s["n_samples"] for s in origin_summaries], dtype=np.int32),
+            origin_content_hashes=np.asarray([s["content_hash"] for s in origin_summaries], dtype=str),
+        )
+
+    np.savez(output_path, **fields)
     return output_path
 
 
@@ -814,16 +898,31 @@ def import_profile(npz_path):
 
     Levanta ValueError (não silencioso) se o arquivo não for um perfil válido
     ou tiver sido gerado por um modelo de embedding diferente.
+
+    Perfis no formato v1 (sem profile_format_version, exportados antes desta
+    versão) continuam sendo lidos exatamente como antes — o retorno não tem
+    "origins" nesse caso. Perfis v2 ganham a chave adicional "origins"
+    (list[dict] com origin/centroid/n_samples/content_hash), consumida por
+    merge_imported_profile para continuar a extração incrementalmente.
     """
     try:
         data = np.load(npz_path, allow_pickle=False)
     except Exception as exc:
         raise ValueError(f"Arquivo de perfil inválido ou corrompido: {exc}") from exc
 
-    required_keys = {"embedding", "bbox", "kps", "det_score", "name", "embedding_model"}
+    required_keys = {"embedding", "bbox", "kps", "det_score", "name", "n_samples", "embedding_model"}
     if not required_keys.issubset(data.files):
         raise ValueError("Arquivo não contém os campos esperados de um perfil de identidade.")
 
+    # allow_pickle=False só rejeita um array dtype=object quando a chave é
+    # efetivamente ACESSADA (np.load acima não falha ao abrir o arquivo,
+    # mesmo com arrays object presentes e não lidos) — por isso todo acesso
+    # aos campos abaixo fica dentro deste try, não só a abertura do arquivo,
+    # garantindo que um .npz malicioso sempre produza o ValueError "inválido
+    # ou corrompido" tratado, nunca deixe a exceção nativa do numpy escapar
+    # sem esse contexto. embedding_model é lido antes deste bloco porque sua
+    # incompatibilidade é um erro de NEGÓCIO com mensagem própria, não um
+    # arquivo corrompido — não deve ser reclassificado como "corrompido".
     embedding_model = str(data["embedding_model"])
     if embedding_model != EMBEDDING_MODEL_ID:
         raise ValueError(
@@ -832,15 +931,211 @@ def import_profile(npz_path):
             "Misturar espaços vetoriais diferentes produz swaps incorretos."
         )
 
-    face = Face(
-        bbox=data["bbox"],
-        kps=data["kps"],
-        det_score=float(data["det_score"]),
+    try:
+        face = Face(
+            bbox=data["bbox"],
+            kps=data["kps"],
+            det_score=float(data["det_score"]),
+        )
+        face.embedding = data["embedding"].astype(np.float32)
+
+        profile = {
+            "name": str(data["name"]),
+            "face": face,
+            "n_samples": int(data["n_samples"]),
+        }
+
+        origin_keys = {"profile_format_version", "origin_names", "origin_centroids", "origin_n_samples", "origin_content_hashes"}
+        if origin_keys.issubset(data.files):
+            origin_names = data["origin_names"]
+            origin_centroids = data["origin_centroids"]
+            origin_n_samples = data["origin_n_samples"]
+            origin_content_hashes = data["origin_content_hashes"]
+            profile["profile_format_version"] = int(data["profile_format_version"])
+            profile["origins"] = [
+                {
+                    "origin": str(origin_names[i]),
+                    "centroid": origin_centroids[i].astype(np.float32),
+                    "n_samples": int(origin_n_samples[i]),
+                    "content_hash": str(origin_content_hashes[i]),
+                }
+                for i in range(len(origin_names))
+            ]
+    except Exception as exc:
+        raise ValueError(f"Arquivo de perfil inválido ou corrompido: {exc}") from exc
+
+    return profile
+
+
+def imported_profile_known_hashes(imported_profile):
+    """Hashes de conteúdo já conhecidos de um perfil importado (v2), para
+    dedup: arquivo novo cujo hash já aparece aqui é ignorado antes de
+    reprocessar (ver PLANO_IDENTITY_EVOLUTIVO.md, item 3 do fluxo). Perfil v1
+    (sem "origins") ou origem sem hash conhecido (string vazia, ver
+    _origin_summaries) simplesmente não contribui nenhum hash — dedup
+    continua funcionando, só não pega esses casos.
+
+    Retorna um set (hash de conteúdo -> nada útil de mapear, só a presença
+    importa aqui).
+    """
+    origins = imported_profile.get("origins", [])
+    return {o["content_hash"] for o in origins if o["content_hash"]}
+
+
+def merge_imported_profile(imported_profile, new_samples, name=None, new_discarded=None):
+    """Combina um perfil IMPORTADO (v2, com profile["origins"]) com amostras
+    NOVAS (de mídia adicional processada nesta sessão, via
+    IdentityProfileBuilder), produzindo uma candidata sem precisar
+    reprocessar o material original da v_N (ver PLANO_IDENTITY_EVOLUTIVO.md,
+    fluxo de atualização incremental).
+
+    Cada origem legada da v_N entra na combinação como 1 pseudo-sample de
+    peso IGUAL às novas origens (não escalado por n_samples) — escalar pelo
+    n_samples reintroduziria o viés de volume que o balanceamento por origem
+    existe para evitar, já que não há garantia sobre a distribuição interna
+    de uma origem legada sem suas amostras individuais preservadas (ver item
+    6 do fluxo no plano).
+
+    SEM parâmetro balance_by_origin (diferente de _build_profile_from_samples):
+    aqui não existe um modo "sem balanceamento" coerente, porque as origens
+    legadas só existem como 1 centroide cada — tratá-las como amostras cruas
+    individuais (o que balance_by_origin=False faria) reduziria cada origem
+    legada inteira ao peso de 1 frame novo, apagando a identidade da v_N
+    quando há muitas amostras novas de uma origem só (medido: 50 amostras
+    legadas vs. 50 novas de 1 vídeo produzia um centroide 99,98% dominado
+    pelo vídeo novo). Sempre agrega via _compute_centroid sobre pseudo-samples
+    por origem (peso igual entre todas), equivalente ao balance_by_origin=True
+    de _build_profile_from_samples.
+
+    A candidata resultante:
+    - Tem profile["samples"] = só as NOVAS amostras (as legadas nunca tiveram
+      samples individuais preservados, apenas o centroide por origem) — isso
+      é suficiente para export_profile gravar um v2 novo (via
+      _combined_origin_summaries abaixo, não via profile["samples"] direto).
+    - NÃO suporta merge_profiles/apply_anchor_to_profile diretamente sobre as
+      origens legadas (mesma limitação de sempre: sem amostras individuais).
+      Aplicar âncora precisa ser feito ANTES de exportar novamente, sobre as
+      novas amostras via apply_anchor_to_profile de um perfil comum, ou
+      tratado como uma etapa separada — não coberto por esta função.
+
+    Levanta ValueError se imported_profile não tiver "origins" (perfil v1,
+    sem dados por origem — não há nada para continuar incrementalmente; a
+    única opção é reextrair do zero com o material completo), se "origins"
+    estiver vazio (v2 corrompido/artesanal sem nenhuma origem) ou se
+    new_samples estiver vazio (nada de novo para agregar).
+    """
+    if "origins" not in imported_profile:
+        raise ValueError(
+            "Este perfil foi exportado no formato antigo (sem dados por origem) e não "
+            "pode ser continuado incrementalmente. Reextraia do zero com o material "
+            "completo (original + novo)."
+        )
+    legacy_origins = imported_profile["origins"]
+    if not legacy_origins:
+        raise ValueError("Perfil importado não contém nenhuma origem válida (arquivo corrompido).")
+    if not new_samples:
+        raise ValueError("Nenhuma amostra nova válida para continuar o perfil.")
+
+    legacy_pseudo_samples = [
+        {"embedding": o["centroid"], "origin": o["origin"]} for o in legacy_origins
+    ]
+    new_pseudo_samples = _origin_centroids_as_pseudo_samples(new_samples)
+    combined_pseudo_samples = legacy_pseudo_samples + new_pseudo_samples
+
+    centroid = _compute_centroid(combined_pseudo_samples)
+
+    representative = max(new_samples, key=lambda s: s["face"].det_score)
+    profile_face = Face(
+        bbox=representative["face"].bbox,
+        kps=representative["face"].kps,
+        det_score=representative["face"].det_score,
     )
-    face.embedding = data["embedding"].astype(np.float32)
+    profile_face.embedding = centroid
+
+    new_discarded = new_discarded or []
+    total_n_samples = sum(o["n_samples"] for o in legacy_origins) + len(new_samples)
 
     return {
-        "name": str(data["name"]),
-        "face": face,
-        "n_samples": int(data["n_samples"]),
+        "name": name or imported_profile["name"],
+        "face": profile_face,
+        "thumbnail": representative["thumbnail"],
+        "samples": list(new_samples),
+        "n_samples": total_n_samples,
+        "n_discarded": len(new_discarded),
+        "discarded": list(new_discarded),
+        "legacy_origins": legacy_origins,
     }
+
+
+def candidate_as_imported_profile(candidate):
+    """Converte uma candidata (retorno de merge_imported_profile, com
+    "legacy_origins" + "samples" novos) numa estrutura equivalente a um
+    perfil recém-importado (com "origins" combinando ambos) — permite
+    encadear merge_imported_profile de novo sobre a candidata (adicionar
+    MAIS mídia nova antes de confirmar), em vez de cada chamada partir
+    sempre da v_N original e descartar silenciosamente o material de
+    rodadas anteriores ainda não confirmadas.
+
+    Usa _combined_origin_summaries (mesma lógica de export_profile) para
+    que o resultado tenha exatamente as mesmas origens que um export+import
+    real produziria, incluindo a desambiguação de nomes colidentes.
+    """
+    summaries = _combined_origin_summaries(candidate)
+    return {
+        "name": candidate["name"],
+        "face": candidate["face"],
+        "n_samples": candidate["n_samples"],
+        "profile_format_version": PROFILE_FORMAT_VERSION,
+        "origins": [
+            {
+                "origin": s["origin"],
+                "centroid": s["centroid"],
+                "n_samples": s["n_samples"],
+                "content_hash": s["content_hash"],
+            }
+            for s in summaries
+        ],
+    }
+
+
+def _combined_origin_summaries(profile, content_hashes=None):
+    """Resumos por origem para exportar uma candidata de merge_imported_profile
+    (que tem tanto "legacy_origins" quanto "samples" novos) — usada por
+    export_profile no lugar de _origin_summaries quando profile tem
+    "legacy_origins", para não perder os centroides das origens legadas ao
+    reexportar (profile["samples"] só cobre as origens NOVAS).
+
+    Origem nova com o mesmo nome de uma origem legada (ex.: arquivo reenviado
+    com o mesmo basename da v_N, mas conteúdo diferente — recorte/reencode,
+    que o dedup por hash não pega, ver imported_profile_known_hashes) ganha
+    um sufixo numérico para não colidir: duas entradas com o mesmo "origin"
+    no .npz fariam essa origem valer o DOBRO do peso normal na próxima
+    importação (cada origem pesa 1 na combinação — ver merge_imported_profile).
+    """
+    legacy_origins = profile.get("legacy_origins", [])
+    legacy_summaries = [
+        {
+            "origin": o["origin"],
+            "centroid": o["centroid"],
+            "n_samples": o["n_samples"],
+            "content_hash": o["content_hash"],
+        }
+        for o in legacy_origins
+    ]
+    new_summaries = _origin_summaries(profile.get("samples") or [], content_hashes=content_hashes)
+
+    used_names = {s["origin"] for s in legacy_summaries}
+    for summary in new_summaries:
+        base_name = summary["origin"]
+        if base_name not in used_names:
+            used_names.add(base_name)
+            continue
+        suffix = 2
+        candidate_name = f"{base_name}#{suffix}"
+        while candidate_name in used_names:
+            suffix += 1
+            candidate_name = f"{base_name}#{suffix}"
+        summary["origin"] = candidate_name
+        used_names.add(candidate_name)
+
+    return legacy_summaries + new_summaries
