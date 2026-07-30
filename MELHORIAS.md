@@ -1,0 +1,81 @@
+# Melhorias — NeoRefacer
+
+Documento único de melhorias do projeto (substitui `PLANO_IDENTIDADE_MULTI_FONTE.md`, `PLANO_IDENTITY_EVOLUTIVO.md`, `REVIEW_GERAL_VIDEO.md`, `REVIEW_PERFORMANCE_VIDEO.md`, `REVISAO_VIDEO_FACESWAP.md` e `PLANO_DEPENDENCIAS_INFRA.md` — todos removidos, conteúdo revisado contra o código atual e consolidado aqui). `README.md` continua separado (não é sobre melhorias).
+
+Contexto de hardware: GPU Tesla T4 (Turing, compute capability 7.5, 16GB VRAM), CPU limitada — Google Colab e Lightning AI free tier, ambos com driver CUDA 12.x. Uso atual: **Video Mode + Identity** (Image/GIF/TIFF Mode e CodeFormer fora do fluxo de uso).
+
+---
+
+## 1. Identity — perfil de identidade multi-fonte
+
+### ✅ Done
+
+- **Extração multi-imagem/multi-vídeo com clustering greedy** (`identity_profile.py`): reusa 100% do pipeline existente (`SCRFD`/`ArcFaceONNX`), sem modelo novo. Clustering por similaridade de cosseno (argmax contra centroides existentes, não "primeiro acima do threshold"), centroide robusto com supressão de outlier.
+- **Filtros de qualidade antes do clustering**: `det_score`, tamanho mínimo de bbox, nitidez (variância do Laplaciano).
+- **Balanceamento por origem** (`balance_by_origin`, opt-in): 1 centroide por vídeo/arquivo antes da combinação final, evita que um vídeo de muitos frames domine sobre poucas fotos avulsas.
+- **Ponderação por nitidez** (`weight_by_sharpness`, opt-in): pondera o centroide pela nitidez do crop. Testado com 230 amostras reais: efeito é fração de grau, imperceptível nesse volume — `sqrt` é conservador demais para grandes conjuntos. Não resolveu o caso de uso original (preservar marcas de expressão); ver seção de textura de pele abaixo.
+- **Foto âncora opcional** (`anchor_sample`/`anchor_weight`, teto 35%): interpolação convexa sobre o centroide já calculado, como etapa separada. Persiste no perfil e é reaplicada em recálculos (busca dirigida, merge de sessão) via `_reattach_anchor_extras` — antes se perdia silenciosamente nesses caminhos.
+- **Diagnóstico de deslocamento da âncora**: status mostra o ângulo/similaridade entre o centroide com e sem âncora, para saber na hora se ela teve efeito real (âncora muito parecida com o perfil desloca quase nada).
+- **Transplante de textura de pele** (`skin_texture`, opt-in, desligado por padrão): extrai a componente de alta frequência (rugas, olheiras, poros) da foto-âncora — mascarada para testa/bochechas, excluindo olhos/nariz/boca — e soma sobre o resultado do swap sem alterar tom de pele/iluminação. Motivação: o embedding ArcFace é treinado para ser invariante a maquiagem, então a âncora por si só não move esse atributo. Extração e aplicação usam alinhamento real por landmarks (`face_align.norm_crop`/`estimate_norm` + `warpAffine` inverso) — corrige um bug crítico encontrado em review (o "thumbnail" da amostra é só um recorte de bbox, sem rotação/escala normalizada). Persiste em export/import de `.npz`. **Ainda não validado visualmente com material real** — próximo passo: testar com âncora real, comparar intensidades 0.5/1.0/1.5 no mesmo vídeo de destino, observar bordas nos furos de exclusão e comportamento em movimento (textura "colada" vs. acompanhando expressão).
+- **Formato de exportação v2 + fluxo evolutivo** (`PROFILE_FORMAT_VERSION`, `merge_imported_profile`): centroide por origem + hash de conteúdo, permite continuar a extração incrementalmente sem reprocessar o material original (v1 → v2 → v3...). Dedup por hash de arquivo. Passou por review adversarial (corrigiu RCE via `allow_pickle=True`, viés de peso, gate de consentimento). Textura de pele/âncora não sobrevivem a este fluxo especificamente (`merge_imported_profile`) — precisam ser reaplicadas manualmente sobre a candidata antes de reexportar (documentado na própria docstring).
+- **Suporte a upload HEIC/HEIF** (fotos de iPhone).
+- 44 testes automatizados cobrindo a lógica pura de centroide/versionamento/textura (mockada onde precisa de GPU real).
+
+### 🔲 Pendente
+
+- **Validação visual da textura de pele com material real** (ver acima) — bloqueia considerar a feature "pronta".
+- **Curadoria de material > ponderação numérica** para preservar marcas de expressão: com centenas de amostras, filtrar/priorizar as mais nítidas na curadoria manual tem efeito maior que qualquer peso suave automático. Alternativa não implementada: usar só o top-N% mais nítido no cálculo do centroide (corte, não peso suave) — mais agressivo que `weight_by_sharpness`, ainda não implementado.
+- **`skin_texture`/âncora reaplicados em `merge_imported_profile`**: hoje é limitação documentada, não automática — poderia ganhar o mesmo tratamento de `_reattach_anchor_extras` se o fluxo evolutivo passar a ser mais usado.
+
+---
+
+## 2. Vídeo — Swap, Matching e Qualidade
+
+### ✅ Done
+
+- **Assignment global por similaridade** em "Faces By Match" (`_apply_swaps`, `refacer.py:1366-1418`): matriz completa rep×face, ordenada por similaridade descendente, cada rep e cada rosto usado no máximo 1×. Resolve o antigo problema de "primeiro acima do threshold ganha" tanto entre múltiplos rostos-alvo quanto dentro de 1 único rosto-alvo com múltiplas pessoas no frame.
+- **Continuidade de identidade entre frames (tracking por IoU)**: em "Faces By Match", um destino que casou em frames recentes mas caiu abaixo do threshold no frame atual (motion blur, rotação breve, oclusão parcial) continua trocando pela posição anterior por até `track_max_misses` frames, em vez de "piscar" o rosto original. Em "Multiple Faces"/multi-destino posicional, o mesmo mecanismo evita troca de destino quando duas pessoas se cruzam. Ativo só nos caminhos sequenciais em modo CUDA (`reface_group` usa threads fora de ordem em CPU/CoreML, onde tracking não é válido).
+- **Try/except por job** (`app.py`): um destino sem rosto detectável não aborta mais o lote inteiro — `gr.Warning` lista os jobs que falharam, os demais continuam.
+- **`first_face`/`process_first_face` removidos**: eram código morto (flag nunca consultada por `_apply_swaps`).
+- **Encode único via pipe ffmpeg** (elimina o encode duplo mp4v→H.264): `_FfmpegVideoWriter` grava frames crus direto para um processo `ffmpeg` externo via pipe, com rate control adequado por encoder (nvenc `-rc vbr -cq 23`, videotoolbox `-q:v 65`, CPU `-crf 20`). Probe real antes de confiar no pipe (`_pipe_encoder_works`, codifica 1 frame de teste, resultado cacheado por encoder+resolução) — fallback para mp4v dispara de verdade agora. Padding automático (`-vf pad=...`) para dimensão ímpar. **Validado em teste real pelo usuário.**
+- **`analyze_video_in_memory` + `reface_with_precomputed`**: decodifica/detecta/computa embeddings uma única vez por vídeo (não por job), reutilizado por todos os rostos-alvo configurados. Preview agora descarta frames pulados como os demais caminhos (antes saía com duração cheia e 90% dos frames sem swap). Ativado sempre que há 2+ jobs, independente do checkbox "Enable Cache".
+- **Hash de vídeo memoizado** (path+mtime+size) e `fps`/`width`/`height` cacheados junto aos frames — elimina releitura de disco e reabertura de `VideoCapture` a cada job no light cache. Métrica de hit rate agora reflete hits/misses reais.
+- **3 caminhos sequenciais escrevem frame direto no writer** (sem lista intermediária em RAM) — `_calculate_optimal_batch_size` virou constante 100 só para o agrupamento de I/O do `reface_group` (o único caminho concorrente restante, threads em CPU/CoreML).
+- **Máscara "mouth rect"** (opt-in, alternativa ao corte reto do Reface Ratio): faixa vertical estreita boca→queixo, calculada por frame a partir dos keypoints, cai para o corte reto se `kps` vier `None`. Bordas verticais garantidas dentro do crop.
+- **Progresso Gradio correto**: `gr.Progress` como primeiro parâmetro posicional de `run()` (Gradio 5.22 não detecta Progress depois de `*vars`) — tqdm interno aparece na UI.
+- **Cache de reanálise entre cliques em Run na mesma fila** — não reprocessa do zero a cada clique.
+- **Threads só onde ajudam**: `reface_group` serializa em modo CUDA, só usa `ThreadPoolExecutor` em CPU/CoreML/TensorRT (overlap de I/O).
+- **Profiling opt-in** via `REFACER_PROFILE` env var, desligado por padrão.
+- **Teto de RAM** em `analyze_video_in_memory` (`in_memory_analysis_max_mb`), com fallback automático para o caminho per-job em vídeos grandes.
+- **Transição de blend com smoothstep** (não mais linear).
+
+### 🔲 Pendente / Limitação conhecida (documentada, não implementar sem novo pedido)
+
+- **Pose lateral/deitada (yaw/pitch acentuado) perde integridade no swap** — limitação estrutural: o alinhamento (`SimilarityTransform`, 4 graus de liberdade) e o `INSwapper` de terceiros usam sempre um template frontal fixo; nenhuma transformação 2D recupera profundidade 3D perdida. Existe um modo multi-template (`mode='non-arcface'`, 5 templates de pose) já implementado em `face_align.py` mas nunca ativado — mitigaria só pose *moderada* (3/4), custo de ativar é quase nulo, mas o `INSwapper` faz seu próprio realinhamento interno (fixo, frontal) então o ganho seria parcial mesmo assim. Não resolveria pose extrema. Fork/monkeypatch do `INSwapper` para resolver de verdade é desproporcional ao ganho — registrado como limitação, não implementar por ora.
+- **"Reface Ratio" (corte parcial) usa a bbox do detector para todos os modos** — o corte horizontal não gira com a pose da cabeça; mais notado com giro de cabeça e slider > 0. Resolver corretamente exigiria estimar yaw/pitch dos 5 keypoints — não compensa para um recurso opt-in/uso ocasional.
+- **CodeFormer nunca aplicado em vídeo** — decisão correta, mantê-la (custo alto demais para o hardware). Ajuste barato pendente: `w=0.5→0.7` já aplicado no modo imagem (mais fidelidade); poderia ser exposto como slider na UI de imagem se algum dia voltar a ser usado (hoje fora do fluxo de uso).
+- **I/O pulverizado do cache em disco** (`reface_with_cache`, 1 `.npz` por frame, compressão zlib desnecessária para arrays pequenos) — ganho de CPU real, mas caminho usado só quando `use_cache=True` com vídeo > 30-60s; despriorizado, `analyze_video_in_memory`/`precomputed` já é o caminho preferido para múltiplos jobs.
+- **Menores registrados, baixa prioridade**: `testsrc.mp4` do probe de encoder não removido do CWD (usar `tempfile`); intermediário de mux/reencode não apagado em `output/` quando há áudio (2× disco por vídeo).
+
+---
+
+## 3. Dependências e Infraestrutura
+
+Contexto: T4 é compatível com CUDA 12.x tanto em Colab quanto em Lightning AI (mesma GPU física) — nenhuma recomendação abaixo depende de feature exclusiva de um provedor ou exige CUDA 13.
+
+### 🔲 Pendente — priorizado por impacto
+
+- 🔴 **Atualizar `opencv-python`/`opencv-python-headless`** de `4.7.0.72` para `4.13.0.92`: CVE-2023-4863 (CVSS 9.8, RCE via libwebp) corrigido a partir da `4.8.1.78` — o app decodifica imagens de upload (`cv2.imread`), vetor de ataque real. Risco de quebra baixo (API usada é estável entre as versões); testar suíte + smoke test manual de detecção/swap depois do bump.
+- 🟢 **IO Binding no ONNX Runtime** em `recognition/scrfd.py`/`recognition/arcface_onnx.py` (código próprio do projeto, não da lib `insightface`): `session.run()` puro hoje copia CPU↔GPU implicitamente por frame; `session.io_binding()` mantém os tensores na GPU entre detecção→embedding→swap. Zero risco de versão (mesma lib `1.21.0` já suporta), esforço médio de implementação. Maior potencial de ganho de FPS entre tudo levantado.
+- 🟡 **`onnxruntime`/`onnxruntime_gpu`**: pode subir de `1.21.0` até `1.26.x` (ganho incremental de grafo/kernel). Não ir além — a partir da `1.27` o padrão passa a exigir CUDA 13, que T4/Colab/Lightning não oferecem hoje.
+- 🟡 **`numpy==1.24.3`**: manter na série 1.x (pode subir até `1.26.4`), nunca migrar para 2.x — `insightface==0.7.3` tem extensões Cython compiladas contra a ABI do NumPy 1.x, quebra em runtime com NumPy 2.x (erro de ABI documentado em issues do próprio repo).
+
+### ⚪ Investigado, não recomendado migrar agora
+
+- **`insightface==0.7.3` → `1.0`**: changelog oficial completo obtido (fonte primária, README do pacote). Única mudança de comportamento de modelo entre 0.7.3 e 1.0 é detecção em Auto (128×128+640×640) por padrão — o projeto **já implementa isso manualmente** em `recognition/scrfd.py` (`autodetect()`) desde antes. Nenhuma entrada de changelog sobre `INSwapper`/modelo de swap ou `ArcFaceONNX`/embedding. Mudanças reais da 1.0/1.0.1: GUI desktop nova (PySide6, não usada aqui), extensão `face3d` opcional parar de compilar por padrão (não usada aqui), reorganização de dependências extras. **Ganho documentado: zero para este projeto.** Risco pequeno-mas-real (mudança de assinatura/tipo em `Face`/`INSwapper` sem garantia). Revisitar se: sair CVE de segurança na `0.7.3`, ou uma versão futura documentar mudança real no `INSwapper`.
+- **`gradio==5.22.0` → `6.0`**: exige mudança de código (parâmetros `theme`/`css` saem do construtor `gr.Blocks` e vão para `.launch()`); ganho é de footprint de UI, não do gargalo real (inferência de modelo). Reavaliar só se `5.x` parar de receber patches de segurança.
+- **`torch`/`torchvision` (CodeFormer)**: só usado no Image/TIFF Mode, fora do fluxo de uso atual. Sem prioridade.
+
+### Nota sobre validação
+
+Os testes automatizados (`tests/`) mockam `cv2`/`insightface`/`onnxruntime` para rodar sem GPU — cobrem lógica pura (matemática de centroide, versionamento de `.npz`), não inferência real. Nenhuma mudança de versão de `opencv-python`/`onnxruntime`/`insightface` é validada pela suíte atual. Antes de aplicar qualquer item pendente desta seção, testar manualmente no Colab/Lightning (GPU real, modelos `.onnx` carregados): detectar um rosto, gerar embedding, fazer um swap simples, comparar visualmente/numericamente com o resultado da versão anterior.
