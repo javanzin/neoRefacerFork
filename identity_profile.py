@@ -153,7 +153,39 @@ _ARCFACE_LANDMARKS_112 = np.array(
      [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32,
 )
 
-_SKIN_TEXTURE_HIGHPASS_SIGMA = 3.0
+# Band-pass (DoG — diferença de dois Gaussian blurs) para isolar a banda de
+# frequência onde vivem rugas/olheiras/poros no crop 112x112:
+# - SIGMA_LOW = 1.0 descarta o que é MENOR que ~2px (grão de sensor, ruído de
+#   compressão JPEG da foto âncora) — era exatamente isso que um high-pass
+#   puro (versão anterior, sigma único de 3.0) deixava passar em amplitude
+#   total, dando aparência "dura"/granulada à textura transplantada.
+# - SIGMA_HIGH = 4.0 descarta o que é MAIOR que ~8px (tom de pele, gradiente
+#   de iluminação, sombra de volume), que deve continuar vindo do frame de
+#   destino.
+# Escala de referência: no template ArcFace 112x112 a distância interocular é
+# ~35px, então uma ruga (1-3px de espessura de linha) ou olheira (banda de
+# 4-8px sob o olho) cai na janela ~2-8px que esta banda [2*SIGMA_LOW,
+# 2*SIGMA_HIGH] preserva.
+_SKIN_TEXTURE_BANDPASS_SIGMA_LOW = 1.0
+_SKIN_TEXTURE_BANDPASS_SIGMA_HIGH = 4.0
+
+# Largura (px, no crop 112x112) da rampa suave (smoothstep) nas bordas da
+# máscara de pele — tanto ao redor dos círculos de exclusão dos landmarks
+# quanto na elipse externa. Uma borda binária (versão anterior) vira um
+# degrau visível ("círculo em volta") quando a textura é somada: a transição
+# de "textura completa" para "nenhuma textura" acontece em 1px. 4px de rampa:
+# - escala para ~10-20px no rosto de destino típico (crop 112 → rosto de
+#   200-500px num frame HD), largo o bastante para a transição ficar abaixo
+#   do limiar de percepção com amplitudes de textura de ±10 níveis de cinza;
+# - estreito o bastante para os círculos de exclusão (raios 11-16px, ver
+#   abaixo) mais a rampa não se fundirem no centro do rosto e comerem a
+#   bochecha (problema já observado com raio uniforme de 20px);
+# - a rampa cresce PARA FORA do raio de exclusão (mask=0 garantido dentro do
+#   raio), então não reintroduz cílio/sobrancelha/lábio — só adia o início
+#   da textura, em vez de um feather por blur da máscara, que vazaria para
+#   dentro da região excluída.
+_SKIN_TEXTURE_MASK_FEATHER_PX = 4.0
+
 # Raio (em px, no crop 112x112) de exclusão ao redor de cada landmark, na
 # mesma ordem de _ARCFACE_LANDMARKS_112 (olho esq., olho dir., nariz, boca
 # esq., boca dir.) — afasta a máscara de pele desses pontos, cuja textura
@@ -166,28 +198,48 @@ _SKIN_TEXTURE_HIGHPASS_SIGMA = 3.0
 _SKIN_TEXTURE_EXCLUSION_RADII = np.array([16.0, 16.0, 11.0, 12.0, 12.0], dtype=np.float32)
 
 
+def _smoothstep(t):
+    """Rampa suave 0→1 (Hermite, C1-contínua) para t em [0,1]; clampada fora
+    do intervalo. Usada nas bordas da máscara de pele — uma rampa linear já
+    esconderia o degrau, mas a derivada descontínua nas pontas ainda pode ler
+    como "linha" com texturas de amplitude alta; smoothstep custa o mesmo."""
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
 def _skin_region_mask(crop_size=112):
-    """Máscara binária (0/1, shape (crop_size, crop_size)) da região de pele
-    útil para textura — testa e bochechas do crop alinhado ArcFace, excluindo
-    um raio ao redor de cada landmark (olhos, nariz, boca) e a borda externa
-    do rosto (fundo/cabelo/orelha, que não é pele facial).
+    """Máscara suave (float 0..1, shape (crop_size, crop_size)) da região de
+    pele útil para textura — testa e bochechas do crop alinhado ArcFace,
+    excluindo um raio ao redor de cada landmark (olhos, nariz, boca) e a
+    borda externa do rosto (fundo/cabelo/orelha, que não é pele facial).
+
+    As bordas NÃO são binárias: cada exclusão de landmark é 0 dentro do raio
+    e sobe em rampa smoothstep de _SKIN_TEXTURE_MASK_FEATHER_PX de largura
+    logo após o raio; a elipse externa desce na mesma largura de rampa antes
+    da borda. Uma máscara binária produzia um contorno circular visível no
+    resultado (transição de 1px entre "textura completa" e "nenhuma").
 
     Fixa porque o template de alinhamento é fixo (ver _ARCFACE_LANDMARKS_112)
     — calculada uma vez e cacheada (ver _extract_skin_texture).
     """
     yy, xx = np.mgrid[0:crop_size, 0:crop_size].astype(np.float32)
+    feather = _SKIN_TEXTURE_MASK_FEATHER_PX
 
     # Elipse frouxa cobrindo a região facial central (exclui os cantos do
     # crop 112x112, que no template ArcFace já são fundo/cabelo/orelha).
+    # A distância elíptica normalizada (1.0 = borda) é convertida para ~px
+    # multiplicando pelo eixo médio, para a rampa da elipse ter a mesma
+    # largura física das rampas circulares dos landmarks.
     center = np.array([56.0, 60.0])
-    face_ellipse = (
-        ((xx - center[0]) / 46.0) ** 2 + ((yy - center[1]) / 52.0) ** 2
-    ) <= 1.0
+    axes = np.array([46.0, 52.0])
+    ellipse_dist = np.sqrt(
+        ((xx - center[0]) / axes[0]) ** 2 + ((yy - center[1]) / axes[1]) ** 2
+    )
+    mask = _smoothstep((1.0 - ellipse_dist) * float(axes.mean()) / feather)
 
-    mask = face_ellipse.copy()
     for (lx, ly), radius in zip(_ARCFACE_LANDMARKS_112, _SKIN_TEXTURE_EXCLUSION_RADII):
-        dist_sq = (xx - lx) ** 2 + (yy - ly) ** 2
-        mask &= dist_sq > radius ** 2
+        dist = np.sqrt((xx - lx) ** 2 + (yy - ly) ** 2)
+        mask *= _smoothstep((dist - radius) / feather)
 
     return mask.astype(np.float32)
 
@@ -212,21 +264,35 @@ def _extract_skin_texture(frame_bgr, kps):
     isso este passo refaz o alinhamento aqui via face_align.norm_crop, com o
     MESMO template usado por refacer.py no restante do pipeline de swap.
 
-    Frequência ALTA (não a imagem inteira): tom de pele e iluminação devem
-    vir do frame de destino sendo processado, não da foto âncora — só a
-    textura fina (o que o embedding de identidade não codifica, ver
-    ANCHOR_MAX_WEIGHT) é o que faz sentido transplantar. Isolada por
-    unsharp-mask (crop menos sua versão borrada).
+    LUMINÂNCIA, não BGR: a versão anterior extraía a "alta frequência" por
+    canal de cor separado (crop BGR menos seu blur BGR) — isso não separa cor
+    de brilho, então variação LOCAL de cor da âncora (sardas avermelhadas,
+    ruído de croma do sensor, artefatos de chroma-subsampling do JPEG,
+    resquício de maquiagem) vazava para dentro da "textura" e era somada ao
+    frame de destino, produzindo mancha de tonalidade visível. Extrair em
+    escala de cinza garante que a textura é um delta puro de brilho: ao ser
+    somado igualmente aos 3 canais do destino (ver _apply_skin_texture), a
+    crominância do destino fica intocada por construção.
 
-    Retorna um dict {"texture": array float32 (112,112,3) já mascarado pela
-    região de pele, "mask": _SKIN_REGION_MASK_112} — "mask" viaja junto para
-    quem for aplicar não precisar reimportar a constante.
+    Banda MÉDIA de frequência (não high-pass puro): rugas/olheiras/poros são
+    estruturas de ~2-8px no crop 112x112 — isoladas por DoG (blur sigma
+    _SKIN_TEXTURE_BANDPASS_SIGMA_LOW menos blur sigma ..._HIGH), que descarta
+    tanto o grão/ruído sub-2px (que dava aparência "dura" à textura) quanto o
+    tom/iluminação acima de ~8px (que deve vir do frame de destino, não da
+    âncora — ver ANCHOR_MAX_WEIGHT para o que o embedding não codifica).
+
+    Retorna um dict {"texture": array float32 (112,112) — delta de LUMINÂNCIA
+    já mascarado pela região de pele, "mask": _SKIN_REGION_MASK_112} —
+    "mask" viaja junto para quem for aplicar não precisar reimportar a
+    constante.
     """
     aligned = face_align.norm_crop(frame_bgr, kps, image_size=112)
-    blurred = cv2.GaussianBlur(aligned.astype(np.float32), (0, 0), _SKIN_TEXTURE_HIGHPASS_SIGMA)
-    high_freq = aligned.astype(np.float32) - blurred
-    masked_texture = high_freq * _SKIN_REGION_MASK_112[:, :, np.newaxis]
-    return {"texture": masked_texture, "mask": _SKIN_REGION_MASK_112}
+    gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    fine = cv2.GaussianBlur(gray, (0, 0), _SKIN_TEXTURE_BANDPASS_SIGMA_LOW)
+    coarse = cv2.GaussianBlur(gray, (0, 0), _SKIN_TEXTURE_BANDPASS_SIGMA_HIGH)
+    band = fine - coarse
+    masked_texture = band * _SKIN_REGION_MASK_112
+    return {"texture": masked_texture.astype(np.float32), "mask": _SKIN_REGION_MASK_112}
 
 
 def _downscale_gray(frame_bgr):

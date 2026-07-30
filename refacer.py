@@ -1249,16 +1249,23 @@ class Refacer:
         return swapped
 
     def _apply_skin_texture(self, swapped_frame, face, skin_texture):
-        """Soma a textura de pele (alta frequência — rugas, olheiras, poros;
-        ver identity_profile._extract_skin_texture) extraída da foto âncora
-        sobre o resultado do swap, opt-in via skin_texture anexado ao
-        dest_face pelo identity_profile (ver apply_identity_anchor em app.py).
+        """Soma a textura de pele (banda média de frequência em LUMINÂNCIA —
+        rugas, olheiras, poros; ver identity_profile._extract_skin_texture)
+        extraída da foto âncora sobre o resultado do swap, opt-in via
+        skin_texture anexado ao dest_face pelo identity_profile (ver
+        apply_identity_anchor em app.py).
 
-        Só a componente de alta frequência é somada (nunca substitui pixels):
-        tom de pele e iluminação continuam vindo inteiramente do swap, que já
-        herdou isso do frame de destino — a textura da âncora só acrescenta
-        detalhe fino que o embedding de identidade (ArcFace, ver
-        ANCHOR_MAX_WEIGHT) não carrega.
+        A textura é um delta ESCALAR de luminância (shape (112,112)), somado
+        igualmente aos 3 canais BGR do frame: isso preserva a crominância do
+        destino por construção — só o brilho local muda (ruga escurece,
+        brilho de poro clareia), nunca a cor. Tom de pele e iluminação
+        continuam vindo inteiramente do swap, que já herdou isso do frame de
+        destino — a textura da âncora só acrescenta detalhe fino que o
+        embedding de identidade (ArcFace, ver ANCHOR_MAX_WEIGHT) não carrega.
+        Perfis exportados antes desta mudança guardavam a textura por canal
+        BGR (shape (112,112,3)) — colapsada aqui para luminância com os
+        mesmos pesos de cv2.COLOR_BGR2GRAY, para que perfis antigos também
+        parem de transplantar cor.
 
         A textura foi extraída num crop 112x112 alinhado por landmarks ao
         template arcface_src (ver identity_profile._extract_skin_texture) —
@@ -1282,14 +1289,20 @@ class Refacer:
         M_inv = cv2.invertAffineTransform(M)
 
         intensity = skin_texture.get("intensity", 1.0)
+        texture = np.asarray(skin_texture["texture"], dtype=np.float32)
+        if texture.ndim == 3:
+            # Perfil legado (textura por canal BGR): colapsa para luminância
+            # com os pesos de COLOR_BGR2GRAY antes de aplicar (ver docstring).
+            texture = texture @ np.array([0.114, 0.587, 0.299], dtype=np.float32)
         texture_frame_space = cv2.warpAffine(
-            skin_texture["texture"], M_inv, (w_frame, h_frame), borderValue=0.0,
+            texture, M_inv, (w_frame, h_frame), borderValue=0.0,
         )
         mask_frame_space = cv2.warpAffine(
             skin_texture["mask"], M_inv, (w_frame, h_frame), borderValue=0.0,
-        )[:, :, np.newaxis]
+        )
 
-        blended = swapped_frame.astype(np.float32) + texture_frame_space * mask_frame_space * intensity
+        luma_delta = (texture_frame_space * mask_frame_space * intensity)[:, :, np.newaxis]
+        blended = swapped_frame.astype(np.float32) + luma_delta
         return np.clip(blended, 0, 255).astype(np.uint8)
 
     def _apply_swaps(self, frame, faces):

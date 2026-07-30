@@ -402,27 +402,157 @@ def test_extract_skin_texture_mask_excludes_landmarks_and_borders():
     # Nenhum dos 5 landmarks (olhos, nariz, boca) fica dentro da máscara.
     for lx, ly in _ARCFACE_LANDMARKS_112:
         assert mask[int(ly), int(lx)] == 0.0
-    # O centro geométrico do crop (bochecha) deve estar coberto.
-    assert mask[60, 56] == 1.0
+    # Um ponto de bochecha (fora dos raios de exclusão + rampa de feather)
+    # deve estar totalmente coberto.
+    assert mask[76, 34] == 1.0
 
 
-def test_extract_skin_texture_isolates_high_frequency_only():
+def test_skin_region_mask_has_smooth_feathered_edges():
+    # A máscara não pode ser binária: uma borda 0→1 em 1px vira um contorno
+    # circular visível quando a textura é somada ao frame. Deve existir uma
+    # rampa de valores intermediários ao redor de cada exclusão.
+    from identity_profile import (
+        _SKIN_REGION_MASK_112, _SKIN_TEXTURE_MASK_FEATHER_PX,
+        _ARCFACE_LANDMARKS_112, _SKIN_TEXTURE_EXCLUSION_RADII,
+    )
+
+    mask = _SKIN_REGION_MASK_112
+    # Fração relevante de pixels com valor fracionário (nem 0 nem 1) — uma
+    # máscara binária teria zero.
+    fractional = ((mask > 0.0) & (mask < 1.0)).mean()
+    assert fractional > 0.05
+
+    # Rampa radial saindo do olho esquerdo para a esquerda (longe das outras
+    # exclusões): 0 dentro do raio, 1 depois de raio + feather, e crescimento
+    # monotônico não-decrescente no meio.
+    lx, ly = _ARCFACE_LANDMARKS_112[0]
+    radius = _SKIN_TEXTURE_EXCLUSION_RADII[0]
+    row = int(round(ly))
+    inside = mask[row, int(round(lx - radius + 1))]
+    assert inside == 0.0
+    ramp = mask[row, int(round(lx - radius - _SKIN_TEXTURE_MASK_FEATHER_PX - 1)):int(round(lx - radius + 1))]
+    # Lida da esquerda (fora) para a direita (dentro do raio): decrescente.
+    assert np.all(np.diff(ramp) <= 0.0)
+    assert ramp[0] == 1.0
+    # Existe ao menos um valor estritamente intermediário na rampa.
+    assert np.any((ramp > 0.0) & (ramp < 1.0))
+
+
+def test_extract_skin_texture_isolates_medium_band_only():
     from identity_profile import _extract_skin_texture
 
-    # Frame liso (sem textura nenhuma): alta frequência deve ser ~zero.
+    # Frame liso (sem textura nenhuma): a banda extraída deve ser ~zero.
     flat, kps = _frame_with_template_kps(128)
     flat_texture = _extract_skin_texture(flat, kps)["texture"]
+    # Textura agora é um delta de LUMINÂNCIA (2D), não por canal BGR.
+    assert flat_texture.shape == (112, 112)
     assert np.abs(flat_texture).max() < 1.0
 
-    # Ruído de alta frequência somado: deve aparecer na textura extraída.
+    # Ruído somado: deve aparecer na textura extraída (atenuado pelo colapso
+    # para luminância e pelo corte de altíssima frequência do band-pass, por
+    # isso o limiar é menor que o desvio do ruído de entrada).
     rng = np.random.default_rng(42)
     noisy = np.clip(128 + rng.normal(scale=20, size=(112, 112, 3)), 0, 255).astype(np.uint8)
     noisy_result = _extract_skin_texture(noisy, kps)
     noisy_texture, mask = noisy_result["texture"], noisy_result["mask"]
-    assert noisy_texture[mask > 0].std() > 5.0
+    assert noisy_texture[mask > 0].std() > 2.0
     # Fora da máscara de pele, a textura é sempre zero (nunca escapa a
     # região de olhos/nariz/boca/fundo).
     assert np.abs(noisy_texture[mask == 0]).max() == 0.0
+
+
+def test_extract_skin_texture_ignores_chroma_only_variation():
+    # Padrão de CROMA puro (canais variam em direções opostas mantendo a
+    # luminância constante): não é textura de pele, é cor — não pode vazar
+    # para a textura extraída (era a causa da "mancha de tonalidade" quando a
+    # extração era feita por canal BGR).
+    from identity_profile import _extract_skin_texture
+
+    _, kps = _frame_with_template_kps(128)
+    rng = np.random.default_rng(7)
+    delta = rng.normal(scale=20, size=(112, 112))
+    frame = np.empty((112, 112, 3), dtype=np.float64)
+    # Pesos BGR2GRAY: 0.114*dB + 0.587*dG + 0.299*dR == 0 (luminância fixa).
+    frame[:, :, 0] = 128 + delta                      # B
+    frame[:, :, 1] = 128                              # G
+    frame[:, :, 2] = 128 - delta * (0.114 / 0.299)    # R
+    frame = np.clip(frame, 0, 255).astype(np.uint8)
+
+    texture = _extract_skin_texture(frame, kps)["texture"]
+    # Sobra só o erro de quantização do uint8 (< ~1 nível de cinza).
+    assert np.abs(texture).max() < 2.0
+
+
+def test_apply_skin_texture_never_changes_chroma_of_destination():
+    # A textura em luminância deve ser somada IGUALMENTE aos 3 canais do
+    # frame de destino — o delta por canal tem que ser idêntico onde não há
+    # clipping, preservando a cor original do destino.
+    from identity_profile import _extract_skin_texture
+    from refacer import Refacer
+    from insightface.app.common import Face
+
+    frame, kps = _frame_with_template_kps(128)
+    rng = np.random.default_rng(11)
+    textured = np.clip(
+        128 + rng.normal(scale=15, size=(112, 112, 3)), 0, 255
+    ).astype(np.uint8)
+    skin_texture = {**_extract_skin_texture(textured, kps), "intensity": 0.5}
+
+    face = Face()
+    face.kps = kps
+    # Frame de destino com cor uniforme bem longe do neutro (canais bem
+    # separados, todos longe de 0/255 para não haver clipping).
+    swapped = np.empty((112, 112, 3), dtype=np.uint8)
+    swapped[:, :, 0] = 60
+    swapped[:, :, 1] = 120
+    swapped[:, :, 2] = 180
+
+    result = Refacer._apply_skin_texture(None, swapped, face, skin_texture)
+
+    delta = result.astype(np.int32) - swapped.astype(np.int32)
+    # Delta igual nos 3 canais (sem clipping possível com base 60-180 e
+    # textura de amplitude pequena) — nenhuma mudança de crominância. A
+    # tolerância de 1 nível cobre só o arredondamento float32/uint8 (o mesmo
+    # delta somado a bases de magnitude diferente pode truncar 1 nível
+    # diferente); vazamento de cor real (o bug corrigido) era de dezenas de
+    # níveis.
+    assert np.abs(delta[:, :, 0] - delta[:, :, 1]).max() <= 1
+    assert np.abs(delta[:, :, 1] - delta[:, :, 2]).max() <= 1
+    # E a textura de fato foi aplicada (delta não é zero em toda parte).
+    assert np.abs(delta).max() > 0
+
+
+def test_apply_skin_texture_accepts_legacy_3channel_profiles():
+    # Perfis exportados antes da migração guardam textura por canal BGR
+    # (shape (112,112,3)) — devem continuar aplicáveis, colapsados para
+    # luminância (delta igual nos 3 canais, sem transplantar cor).
+    from identity_profile import _SKIN_REGION_MASK_112
+    from refacer import Refacer
+    from insightface.app.common import Face
+    from identity_profile import _ARCFACE_LANDMARKS_112
+
+    rng = np.random.default_rng(13)
+    legacy_texture = (
+        rng.normal(scale=8, size=(112, 112, 3)).astype(np.float32)
+        * _SKIN_REGION_MASK_112[:, :, np.newaxis]
+    )
+    skin_texture = {
+        "texture": legacy_texture,
+        "mask": _SKIN_REGION_MASK_112,
+        "intensity": 1.0,
+    }
+
+    face = Face()
+    face.kps = _ARCFACE_LANDMARKS_112.copy()
+    swapped = np.full((112, 112, 3), 128, dtype=np.uint8)
+
+    result = Refacer._apply_skin_texture(None, swapped, face, skin_texture)
+
+    assert result.shape == swapped.shape
+    delta = result.astype(np.int32) - swapped.astype(np.int32)
+    np.testing.assert_array_equal(delta[:, :, 0], delta[:, :, 1])
+    np.testing.assert_array_equal(delta[:, :, 1], delta[:, :, 2])
+    assert np.abs(delta).max() > 0
 
 
 def test_skin_texture_roundtrips_through_export_import(tmp_path):
