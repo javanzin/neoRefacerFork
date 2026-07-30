@@ -153,21 +153,39 @@ _ARCFACE_LANDMARKS_112 = np.array(
      [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32,
 )
 
-# Band-pass (DoG — diferença de dois Gaussian blurs) para isolar a banda de
-# frequência onde vivem rugas/olheiras/poros no crop 112x112:
-# - SIGMA_LOW = 1.0 descarta o que é MENOR que ~2px (grão de sensor, ruído de
-#   compressão JPEG da foto âncora) — era exatamente isso que um high-pass
-#   puro (versão anterior, sigma único de 3.0) deixava passar em amplitude
-#   total, dando aparência "dura"/granulada à textura transplantada.
-# - SIGMA_HIGH = 4.0 descarta o que é MAIOR que ~8px (tom de pele, gradiente
-#   de iluminação, sombra de volume), que deve continuar vindo do frame de
-#   destino.
-# Escala de referência: no template ArcFace 112x112 a distância interocular é
-# ~35px, então uma ruga (1-3px de espessura de linha) ou olheira (banda de
-# 4-8px sob o olho) cai na janela ~2-8px que esta banda [2*SIGMA_LOW,
-# 2*SIGMA_HIGH] preserva.
-_SKIN_TEXTURE_BANDPASS_SIGMA_LOW = 1.0
-_SKIN_TEXTURE_BANDPASS_SIGMA_HIGH = 4.0
+# Separação tom/textura via filtro BILATERAL (não DoG/banda de frequência —
+# ver histórico abaixo): o bilateral suaviza preservando bordas de alto
+# contraste (pondera vizinhos pela distância espacial E pela diferença de
+# valor — um vizinho muito diferente em brilho, como o centro de uma
+# olheira, pesa quase nada mesmo estando espacialmente perto), então a
+# "textura" (crop menos essa suavização) cai a zero rapidamente ao redor de
+# uma mancha isolada, sem os lóbulos de sinal invertido que um filtro linear
+# (Gaussian/DoG) produz.
+#
+# Histórico: a primeira versão usava DoG (blur(sigma=1.0) - blur(sigma=4.0))
+# para isolar a banda de frequência de rugas/olheiras (~2-8px no crop
+# 112x112). Funcionava para textura DIFUSA (grão fino repetido), mas uma
+# olheira/mancha de sombra é uma feature LOCALIZADA de alto contraste — e
+# QUALQUER filtro linear (Gaussian, DoG, unsharp mask) produz RINGING ao
+# redor desse tipo de feature: um halo de sinal de amplitude menor e SINAL
+# INVERTIDO se estendendo pela vizinhança (é uma propriedade matemática da
+# subtração de duas convoluções gaussianas, não um parâmetro ajustável).
+# Confirmado visualmente numa simulação sintética (olheira + rugas + bigode
+# chinês): apareciam anéis concêntricos ao redor de cada olheira que, somados
+# ao resultado, coincidiam com a borda da máscara elíptica e liam como "o
+# contorno do rosto está aparecendo" — era esse ringing, não vazamento da
+# máscara em si.
+#
+# BILATERAL_SIGMA_COLOR: diferença de brilho (0-255) a partir da qual um
+# vizinho passa a pesar pouco na suavização — 25 preserva bem o contraste de
+# uma olheira (sombra de ~20-30 níveis mais escura que a pele ao redor) sem
+# deixar a suavização "atravessar" a borda da mancha.
+# BILATERAL_SIGMA_SPACE: alcance espacial da suavização — 12px cobre a
+# escala de uma olheira/banda de sombra (~15-25px de largura no crop 112x112,
+# maior que a distância interocular/3) sem borrar rugas finas na direção
+# perpendicular a elas.
+_SKIN_TEXTURE_BILATERAL_SIGMA_COLOR = 25.0
+_SKIN_TEXTURE_BILATERAL_SIGMA_SPACE = 12.0
 
 # Largura (px, no crop 112x112) da rampa suave (smoothstep) nas bordas da
 # máscara de pele — tanto ao redor dos círculos de exclusão dos landmarks
@@ -191,11 +209,30 @@ _SKIN_TEXTURE_MASK_FEATHER_PX = 4.0
 # esq., boca dir.) — afasta a máscara de pele desses pontos, cuja textura
 # própria (cílios, sobrancelha, narinas, contorno labial) não é "pele" e
 # desalinharia visivelmente se transplantada para um rosto de destino com
-# proporções diferentes. Olhos usam raio maior (cobre sobrancelha/cílios
-# também); nariz/boca ficam mais justos para não comer bochecha/queixo útil
-# — com um raio único (testado: 20px) os 5 círculos se fundem no centro do
-# rosto e a máscara perde toda a região central de bochecha.
-_SKIN_TEXTURE_EXCLUSION_RADII = np.array([16.0, 16.0, 11.0, 12.0, 12.0], dtype=np.float32)
+# proporções diferentes. Nariz/boca ficam mais justos para não comer
+# bochecha/queixo útil — com um raio único (testado: 20px) os 5 círculos se
+# fundem no centro do rosto e a máscara perde toda a região central de
+# bochecha. Olhos NÃO usam raio circular — ver _SKIN_TEXTURE_EYE_EXCLUSION
+# abaixo, um círculo de 16px aqui cobria também a região de olheira
+# (confirmado visualmente: com raio circular a olheira ficava zerada pela
+# própria exclusão, antes mesmo de qualquer filtro de extração rodar —
+# reportado no teste real como "a olheira não aparece").
+_SKIN_TEXTURE_EXCLUSION_RADII = np.array([11.0, 12.0, 12.0], dtype=np.float32)  # nariz, boca esq., boca dir.
+
+# Exclusão dos olhos como ELIPSE achatada verticalmente (não círculo): olho +
+# sobrancelha + cílios formam uma faixa HORIZONTAL estreita (mais larga que
+# alta), enquanto uma olheira vive numa faixa própria ainda mais abaixo — um
+# círculo de raio grande o bastante para cobrir a sobrancelha (que fica ~10px
+# ACIMA do centro do olho) automaticamente também cobre a olheira (~7-10px
+# ABAIXO), porque o mesmo raio se aplica nas duas direções. A elipse separa
+# essas duas distâncias: eixo_x=16 (cobre bem a largura do olho + cantos),
+# eixo_y=9 (cobre cílio/sobrancelha imediatamente acima/abaixo, mas termina
+# antes da faixa de olheira). offset_y desloca o centro da exclusão ~3px
+# para cima do landmark do olho (que marca o centro do OLHO, não da
+# sobrancelha) — sem esse deslocamento a mesma elipse simétrica cobriria
+# menos sobrancelha do que olheira, quando o objetivo é o oposto.
+_SKIN_TEXTURE_EYE_EXCLUSION_AXES = np.array([16.0, 9.0], dtype=np.float32)
+_SKIN_TEXTURE_EYE_EXCLUSION_OFFSET_Y = -3.0
 
 
 def _smoothstep(t):
@@ -259,7 +296,16 @@ def _skin_region_mask(crop_size=112):
         ((xx - center[0]) / axes[0]) ** 2 + ((yy - center[1]) / axes[1]) ** 2
     ) <= 1.0
 
-    for (lx, ly), radius in zip(_ARCFACE_LANDMARKS_112, _SKIN_TEXTURE_EXCLUSION_RADII):
+    # Olhos: elipse achatada (ver _SKIN_TEXTURE_EYE_EXCLUSION_AXES/_OFFSET_Y)
+    # — os 2 primeiros landmarks de _ARCFACE_LANDMARKS_112.
+    eye_axes = _SKIN_TEXTURE_EYE_EXCLUSION_AXES
+    eye_offset_y = _SKIN_TEXTURE_EYE_EXCLUSION_OFFSET_Y
+    for lx, ly in _ARCFACE_LANDMARKS_112[:2]:
+        ellipse_dist_sq = ((xx - lx) / eye_axes[0]) ** 2 + ((yy - (ly + eye_offset_y)) / eye_axes[1]) ** 2
+        binary_mask &= ellipse_dist_sq > 1.0
+
+    # Nariz e boca (2 cantos): círculo, mesmo tratamento de sempre.
+    for (lx, ly), radius in zip(_ARCFACE_LANDMARKS_112[2:], _SKIN_TEXTURE_EXCLUSION_RADII):
         dist_sq = (xx - lx) ** 2 + (yy - ly) ** 2
         binary_mask &= dist_sq > radius ** 2
 
@@ -298,12 +344,11 @@ def _extract_skin_texture(frame_bgr, kps):
     somado igualmente aos 3 canais do destino (ver _apply_skin_texture), a
     crominância do destino fica intocada por construção.
 
-    Banda MÉDIA de frequência (não high-pass puro): rugas/olheiras/poros são
-    estruturas de ~2-8px no crop 112x112 — isoladas por DoG (blur sigma
-    _SKIN_TEXTURE_BANDPASS_SIGMA_LOW menos blur sigma ..._HIGH), que descarta
-    tanto o grão/ruído sub-2px (que dava aparência "dura" à textura) quanto o
-    tom/iluminação acima de ~8px (que deve vir do frame de destino, não da
-    âncora — ver ANCHOR_MAX_WEIGHT para o que o embedding não codifica).
+    Separação por filtro BILATERAL (não banda de frequência linear — ver
+    _SKIN_TEXTURE_BILATERAL_SIGMA_COLOR/_SPACE para o porquê): a "textura"
+    é o crop menos sua versão suavizada preservando bordas, o que isola
+    rugas/olheiras/poros sem o ringing que um filtro linear produziria ao
+    redor de uma mancha localizada de alto contraste (uma olheira).
 
     Retorna um dict {"texture": array float32 (112,112) — delta de LUMINÂNCIA
     já mascarado pela região de pele, "mask": _SKIN_REGION_MASK_112} —
@@ -312,9 +357,11 @@ def _extract_skin_texture(frame_bgr, kps):
     """
     aligned = face_align.norm_crop(frame_bgr, kps, image_size=112)
     gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    fine = cv2.GaussianBlur(gray, (0, 0), _SKIN_TEXTURE_BANDPASS_SIGMA_LOW)
-    coarse = cv2.GaussianBlur(gray, (0, 0), _SKIN_TEXTURE_BANDPASS_SIGMA_HIGH)
-    band = fine - coarse
+    diameter = int(_SKIN_TEXTURE_BILATERAL_SIGMA_SPACE * 3) | 1  # ímpar, exigido pelo bilateralFilter
+    smooth = cv2.bilateralFilter(
+        gray, diameter, _SKIN_TEXTURE_BILATERAL_SIGMA_COLOR, _SKIN_TEXTURE_BILATERAL_SIGMA_SPACE,
+    )
+    band = gray - smooth
     masked_texture = band * _SKIN_REGION_MASK_112
     return {"texture": masked_texture.astype(np.float32), "mask": _SKIN_REGION_MASK_112}
 

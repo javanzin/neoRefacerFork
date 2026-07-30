@@ -413,7 +413,7 @@ def test_skin_region_mask_has_smooth_feathered_edges():
     # rampa de valores intermediários ao redor de cada exclusão.
     from identity_profile import (
         _SKIN_REGION_MASK_112, _SKIN_TEXTURE_MASK_FEATHER_PX,
-        _ARCFACE_LANDMARKS_112, _SKIN_TEXTURE_EXCLUSION_RADII,
+        _ARCFACE_LANDMARKS_112, _SKIN_TEXTURE_EYE_EXCLUSION_AXES,
     )
 
     mask = _SKIN_REGION_MASK_112
@@ -422,18 +422,17 @@ def test_skin_region_mask_has_smooth_feathered_edges():
     fractional = ((mask > 0.0) & (mask < 1.0)).mean()
     assert fractional > 0.05
 
-    # Rampa radial saindo do olho esquerdo para a esquerda (longe das outras
-    # exclusões e da borda da elipse, para isolar só essa rampa): zero
-    # estrito bem dentro do raio (o blur sobre máscara binária ainda garante
-    # isso perto do centro do landmark — só a VIZINHANÇA da borda do raio
-    # ganha uma rampa, não o raio como um todo: ver docstring de
-    # _skin_region_mask sobre por que uma margem extra no raio antes do blur
-    # foi tentada e descartada — sufocava quase toda a cobertura de
-    # bochecha/testa e criava uma ilha isolada de "pele" sem conexão com o
-    # resto da face, inspecionado visualmente), subindo a valores altos ao
-    # se afastar do centro do landmark, decrescente na direção certa.
+    # Rampa radial saindo do olho esquerdo para a esquerda, ao longo do EIXO
+    # X da elipse de exclusão (mesma linha do centro do landmark, sem offset
+    # vertical — longe das outras exclusões e da borda externa, para isolar
+    # só essa rampa): zero estrito bem dentro do raio (o blur sobre máscara
+    # binária ainda garante isso perto do centro do landmark — só a
+    # VIZINHANÇA da borda ganha uma rampa, não a região toda: ver docstring
+    # de _skin_region_mask sobre por que uma margem extra antes do blur foi
+    # tentada e descartada), subindo a valores altos ao se afastar do centro
+    # do landmark, decrescente na direção certa.
     lx, ly = _ARCFACE_LANDMARKS_112[0]
-    radius = _SKIN_TEXTURE_EXCLUSION_RADII[0]
+    radius = _SKIN_TEXTURE_EYE_EXCLUSION_AXES[0]  # eixo X da elipse do olho
     row = int(round(ly))
     feather = _SKIN_TEXTURE_MASK_FEATHER_PX
 
