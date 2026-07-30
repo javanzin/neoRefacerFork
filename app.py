@@ -669,6 +669,7 @@ from identity_profile import (
     imported_profile_known_hashes,
     merge_imported_profile,
     merge_profiles,
+    _apply_anchor,
     _build_profile_from_samples,
     ANCHOR_MAX_WEIGHT,
     apply_anchor_to_profile,
@@ -803,7 +804,7 @@ def _format_extraction_status(profiles):
         status_lines.extend(f"  - {d['source']}: {d['reason']}" for d in profiles[0]["discarded"])
     return "\n".join(status_lines)
 
-def extract_identity_profile(source_files, folder_files, balance_by_origin=False, progress=gr.Progress()):
+def extract_identity_profile(source_files, folder_files, balance_by_origin=False, weight_by_sharpness=False, progress=gr.Progress()):
     """Builds one reusable identity profile (Face + centroid embedding) per
     person detected in the uploaded images/videos (greedy clustering by
     cosine similarity — see identity_profile.cluster_samples). Video mode
@@ -817,8 +818,8 @@ def extract_identity_profile(source_files, folder_files, balance_by_origin=False
     file_count="directory") — the browser's directory picker already walks
     subfolders recursively, so this is every file found anywhere under the
     chosen folder, not just its top level.
-    balance_by_origin: opt-in (checkbox), default off — see
-    identity_profile._build_profile_from_samples for what changes.
+    balance_by_origin e weight_by_sharpness: opt-in (checkboxes), default off
+    — see identity_profile._build_profile_from_samples for what changes.
     """
     all_files = list(source_files or []) + list(folder_files or [])
     if not all_files:
@@ -834,7 +835,7 @@ def extract_identity_profile(source_files, folder_files, balance_by_origin=False
         reasons = "; ".join(f"{d['source']}: {d['reason']}" for d in builder.discarded) or "motivo desconhecido"
         raise gr.Error(f"Nenhuma amostra de rosto válida foi extraída. Descartes: {reasons}")
 
-    profiles = builder.build_profiles(balance_by_origin=balance_by_origin)
+    profiles = builder.build_profiles(balance_by_origin=balance_by_origin, weight_by_sharpness=weight_by_sharpness)
     for profile in profiles:
         # Cópia própria por perfil — o dict origin_hashes é reconstruído a
         # cada extração e nada hoje muta profile["origin_hashes"] in-place,
@@ -929,6 +930,22 @@ def merge_selected_profiles(profiles, name_a, name_b, balance_by_origin=False):
     except ValueError as e:
         raise gr.Error(str(e))
     merged["origin_hashes"] = {**profile_a.get("origin_hashes", {}), **profile_b.get("origin_hashes", {})}
+
+    # Reaplica a âncora (se algum dos dois perfis tinha uma) direto sobre o
+    # centroide mesclado via _apply_anchor, em vez de apply_anchor_to_profile:
+    # este último reconstruiria o centroide com supressão de outlier
+    # (_compute_centroid), mudando silenciosamente a semântica deliberada do
+    # merge (média simples, ver docstring de merge_profiles). Com âncoras nos
+    # dois perfis, vale a do perfil A — é o nome/perfil que sobrevive ao merge.
+    anchor_source = next((p for p in (profile_a, profile_b) if p.get("anchor_sample") is not None), None)
+    if anchor_source is not None:
+        anchor_weight = anchor_source.get("anchor_weight", ANCHOR_MAX_WEIGHT)
+        merged["face"].embedding = _apply_anchor(
+            merged["face"].embedding, anchor_source["anchor_sample"]["embedding"], anchor_weight,
+        )
+        merged["anchor_sample"] = anchor_source["anchor_sample"]
+        merged["anchor_weight"] = anchor_weight
+
     remaining = [p for p in profiles if p["name"] not in (name_a, name_b)]
     new_profiles = remaining + [merged]
 
@@ -937,6 +954,8 @@ def merge_selected_profiles(profiles, name_a, name_b, balance_by_origin=False):
         f"{name_a} e {name_b} mesclados em {merged['name']} "
         f"({n} amostra{_pluralize_count(n)} combinada{_pluralize_count(n)})."
     )
+    if anchor_source is not None:
+        status += " Âncora reaplicada sobre o centroide mesclado."
     choices = [p["name"] for p in new_profiles]
     return (
         status,
@@ -983,7 +1002,7 @@ def export_selected_profile(profiles, selected_name):
     export_profile(profile, export_path, content_hashes=profile.get("origin_hashes"))
     return gr.update(value=export_path, visible=True)
 
-def find_profile_in_more_material(profiles, selected_name, source_files, folder_files, balance_by_origin=False, progress=gr.Progress()):
+def find_profile_in_more_material(profiles, selected_name, source_files, folder_files, balance_by_origin=False, weight_by_sharpness=False, progress=gr.Progress()):
     """Busca dirigida: procura apenas a pessoa do perfil já selecionado em
     material novo (que pode ter várias pessoas), em vez de reextrair tudo e
     separar por clustering de novo — muito mais barato quando você já sabe
@@ -1035,11 +1054,21 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
         raise gr.Error(f"Nenhuma correspondência encontrada para \"{selected_name}\". Descartes: {reasons}")
 
     combined_samples = profile["samples"] + new_matches
+    # anchor_sample=None (perfil sem âncora) mantém o caminho idêntico ao de
+    # antes; com âncora ativa, reaplica-a sobre o centroide recalculado em vez
+    # de descartá-la silenciosamente (o status da âncora continuaria dizendo
+    # "ativa" sem ser verdade).
     updated_profile = _build_profile_from_samples(
         combined_samples, name=profile["name"], discarded=profile["discarded"] + builder.discarded,
         balance_by_origin=balance_by_origin,
+        weight_by_sharpness=weight_by_sharpness,
+        anchor_sample=profile.get("anchor_sample"),
+        anchor_weight=profile.get("anchor_weight", ANCHOR_MAX_WEIGHT),
     )
     updated_profile["origin_hashes"] = {**profile.get("origin_hashes", {}), **new_origin_hashes}
+    if profile.get("anchor_sample") is not None:
+        updated_profile["anchor_sample"] = profile["anchor_sample"]
+        updated_profile["anchor_weight"] = profile.get("anchor_weight", ANCHOR_MAX_WEIGHT)
     new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
 
     n_new = len(new_matches)
@@ -1048,6 +1077,8 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
         f"\"{selected_name}\" encontrada{_pluralize_count(n_new)} e adicionada{_pluralize_count(n_new)} ao perfil "
         f"({updated_profile['n_samples']} amostra{_pluralize_count(updated_profile['n_samples'])} no total)."
     )
+    if updated_profile.get("anchor_sample") is not None:
+        status += " Âncora reaplicada sobre o centroide atualizado."
     choices = [p["name"] for p in new_profiles]
     return (
         status,
@@ -1307,7 +1338,7 @@ def confirm_candidate_profile(candidate_profile):
     export_profile(candidate_profile, export_path, content_hashes=candidate_profile.get("origin_hashes"))
     return gr.update(value=export_path, visible=True)
 
-def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_weight, balance_by_origin=False):
+def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_weight, balance_by_origin=False, weight_by_sharpness=False):
     """Aplica (ou remove, se anchor_image_file estiver vazio) uma foto âncora
     manual sobre o perfil ativo — upload separado e opcional, processado
     pelos mesmos filtros de qualidade do resto do pipeline (ver
@@ -1322,7 +1353,9 @@ def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_wei
     if not path or not os.path.exists(path):
         # Nenhuma imagem enviada: remove a âncora, se houver, restaurando o
         # centroide base (balanceado ou não, conforme o checkbox).
-        updated_profile = apply_anchor_to_profile(profile, anchor_sample=None, balance_by_origin=balance_by_origin)
+        updated_profile = apply_anchor_to_profile(
+            profile, anchor_sample=None, balance_by_origin=balance_by_origin, weight_by_sharpness=weight_by_sharpness,
+        )
         updated_profile["origin_hashes"] = profile.get("origin_hashes", {})
         new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
         return "Âncora removida. Perfil restaurado ao centroide base.", new_profiles
@@ -1338,10 +1371,29 @@ def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_wei
 
     updated_profile = apply_anchor_to_profile(
         profile, anchor_sample=anchor_sample, anchor_weight=anchor_weight, balance_by_origin=balance_by_origin,
+        weight_by_sharpness=weight_by_sharpness,
     )
     updated_profile["origin_hashes"] = profile.get("origin_hashes", {})
+    # Guarda a âncora no próprio perfil para que recálculos posteriores
+    # (busca dirigida, merge) possam reaplicá-la em vez de descartá-la
+    # silenciosamente enquanto o status ainda diz "Âncora ativa".
+    updated_profile["anchor_sample"] = anchor_sample
+    updated_profile["anchor_weight"] = float(anchor_weight)
     new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
-    status = f"Âncora ativa ({os.path.basename(path)}), influência {anchor_weight:.0%} (teto {ANCHOR_MAX_WEIGHT:.0%})."
+
+    # Deslocamento efetivo: compara o centroide ancorado com o mesmo perfil
+    # recalculado sem âncora — é o que diz se a âncora teve efeito real
+    # (âncora muito parecida com o perfil desloca quase nada, e o usuário
+    # descobriria isso só no resultado visual).
+    base_profile = apply_anchor_to_profile(
+        profile, anchor_sample=None, balance_by_origin=balance_by_origin, weight_by_sharpness=weight_by_sharpness,
+    )
+    similarity = float(np.clip(np.dot(base_profile["face"].embedding, updated_profile["face"].embedding), -1.0, 1.0))
+    angle_degrees = float(np.degrees(np.arccos(similarity)))
+    status = (
+        f"Âncora ativa ({os.path.basename(path)}), influência {anchor_weight:.0%} (teto {ANCHOR_MAX_WEIGHT:.0%}) — "
+        f"desloca o centroide em {angle_degrees:.1f}° (similaridade {similarity:.3f} com o perfil sem âncora)."
+    )
     return status, new_profiles
 
 def _reset_profile_dropdown(profiles):
@@ -1573,6 +1625,18 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
                 "compare os dois resultados antes de confiar."
             ),
         )
+        identity_weight_by_sharpness = gr.Checkbox(
+            label="Ponderar amostras por nitidez (favorece traços e marcas de expressão)",
+            value=False,
+            info=(
+                "Opcional, desligado por padrão. Sem isso, toda amostra aprovada pesa igual — fotos "
+                "moles (que passaram no filtro mínimo de nitidez) diluem os traços finos do rosto. "
+                "Ligado: amostras mais nítidas pesam mais no centroide, favorecendo a versão do "
+                "rosto onde olheiras, pés de galinha e sulcos estão visíveis no crop. Com o "
+                "balanceamento por origem ligado, a ponderação vale dentro de cada arquivo (não "
+                "muda o equilíbrio entre arquivos). Compare os dois resultados antes de confiar."
+            ),
+        )
         with gr.Accordion("Arquivos enviados", open=True) as identity_files_accordion:
             with gr.Row():
                 identity_images = gr.File(
@@ -1743,7 +1807,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
 
         identity_extract_btn.click(
             fn=extract_identity_profile,
-            inputs=[identity_images, identity_folder, identity_balance_by_origin],
+            inputs=[identity_images, identity_folder, identity_balance_by_origin, identity_weight_by_sharpness],
             outputs=[
                 identity_status,
                 identity_gallery,
@@ -1756,6 +1820,14 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             fn=lambda: gr.update(open=False),
             inputs=None,
             outputs=[identity_files_accordion],
+        ).then(
+            # Extração cria perfis novos, sempre SEM âncora — sem isso o status
+            # continuaria exibindo "Âncora ativa" da extração anterior. Só limpa
+            # o texto (não o campo da foto): mexer no gr.Image dispararia seu
+            # .change → apply_identity_anchor, um recálculo colateral indesejado.
+            fn=lambda: "",
+            inputs=None,
+            outputs=[identity_anchor_status],
         )
 
         identity_export_btn.click(
@@ -1768,7 +1840,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             fn=find_profile_in_more_material,
             inputs=[
                 identity_profile_state, identity_selected_profile, identity_search_files, identity_search_folder,
-                identity_balance_by_origin,
+                identity_balance_by_origin, identity_weight_by_sharpness,
             ],
             outputs=[
                 identity_status,
@@ -1863,7 +1935,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             fn=apply_identity_anchor,
             inputs=[
                 identity_profile_state, identity_selected_profile, identity_anchor_image,
-                identity_anchor_weight, identity_balance_by_origin,
+                identity_anchor_weight, identity_balance_by_origin, identity_weight_by_sharpness,
             ],
             outputs=[identity_anchor_status, identity_profile_state],
         )
@@ -1872,7 +1944,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             fn=apply_identity_anchor,
             inputs=[
                 identity_profile_state, identity_selected_profile, identity_anchor_image,
-                identity_anchor_weight, identity_balance_by_origin,
+                identity_anchor_weight, identity_balance_by_origin, identity_weight_by_sharpness,
             ],
             outputs=[identity_anchor_status, identity_profile_state],
         )

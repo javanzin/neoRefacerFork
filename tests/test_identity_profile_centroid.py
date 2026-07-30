@@ -312,3 +312,85 @@ def test_unset_anchor_restores_balanced_centroid():
 
     assert not np.allclose(anchored["face"].embedding, original_embedding)
     assert np.allclose(unset["face"].embedding, original_embedding)
+
+
+# --- Ponderação por nitidez (weight_by_sharpness, opcional) ---
+
+def test_sharpness_weighting_off_is_bitwise_identical():
+    # Default desligado: caminho idêntico ao de antes da opção existir,
+    # mesmo com o campo "sharpness" presente nas amostras.
+    rng = np.random.default_rng(10)
+    base = np.array([1.0, 0.0, 0.0])
+    samples = [_full_sample(base + rng.normal(scale=0.05, size=3)) for _ in range(6)]
+    for i, s in enumerate(samples):
+        s["sharpness"] = 100.0 + 50.0 * i
+
+    with_field = _build_profile_from_samples(samples, "Pessoa 1")
+    without_flag = _build_profile_from_samples(samples, "Pessoa 1", weight_by_sharpness=False)
+    assert np.array_equal(with_field["face"].embedding, without_flag["face"].embedding)
+
+
+def test_sharpness_weighting_pulls_centroid_toward_sharper_samples():
+    # Duas "versões" da mesma pessoa: metade das amostras perto de [1,0,0]
+    # (moles) e metade perto da diagonal (nítidas). Com ponderação ligada, o
+    # centroide fica mais parecido com a direção das amostras nítidas.
+    rng = np.random.default_rng(11)
+    soft_dir = np.array([1.0, 0.0, 0.0])
+    sharp_dir = np.array([1.0, 0.6, 0.0])
+    samples = []
+    for _ in range(5):
+        s = _sample(soft_dir + rng.normal(scale=0.02, size=3))
+        s["sharpness"] = 60.0  # pouco acima do piso de aceitação
+        samples.append(s)
+    for _ in range(5):
+        s = _sample(sharp_dir + rng.normal(scale=0.02, size=3))
+        s["sharpness"] = 1500.0
+        samples.append(s)
+
+    from identity_profile import _sharpness_weights
+
+    plain = _compute_centroid(samples)
+    weighted = _compute_centroid(samples, base_weights=_sharpness_weights(samples))
+
+    sharp_unit = sharp_dir / np.linalg.norm(sharp_dir)
+    assert float(weighted @ sharp_unit) > float(plain @ sharp_unit)
+
+
+def test_sharpness_weighting_without_sharpness_field_equals_plain():
+    # Amostras legadas (sem "sharpness"): pesos todos 1 → mesmo resultado da
+    # média de sempre, nunca quebra.
+    rng = np.random.default_rng(12)
+    base = np.array([1.0, 0.0, 0.0])
+    samples = [_sample(base + rng.normal(scale=0.05, size=3)) for _ in range(6)]
+
+    from identity_profile import _sharpness_weights
+
+    weights = _sharpness_weights(samples)
+    assert np.allclose(weights, np.ones(len(samples)))
+    assert np.allclose(_compute_centroid(samples, base_weights=weights), _compute_centroid(samples))
+
+
+def test_sharpness_weighting_respects_origin_balance():
+    # Com balance_by_origin, a nitidez pondera DENTRO de cada origem; entre
+    # origens o peso segue 1 pseudo-sample cada. Uma origem inteira de fotos
+    # ultranítidas não pode passar a dominar a outra origem por causa disso.
+    rng = np.random.default_rng(13)
+    dir_a = np.array([1.0, 0.0, 0.0])
+    dir_b = np.array([0.0, 1.0, 0.0])
+    samples = []
+    for _ in range(4):
+        s = _sample(dir_a + rng.normal(scale=0.01, size=3), origin="a.mp4")
+        s["sharpness"] = 5000.0
+        samples.append(s)
+    for _ in range(4):
+        s = _sample(dir_b + rng.normal(scale=0.01, size=3), origin="b.jpg")
+        s["sharpness"] = 60.0
+        samples.append(s)
+
+    balanced = _compute_balanced_centroid(samples, weight_by_sharpness=True)
+    # Origens homogêneas internamente: a ponderação intra-origem quase não
+    # muda cada centroide local, então o resultado deve seguir ~equilibrado
+    # entre as duas direções (não dominado pela origem ultranítida).
+    sim_a = float(balanced @ dir_a)
+    sim_b = float(balanced @ dir_b)
+    assert abs(sim_a - sim_b) < 0.05

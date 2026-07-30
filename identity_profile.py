@@ -151,28 +151,66 @@ def _is_near_duplicate(frame_bgr, last_accepted_downscaled):
     return diff.mean() < NEAR_DUPLICATE_MEAN_DIFF_THRESHOLD
 
 
-def _simple_mean_centroid(samples):
+def _sharpness_weights(samples):
+    """Pesos relativos por nitidez para a ponderação opcional do centroide
+    (weight_by_sharpness): amostras mais nítidas carregam mais detalhe
+    estrutural do rosto (traços, marcas de expressão) no crop que gerou o
+    embedding, então pesam mais na média; amostras moles que passaram no
+    filtro de entrada diluem menos.
+
+    - sqrt comprime a faixa dinâmica: a variância do Laplaciano varia ordens
+      de magnitude entre fotos, e usar o valor cru deixaria uma única foto
+      ultranítida dominar o centroide (o oposto do objetivo de ter várias
+      referências).
+    - Amostra sem o campo "sharpness" (legada, anterior a este campo, ou
+      pseudo-sample de origem) recebe a mediana das que têm — neutra, nunca
+      quebra nem zera ninguém.
+    - Sem nenhuma nitidez conhecida, todos os pesos são 1 (idêntico à média
+      simples).
+    """
+    values = np.array([float(s.get("sharpness") or 0.0) for s in samples])
+    known = values > 0
+    if not np.any(known):
+        return np.ones(len(samples))
+    values[~known] = np.median(values[known])
+    weights = np.sqrt(values)
+    return weights / weights.mean()
+
+
+def _simple_mean_centroid(samples, weights=None):
     """Média de embeddings individualmente L2-normalizados, renormalizada no
     final — usada como ponto de partida do centroide robusto e diretamente
     por quem precisa da decisão "essa amostra é da mesma pessoa?" sem
     suprimir nenhuma amostra (cluster_samples() e merge_profiles()).
+
+    weights (opcional): pesos relativos por amostra (ex. _sharpness_weights).
+    None (default) mantém a média simples de sempre, bit-a-bit.
     """
     embeddings = np.stack([s["embedding"] for s in samples])
     norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
     norms[norms == 0] = 1.0
     normalized = embeddings / norms
 
-    centroid = normalized.mean(axis=0)
+    if weights is None:
+        centroid = normalized.mean(axis=0)
+    else:
+        weights = np.asarray(weights, dtype=np.float64)
+        centroid = (normalized * weights[:, np.newaxis]).sum(axis=0) / weights.sum()
     centroid_norm = np.linalg.norm(centroid)
     return centroid / centroid_norm if centroid_norm > 0 else centroid
 
 
-def _compute_centroid(samples, iterations=ROBUST_CENTROID_ITERATIONS):
+def _compute_centroid(samples, iterations=ROBUST_CENTROID_ITERATIONS, base_weights=None):
     """Centroide robusto: parte da média simples dos embeddings (L2-normalizados
     individualmente) e refina por `iterations` passos, reponderando cada
     amostra por max(0, similaridade_de_cosseno_ao_centroide - piso). Amostras
     mais parecidas com o grupo pesam mais; outliers (ver
     ROBUST_CENTROID_SIMILARITY_FLOOR) pesam ~0 sem ser removidos da lista.
+
+    base_weights (opcional): pesos relativos por amostra (ex.
+    _sharpness_weights) multiplicados ao peso de similaridade em cada
+    iteração (e usados na média inicial e no atalho de poucas amostras).
+    None (default) mantém o comportamento de sempre, bit-a-bit.
 
     Usada para o perfil final (build_profile/build_profiles) — não para a
     decisão de clustering nem para merge_profiles(), que usam a média simples
@@ -184,17 +222,22 @@ def _compute_centroid(samples, iterations=ROBUST_CENTROID_ITERATIONS):
     norms[norms == 0] = 1.0
     normalized = embeddings / norms
 
-    centroid = _simple_mean_centroid(samples)
+    if base_weights is not None:
+        base_weights = np.asarray(base_weights, dtype=np.float64)
+
+    centroid = _simple_mean_centroid(samples, weights=base_weights)
 
     if len(samples) <= 3:
         # Com poucas amostras, "outlier" vira decisão por maioria simples
         # (ex.: 2x1) sem base estatística real para distinguir ruído de
-        # variação legítima — mantém a média simples de sempre.
+        # variação legítima — mantém a média (simples ou ponderada) de sempre.
         return centroid
 
     for _ in range(iterations):
         similarities = normalized @ centroid
         weights = np.clip(similarities - ROBUST_CENTROID_SIMILARITY_FLOOR, 0.0, None)
+        if base_weights is not None:
+            weights = weights * base_weights
 
         if not np.any(weights > 0):
             # Todas as amostras ficaram abaixo do piso (grupo muito
@@ -227,15 +270,26 @@ def _group_samples_by_origin(samples):
     return groups
 
 
-def _origin_centroids_as_pseudo_samples(samples):
+def _origin_centroids_as_pseudo_samples(samples, weight_by_sharpness=False):
     """Um "pseudo-sample" (dict só com `embedding`) por origem distinta,
     cada um sendo o centroide simples (sem supressão de outlier) daquela
     origem — reaproveita _simple_mean_centroid em vez de duplicar a lógica de
     normalização. Alimentar isso de volta em _compute_centroid faz a
     supressão de outlier operar sobre origens, não sobre frames individuais.
+
+    weight_by_sharpness (default False): pondera as amostras DENTRO de cada
+    origem pela nitidez (ver _sharpness_weights). Entre origens o peso segue
+    igual (1 pseudo-sample cada) — a ponderação por nitidez não deve desfazer
+    o balanceamento por origem.
     """
     groups = _group_samples_by_origin(samples)
-    return [{"embedding": _simple_mean_centroid(group_samples)} for group_samples in groups.values()]
+    return [
+        {"embedding": _simple_mean_centroid(
+            group_samples,
+            weights=_sharpness_weights(group_samples) if weight_by_sharpness else None,
+        )}
+        for group_samples in groups.values()
+    ]
 
 
 def _origin_summaries(samples, content_hashes=None):
@@ -266,7 +320,7 @@ def _origin_summaries(samples, content_hashes=None):
     ]
 
 
-def _compute_balanced_centroid(samples):
+def _compute_balanced_centroid(samples, weight_by_sharpness=False):
     """Centroide robusto (mesma supressão de outlier de _compute_centroid),
     mas operando sobre um centroide por origem em vez das amostras cruas —
     um vídeo de centenas de frames vira 1 pseudo-sample, equalizando sua
@@ -282,8 +336,11 @@ def _compute_balanced_centroid(samples):
     mudaria o resultado de qualquer forma (toda amostra teria peso 1), então
     a única diferença observável é de arredondamento de ponto flutuante
     (ver test_single_origin_matches_current_behavior), não de direção.
+
+    weight_by_sharpness: ver _origin_centroids_as_pseudo_samples — pondera
+    por nitidez dentro de cada origem, mantendo o peso igual entre origens.
     """
-    return _compute_centroid(_origin_centroids_as_pseudo_samples(samples))
+    return _compute_centroid(_origin_centroids_as_pseudo_samples(samples, weight_by_sharpness=weight_by_sharpness))
 
 
 def _compute_balanced_mean(samples):
@@ -320,6 +377,7 @@ def _build_profile_from_samples(
     balance_by_origin=False,
     anchor_sample=None,
     anchor_weight=ANCHOR_MAX_WEIGHT,
+    weight_by_sharpness=False,
 ):
     """Núcleo puro (sem estado de instância) de build_profile/build_profiles:
     agrega uma lista de amostras num único perfil. Recebe `samples` e
@@ -340,11 +398,23 @@ def _build_profile_from_samples(
     build_anchor_sample), aplicada como uma etapa SEPARADA depois do
     centroide (balanceado ou não) já calculado. Com None (default), não tem
     nenhum efeito — nem o cálculo de _apply_anchor roda.
+
+    weight_by_sharpness (default False, caminho idêntico ao de antes): pondera
+    as amostras pela nitidez do crop (ver _sharpness_weights) — amostras mais
+    nítidas, que preservam traços e marcas de expressão no crop de onde saiu
+    o embedding, pesam mais no centroide. Com balance_by_origin, a ponderação
+    acontece dentro de cada origem (não entre origens).
     """
     if not samples:
         raise ValueError("Nenhuma amostra válida para construir o perfil de identidade.")
 
-    centroid = _compute_balanced_centroid(samples) if balance_by_origin else _compute_centroid(samples)
+    if balance_by_origin:
+        centroid = _compute_balanced_centroid(samples, weight_by_sharpness=weight_by_sharpness)
+    else:
+        centroid = _compute_centroid(
+            samples,
+            base_weights=_sharpness_weights(samples) if weight_by_sharpness else None,
+        )
     if anchor_sample is not None:
         centroid = _apply_anchor(centroid, anchor_sample["embedding"], anchor_weight)
 
@@ -492,6 +562,10 @@ class IdentityProfileBuilder:
             "thumbnail": aligned,
             "source": source_label,
             "origin": origin,
+            # Nitidez do crop (variância do Laplaciano, a mesma já usada no
+            # filtro acima) — guardada para a ponderação opcional por nitidez
+            # do centroide (ver _sharpness_weights), não só passa/não-passa.
+            "sharpness": sharpness,
         }
         self.samples.append(sample)
         return sample
@@ -633,10 +707,11 @@ class IdentityProfileBuilder:
         )
         return matches
 
-    def build_profile(self, name="Pessoa 1", balance_by_origin=False, anchor_sample=None, anchor_weight=ANCHOR_MAX_WEIGHT):
+    def build_profile(self, name="Pessoa 1", balance_by_origin=False, anchor_sample=None, anchor_weight=ANCHOR_MAX_WEIGHT, weight_by_sharpness=False):
         return _build_profile_from_samples(
             self.samples, name, self.discarded,
             balance_by_origin=balance_by_origin, anchor_sample=anchor_sample, anchor_weight=anchor_weight,
+            weight_by_sharpness=weight_by_sharpness,
         )
 
     def cluster_samples(self, threshold=CLUSTER_SIMILARITY_THRESHOLD):
@@ -697,22 +772,27 @@ class IdentityProfileBuilder:
 
         return [c["samples"] for c in clusters]
 
-    def build_profiles(self, threshold=CLUSTER_SIMILARITY_THRESHOLD, balance_by_origin=False):
+    def build_profiles(self, threshold=CLUSTER_SIMILARITY_THRESHOLD, balance_by_origin=False, weight_by_sharpness=False):
         """Separa as amostras em clusters por pessoa e constrói um perfil
         (centroide + Face sintético) por cluster, nomeados "Pessoa 1",
         "Pessoa 2"... na ordem de criação dos clusters.
 
-        balance_by_origin (default False): repassado a _build_profile_from_samples
-        — ver docstring lá para o que muda. Âncora não se aplica aqui: ela é
-        escolhida pelo usuário depois de já ver os perfis extraídos (ver
-        apply_anchor_to_profile).
+        balance_by_origin e weight_by_sharpness (default False): repassados a
+        _build_profile_from_samples — ver docstring lá para o que muda. Âncora
+        não se aplica aqui: ela é escolhida pelo usuário depois de já ver os
+        perfis extraídos (ver apply_anchor_to_profile). A ponderação por
+        nitidez também não afeta o clustering (cluster_samples segue média
+        simples: a pergunta lá é pertencimento, não representatividade).
         """
         if not self.samples:
             raise ValueError("Nenhuma amostra válida para construir perfis de identidade.")
 
         groups = self.cluster_samples(threshold=threshold)
         profiles = [
-            _build_profile_from_samples(group, name=f"Pessoa {i + 1}", balance_by_origin=balance_by_origin)
+            _build_profile_from_samples(
+                group, name=f"Pessoa {i + 1}",
+                balance_by_origin=balance_by_origin, weight_by_sharpness=weight_by_sharpness,
+            )
             for i, group in enumerate(groups)
         ]
 
@@ -801,15 +881,16 @@ def build_anchor_sample(detector, recognizer, frame_bgr, source_label):
     return anchor_sample, builder.discarded
 
 
-def apply_anchor_to_profile(profile, anchor_sample=None, anchor_weight=ANCHOR_MAX_WEIGHT, balance_by_origin=False):
+def apply_anchor_to_profile(profile, anchor_sample=None, anchor_weight=ANCHOR_MAX_WEIGHT, balance_by_origin=False, weight_by_sharpness=False):
     """Reaplica (ou remove, com anchor_sample=None) a foto âncora sobre um
     perfil já construído, recalculando a partir de profile["samples"] em vez
     de acumular — chamar duas vezes seguidas com âncoras diferentes não
     duplica amostras nem cresce n_samples.
 
-    balance_by_origin deve refletir a mesma opção usada para construir o
-    perfil originalmente (ver _build_profile_from_samples), para que reaplicar
-    a âncora não mude silenciosamente essa outra escolha.
+    balance_by_origin e weight_by_sharpness devem refletir as mesmas opções
+    usadas para construir o perfil originalmente (ver
+    _build_profile_from_samples), para que reaplicar a âncora não mude
+    silenciosamente essas outras escolhas.
 
     Requer profile["samples"] — perfis importados de .npz não os têm (mesma
     limitação de merge_profiles), então não podem receber uma âncora.
@@ -827,6 +908,7 @@ def apply_anchor_to_profile(profile, anchor_sample=None, anchor_weight=ANCHOR_MA
         balance_by_origin=balance_by_origin,
         anchor_sample=anchor_sample,
         anchor_weight=anchor_weight,
+        weight_by_sharpness=weight_by_sharpness,
     )
 
 
