@@ -213,35 +213,59 @@ def _skin_region_mask(crop_size=112):
     excluindo um raio ao redor de cada landmark (olhos, nariz, boca) e a
     borda externa do rosto (fundo/cabelo/orelha, que não é pele facial).
 
-    As bordas NÃO são binárias: cada exclusão de landmark é 0 dentro do raio
-    e sobe em rampa smoothstep de _SKIN_TEXTURE_MASK_FEATHER_PX de largura
-    logo após o raio; a elipse externa desce na mesma largura de rampa antes
-    da borda. Uma máscara binária produzia um contorno circular visível no
-    resultado (transição de 1px entre "textura completa" e "nenhuma").
+    Gerada como máscara BINÁRIA (elipse + 5 círculos de exclusão) e suavizada
+    por um Gaussian blur — mesma técnica já usada nas outras máscaras do
+    projeto (ver refacer.py:_rect_cutoff_mask/_mouth_chin_rect_mask, rampa
+    smoothstep sobre uma faixa de transição fixa em px) e no blending padrão
+    de paste_back de qualquer face-swap. Uma tentativa anterior calculava a
+    rampa analiticamente a partir da distância euclidiana até o contorno de
+    uma elipse — matematicamente correta em teoria, mas a aproximação de
+    gradiente usada para converter "distância normalizada" em "px reais"
+    tinha erro sistemático dependente do ângulo (rampa real variando entre
+    2.5px e 3.5px em vez dos 4px pretendidos), visível como um "anel" mais
+    marcado em certas direções no resultado real. Blur gaussiano sobre uma
+    máscara binária não tem esse problema: a largura da rampa em px reais é
+    sempre ~3×sigma em qualquer direção, por construção — é uma convolução,
+    não uma fórmula geométrica por caso.
 
     Fixa porque o template de alinhamento é fixo (ver _ARCFACE_LANDMARKS_112)
     — calculada uma vez e cacheada (ver _extract_skin_texture).
     """
     yy, xx = np.mgrid[0:crop_size, 0:crop_size].astype(np.float32)
-    feather = _SKIN_TEXTURE_MASK_FEATHER_PX
 
-    # Elipse frouxa cobrindo a região facial central (exclui os cantos do
-    # crop 112x112, que no template ArcFace já são fundo/cabelo/orelha).
-    # A distância elíptica normalizada (1.0 = borda) é convertida para ~px
-    # multiplicando pelo eixo médio, para a rampa da elipse ter a mesma
-    # largura física das rampas circulares dos landmarks.
+    # sigma = feather/4: medido empiricamente sobre um degrau 1D (não os
+    # "3 sigma" de regra de bolso, que davam ~6.7px de rampa em vez dos 4px
+    # pretendidos) — com sigma=1.0 um Gaussian blur produz uma rampa de
+    # exatamente 4px entre os pontos em que a máscara cruza 0.01 e 0.99, em
+    # qualquer direção (é uma convolução simétrica, não depende da
+    # curvatura local do contorno como a tentativa analítica anterior).
+    sigma = _SKIN_TEXTURE_MASK_FEATHER_PX / 4.0
+
+    # Sem margem extra no raio de exclusão antes do blur: uma primeira
+    # tentativa desta correção usou raio + 1.5*feather para garantir zero
+    # estrito bem além do landmark — mas com os raios já grandes (11-16px)
+    # isso empurrava as 5 rampas de exclusão a se sobreporem entre si E com
+    # a rampa da borda externa da elipse, sufocando quase toda a área de
+    # bochecha/testa (cobertura >0.99 caiu de ~25% para ~12%) e criando uma
+    # ilha isolada e minúscula de "pele" perto do canto externo do olho, sem
+    # conexão com o resto da face — inspecionado visualmente, não só por
+    # número. O valor NO PONTO EXATO do landmark já é 0.0 com o raio nominal
+    # (confirmado: os raios de 11-16px já são grandes o bastante), então a
+    # margem extra não era necessária para a garantia que importa — só
+    # empobrecia a cobertura útil.
     center = np.array([56.0, 60.0])
     axes = np.array([46.0, 52.0])
-    ellipse_dist = np.sqrt(
+    binary_mask = (
         ((xx - center[0]) / axes[0]) ** 2 + ((yy - center[1]) / axes[1]) ** 2
-    )
-    mask = _smoothstep((1.0 - ellipse_dist) * float(axes.mean()) / feather)
+    ) <= 1.0
 
     for (lx, ly), radius in zip(_ARCFACE_LANDMARKS_112, _SKIN_TEXTURE_EXCLUSION_RADII):
-        dist = np.sqrt((xx - lx) ** 2 + (yy - ly) ** 2)
-        mask *= _smoothstep((dist - radius) / feather)
+        dist_sq = (xx - lx) ** 2 + (yy - ly) ** 2
+        binary_mask &= dist_sq > radius ** 2
 
-    return mask.astype(np.float32)
+    mask = cv2.GaussianBlur(binary_mask.astype(np.float32), (0, 0), sigma)
+
+    return np.clip(mask, 0.0, 1.0).astype(np.float32)
 
 
 _SKIN_REGION_MASK_112 = _skin_region_mask(112)

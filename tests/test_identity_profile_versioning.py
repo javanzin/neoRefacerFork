@@ -402,9 +402,9 @@ def test_extract_skin_texture_mask_excludes_landmarks_and_borders():
     # Nenhum dos 5 landmarks (olhos, nariz, boca) fica dentro da máscara.
     for lx, ly in _ARCFACE_LANDMARKS_112:
         assert mask[int(ly), int(lx)] == 0.0
-    # Um ponto de bochecha (fora dos raios de exclusão + rampa de feather)
-    # deve estar totalmente coberto.
-    assert mask[76, 34] == 1.0
+    # Um ponto de bochecha (fora dos raios de exclusão + margem + rampa de
+    # feather) deve estar totalmente coberto.
+    assert mask[76, 34] == pytest.approx(1.0, abs=1e-4)
 
 
 def test_skin_region_mask_has_smooth_feathered_edges():
@@ -423,19 +423,36 @@ def test_skin_region_mask_has_smooth_feathered_edges():
     assert fractional > 0.05
 
     # Rampa radial saindo do olho esquerdo para a esquerda (longe das outras
-    # exclusões): 0 dentro do raio, 1 depois de raio + feather, e crescimento
-    # monotônico não-decrescente no meio.
+    # exclusões e da borda da elipse, para isolar só essa rampa): zero
+    # estrito bem dentro do raio (o blur sobre máscara binária ainda garante
+    # isso perto do centro do landmark — só a VIZINHANÇA da borda do raio
+    # ganha uma rampa, não o raio como um todo: ver docstring de
+    # _skin_region_mask sobre por que uma margem extra no raio antes do blur
+    # foi tentada e descartada — sufocava quase toda a cobertura de
+    # bochecha/testa e criava uma ilha isolada de "pele" sem conexão com o
+    # resto da face, inspecionado visualmente), subindo a valores altos ao
+    # se afastar do centro do landmark, decrescente na direção certa.
     lx, ly = _ARCFACE_LANDMARKS_112[0]
     radius = _SKIN_TEXTURE_EXCLUSION_RADII[0]
     row = int(round(ly))
-    inside = mask[row, int(round(lx - radius + 1))]
-    assert inside == 0.0
-    ramp = mask[row, int(round(lx - radius - _SKIN_TEXTURE_MASK_FEATHER_PX - 1)):int(round(lx - radius + 1))]
-    # Lida da esquerda (fora) para a direita (dentro do raio): decrescente.
-    assert np.all(np.diff(ramp) <= 0.0)
-    assert ramp[0] == 1.0
+    feather = _SKIN_TEXTURE_MASK_FEATHER_PX
+
+    # Amostra pontos individuais a distâncias crescentes do centro do
+    # landmark, ao longo desta linha (para a esquerda, longe de qualquer
+    # outra exclusão): deve haver zero estrito bem dentro do raio, uma rampa
+    # monotonicamente crescente saindo do raio, e um platô alto uma vez
+    # afastado o suficiente (na bochecha).
+    def value_at(distance_from_landmark):
+        x = int(round(lx - distance_from_landmark))
+        return mask[row, x]
+
+    assert value_at(radius * 0.3) == 0.0
+    ramp_samples = [value_at(radius + d) for d in np.arange(-feather, feather * 1.5, feather / 4.0)]
+    assert np.all(np.diff(ramp_samples) >= -1e-6)
+    assert ramp_samples[0] < 0.1
+    assert ramp_samples[-1] > 0.9
     # Existe ao menos um valor estritamente intermediário na rampa.
-    assert np.any((ramp > 0.0) & (ramp < 1.0))
+    assert any(0.0 < v < 1.0 for v in ramp_samples)
 
 
 def test_extract_skin_texture_isolates_medium_band_only():
