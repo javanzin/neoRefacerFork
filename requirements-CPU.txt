@@ -3,11 +3,11 @@ imageio[ffmpeg]==2.37.0
 imagecodecs==2025.3.30
 gradio==5.22.0
 insightface==0.7.3
-numpy==1.24.3
+numpy==1.26.4
 onnx==1.14.0
-onnxruntime==1.21.0
-opencv_python==4.7.0.72
-opencv_python_headless==4.7.0.72
+onnxruntime==1.26.0
+opencv_python==4.13.0.92
+opencv_python_headless==4.13.0.92
 pillow_heif
 scikit-image==0.20.0
 tqdm==4.67.1
