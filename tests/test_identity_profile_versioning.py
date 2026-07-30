@@ -367,3 +367,97 @@ def test_candidate_as_imported_profile_allows_chaining_merge(tmp_path):
     }
     assert candidate_2["samples"][0]["origin"] == "fotos_B.jpg"
     assert candidate_2["n_samples"] == 1 + 1 + 1
+
+
+# --- Textura de pele transplantada (opt-in, ver app.apply_identity_anchor) ---
+#
+# _extract_skin_texture recebe um FRAME + kps (não um crop já alinhado) e
+# alinha internamente via face_align.norm_crop, com o mesmo template
+# arcface_src usado pelo resto do pipeline de swap (ver docstring da função
+# para o porquê — um crop de bbox não tem olhos/nariz/boca em posição fixa).
+# Os testes abaixo usam kps == _ARCFACE_LANDMARKS_112 (o próprio template) e
+# um frame já do tamanho 112x112: nesse caso norm_crop é a transformação
+# identidade (a menos de arredondamento de warpAffine), então o crop alinhado
+# é ~igual ao frame de entrada — permite testar a máscara/frequência sem
+# depender da geometria exata do warp.
+
+def _frame_with_template_kps(fill_value):
+    from identity_profile import _ARCFACE_LANDMARKS_112
+
+    frame = np.full((112, 112, 3), fill_value, dtype=np.uint8)
+    return frame, _ARCFACE_LANDMARKS_112.copy()
+
+
+def test_extract_skin_texture_mask_excludes_landmarks_and_borders():
+    from identity_profile import _extract_skin_texture, _ARCFACE_LANDMARKS_112
+
+    frame, kps = _frame_with_template_kps(128)
+    result = _extract_skin_texture(frame, kps)
+    mask = result["mask"]
+
+    assert mask.shape == (112, 112)
+    # Cobertura razoável (bochecha/testa), mas nem todo o crop (exclui
+    # cantos de fundo/cabelo e os 5 landmarks).
+    assert 0.2 < mask.mean() < 0.6
+    # Nenhum dos 5 landmarks (olhos, nariz, boca) fica dentro da máscara.
+    for lx, ly in _ARCFACE_LANDMARKS_112:
+        assert mask[int(ly), int(lx)] == 0.0
+    # O centro geométrico do crop (bochecha) deve estar coberto.
+    assert mask[60, 56] == 1.0
+
+
+def test_extract_skin_texture_isolates_high_frequency_only():
+    from identity_profile import _extract_skin_texture
+
+    # Frame liso (sem textura nenhuma): alta frequência deve ser ~zero.
+    flat, kps = _frame_with_template_kps(128)
+    flat_texture = _extract_skin_texture(flat, kps)["texture"]
+    assert np.abs(flat_texture).max() < 1.0
+
+    # Ruído de alta frequência somado: deve aparecer na textura extraída.
+    rng = np.random.default_rng(42)
+    noisy = np.clip(128 + rng.normal(scale=20, size=(112, 112, 3)), 0, 255).astype(np.uint8)
+    noisy_result = _extract_skin_texture(noisy, kps)
+    noisy_texture, mask = noisy_result["texture"], noisy_result["mask"]
+    assert noisy_texture[mask > 0].std() > 5.0
+    # Fora da máscara de pele, a textura é sempre zero (nunca escapa a
+    # região de olhos/nariz/boca/fundo).
+    assert np.abs(noisy_texture[mask == 0]).max() == 0.0
+
+
+def test_skin_texture_roundtrips_through_export_import(tmp_path):
+    from identity_profile import _extract_skin_texture
+
+    sample = _full_sample([1.0, 0.0, 0.0])
+    profile = _build_profile_from_samples([sample, sample, sample, sample], "Pessoa 1")
+
+    frame, kps = _frame_with_template_kps(100)
+    frame[40:60, 40:60] = 180  # alguma variação para não ser puramente liso
+    profile["face"].skin_texture = {**_extract_skin_texture(frame, kps), "intensity": 0.7}
+
+    path = tmp_path / "with_skin_texture.npz"
+    export_profile(profile, str(path))
+    imported = import_profile(str(path))
+
+    assert hasattr(imported["face"], "skin_texture")
+    assert imported["face"].skin_texture is not None
+    np.testing.assert_allclose(
+        imported["face"].skin_texture["texture"], profile["face"].skin_texture["texture"], atol=1e-5,
+    )
+    np.testing.assert_allclose(
+        imported["face"].skin_texture["mask"], profile["face"].skin_texture["mask"],
+    )
+    assert imported["face"].skin_texture["intensity"] == pytest.approx(0.7)
+
+
+def test_profile_without_skin_texture_imports_without_the_attribute(tmp_path):
+    # Perfil sem textura anexada (o caso comum, opt-in desligado): não deve
+    # gravar/ler nenhum campo de skin_texture, nem quebrar o import.
+    sample = _full_sample([0.0, 1.0, 0.0])
+    profile = _build_profile_from_samples([sample, sample, sample, sample], "Pessoa 1")
+
+    path = tmp_path / "no_skin_texture.npz"
+    export_profile(profile, str(path))
+    imported = import_profile(str(path))
+
+    assert getattr(imported["face"], "skin_texture", None) is None

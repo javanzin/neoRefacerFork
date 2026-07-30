@@ -1240,10 +1240,57 @@ class Refacer:
 
     def _swap_one(self, frame, face, dest_face):
         swapped = self.face_swapper.get(frame, face, dest_face, paste_back=True)
+        skin_texture = getattr(dest_face, "skin_texture", None)
+        if skin_texture is not None:
+            swapped = self._apply_skin_texture(swapped, face, skin_texture)
         if self._should_partial_blend():
             self.blend_height_ratio = self.partial_reface_ratio
             return self._partial_face_blend(frame, swapped, face)
         return swapped
+
+    def _apply_skin_texture(self, swapped_frame, face, skin_texture):
+        """Soma a textura de pele (alta frequência — rugas, olheiras, poros;
+        ver identity_profile._extract_skin_texture) extraída da foto âncora
+        sobre o resultado do swap, opt-in via skin_texture anexado ao
+        dest_face pelo identity_profile (ver apply_identity_anchor em app.py).
+
+        Só a componente de alta frequência é somada (nunca substitui pixels):
+        tom de pele e iluminação continuam vindo inteiramente do swap, que já
+        herdou isso do frame de destino — a textura da âncora só acrescenta
+        detalhe fino que o embedding de identidade (ArcFace, ver
+        ANCHOR_MAX_WEIGHT) não carrega.
+
+        A textura foi extraída num crop 112x112 alinhado por landmarks ao
+        template arcface_src (ver identity_profile._extract_skin_texture) —
+        colar via cv2.resize direto no bbox (abordagem anterior) ignora
+        rotação/pose do rosto de DESTINO: rosto inclinado faria a textura
+        (e os furos de exclusão de olho/nariz/boca) não girarem junto,
+        caindo desalinhados. Em vez disso, usa a MESMA transformação de
+        alinhamento (face_align.estimate_norm nos kps do rosto de destino) e
+        aplica sua inversa via warpAffine — mesmo mecanismo geométrico que o
+        próprio INSwapper usa para colar o rosto trocado de volta no frame.
+        Isso também resolve de graça o caso de rosto cortado pela borda do
+        frame: warpAffine com borderValue=0 preenche a parte fora do frame
+        com zero (nenhuma contribuição), em vez de comprimir a textura
+        inteira para dentro da área visível.
+        """
+        if face.kps is None:
+            return swapped_frame
+
+        h_frame, w_frame = swapped_frame.shape[:2]
+        M, _ = face_align.estimate_norm(face.kps, image_size=112)
+        M_inv = cv2.invertAffineTransform(M)
+
+        intensity = skin_texture.get("intensity", 1.0)
+        texture_frame_space = cv2.warpAffine(
+            skin_texture["texture"], M_inv, (w_frame, h_frame), borderValue=0.0,
+        )
+        mask_frame_space = cv2.warpAffine(
+            skin_texture["mask"], M_inv, (w_frame, h_frame), borderValue=0.0,
+        )[:, :, np.newaxis]
+
+        blended = swapped_frame.astype(np.float32) + texture_frame_space * mask_frame_space * intensity
+        return np.clip(blended, 0, 255).astype(np.uint8)
 
     def _apply_swaps(self, frame, faces):
         """Apply face swaps to an already-detected+embedded list of faces.

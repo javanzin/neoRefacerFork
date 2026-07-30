@@ -8,12 +8,22 @@ ser consumido exatamente como um dest_face extraído de uma única foto (ver
 prepare_faces em refacer.py).
 """
 
+import sys
 import time
 
 import cv2
 import numpy as np
 from insightface.app.common import Face
 from tqdm import tqdm
+
+# recognition/face_align.py é um módulo local do projeto (não pip-instalado),
+# o mesmo usado por refacer.py para o alinhamento/warp do swap em si — reusar
+# aqui garante que a textura de pele (ver _extract_skin_texture) é extraída
+# com o MESMO template de alinhamento usado no restante do pipeline. Este
+# insert é idempotente (sys.path aceita entradas repetidas sem efeito
+# colateral) e não depende de refacer.py já ter sido importado antes.
+sys.path.insert(1, "./recognition")
+import face_align
 
 # Vídeos são amostrados, não decodificados quadro a quadro: um perfil de
 # identidade não precisa de toda a densidade temporal do vídeo (rostos entre
@@ -131,6 +141,92 @@ ANCHOR_MAX_WEIGHT = 0.35
 def _face_sharpness(aligned_crop_bgr):
     gray = cv2.cvtColor(aligned_crop_bgr, cv2.COLOR_BGR2GRAY)
     return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+# Template fixo de alinhamento 112x112 do ArcFace (insightface.utils.face_align.
+# arcface_dst) — todo "thumbnail" de amostra (ver _add_face_candidate) é
+# recortado para este MESMO template, então a posição de olhos/nariz/boca é
+# sempre igual entre amostras diferentes: a máscara de pele abaixo pode ser
+# fixa, sem depender de detecção adicional por amostra.
+_ARCFACE_LANDMARKS_112 = np.array(
+    [[38.2946, 51.6963], [73.5318, 51.5014], [56.0252, 71.7366],
+     [41.5493, 92.3655], [70.7299, 92.2041]], dtype=np.float32,
+)
+
+_SKIN_TEXTURE_HIGHPASS_SIGMA = 3.0
+# Raio (em px, no crop 112x112) de exclusão ao redor de cada landmark, na
+# mesma ordem de _ARCFACE_LANDMARKS_112 (olho esq., olho dir., nariz, boca
+# esq., boca dir.) — afasta a máscara de pele desses pontos, cuja textura
+# própria (cílios, sobrancelha, narinas, contorno labial) não é "pele" e
+# desalinharia visivelmente se transplantada para um rosto de destino com
+# proporções diferentes. Olhos usam raio maior (cobre sobrancelha/cílios
+# também); nariz/boca ficam mais justos para não comer bochecha/queixo útil
+# — com um raio único (testado: 20px) os 5 círculos se fundem no centro do
+# rosto e a máscara perde toda a região central de bochecha.
+_SKIN_TEXTURE_EXCLUSION_RADII = np.array([16.0, 16.0, 11.0, 12.0, 12.0], dtype=np.float32)
+
+
+def _skin_region_mask(crop_size=112):
+    """Máscara binária (0/1, shape (crop_size, crop_size)) da região de pele
+    útil para textura — testa e bochechas do crop alinhado ArcFace, excluindo
+    um raio ao redor de cada landmark (olhos, nariz, boca) e a borda externa
+    do rosto (fundo/cabelo/orelha, que não é pele facial).
+
+    Fixa porque o template de alinhamento é fixo (ver _ARCFACE_LANDMARKS_112)
+    — calculada uma vez e cacheada (ver _extract_skin_texture).
+    """
+    yy, xx = np.mgrid[0:crop_size, 0:crop_size].astype(np.float32)
+
+    # Elipse frouxa cobrindo a região facial central (exclui os cantos do
+    # crop 112x112, que no template ArcFace já são fundo/cabelo/orelha).
+    center = np.array([56.0, 60.0])
+    face_ellipse = (
+        ((xx - center[0]) / 46.0) ** 2 + ((yy - center[1]) / 52.0) ** 2
+    ) <= 1.0
+
+    mask = face_ellipse.copy()
+    for (lx, ly), radius in zip(_ARCFACE_LANDMARKS_112, _SKIN_TEXTURE_EXCLUSION_RADII):
+        dist_sq = (xx - lx) ** 2 + (yy - ly) ** 2
+        mask &= dist_sq > radius ** 2
+
+    return mask.astype(np.float32)
+
+
+_SKIN_REGION_MASK_112 = _skin_region_mask(112)
+
+
+def _extract_skin_texture(frame_bgr, kps):
+    """Extrai a textura de pele (frequência alta — rugas, olheiras, poros) de
+    uma foto, para transplante opcional sobre o resultado do swap (ver
+    refacer.Refacer._apply_skin_texture).
+
+    IMPORTANTE: recebe o frame ORIGINAL + os 5 landmarks (kps), não o
+    "thumbnail" da amostra (sample["thumbnail"], ver _add_face_candidate) —
+    esse thumbnail é só um recorte do bbox redimensionado para 112x112, SEM
+    alinhamento por landmarks (sem rotação/escala normalizada). A máscara de
+    exclusão abaixo (_SKIN_REGION_MASK_112) só faz sentido no espaço do
+    template arcface_src fixo (ver _ARCFACE_LANDMARKS_112) — um crop de bbox
+    tem os olhos/nariz/boca em posições que variam por pose/enquadramento, o
+    que faria os círculos de exclusão sistematicamente errar a posição real
+    das feições (apagando olheira, deixando vazar cílio/sobrancelha). Por
+    isso este passo refaz o alinhamento aqui via face_align.norm_crop, com o
+    MESMO template usado por refacer.py no restante do pipeline de swap.
+
+    Frequência ALTA (não a imagem inteira): tom de pele e iluminação devem
+    vir do frame de destino sendo processado, não da foto âncora — só a
+    textura fina (o que o embedding de identidade não codifica, ver
+    ANCHOR_MAX_WEIGHT) é o que faz sentido transplantar. Isolada por
+    unsharp-mask (crop menos sua versão borrada).
+
+    Retorna um dict {"texture": array float32 (112,112,3) já mascarado pela
+    região de pele, "mask": _SKIN_REGION_MASK_112} — "mask" viaja junto para
+    quem for aplicar não precisar reimportar a constante.
+    """
+    aligned = face_align.norm_crop(frame_bgr, kps, image_size=112)
+    blurred = cv2.GaussianBlur(aligned.astype(np.float32), (0, 0), _SKIN_TEXTURE_HIGHPASS_SIGMA)
+    high_freq = aligned.astype(np.float32) - blurred
+    masked_texture = high_freq * _SKIN_REGION_MASK_112[:, :, np.newaxis]
+    return {"texture": masked_texture, "mask": _SKIN_REGION_MASK_112}
 
 
 def _downscale_gray(frame_bgr):
@@ -870,14 +966,20 @@ def build_anchor_sample(detector, recognizer, frame_bgr, source_label):
     sem duplicar a validação de nitidez/score/tamanho) — uma âncora de má
     qualidade não deve ser aceita silenciosamente.
 
-    Retorna a amostra aceita (dict com "embedding", compatível com
-    anchor_sample de apply_anchor_to_profile) ou None se rejeitada, e a lista
-    de descartes (mesmo formato de IdentityProfileBuilder.discarded) para o
-    chamador reportar o motivo ao usuário.
+    Retorna a amostra aceita (dict com "embedding" e "skin_texture" — ver
+    _extract_skin_texture, compatível com anchor_sample de
+    apply_anchor_to_profile) ou None se rejeitada, e a lista de descartes
+    (mesmo formato de IdentityProfileBuilder.discarded) para o chamador
+    reportar o motivo ao usuário.
     """
     builder = IdentityProfileBuilder(detector, recognizer)
     builder.add_image(frame_bgr, source_label)
     anchor_sample = builder.samples[0] if builder.samples else None
+    if anchor_sample is not None:
+        # frame_bgr (o quadro ORIGINAL, não o thumbnail de bbox da amostra) +
+        # os kps detectados — _extract_skin_texture faz o próprio alinhamento
+        # por landmark a partir daqui (ver docstring lá para o porquê).
+        anchor_sample["skin_texture"] = _extract_skin_texture(frame_bgr, anchor_sample["face"].kps)
     return anchor_sample, builder.discarded
 
 
@@ -948,6 +1050,19 @@ def export_profile(profile, output_path, content_hashes=None):
         embedding_model=EMBEDDING_MODEL_ID,
         created_at=np.int64(int(time.time())),
     )
+
+    # Textura de pele transplantada (opt-in, ver apply_identity_anchor em
+    # app.py) — arrays numéricos puros (float32/mask), nunca pickle, mesma
+    # justificativa de segurança de origin_names abaixo. Sem isso, exportar o
+    # .npz depois de ligar o transplante perderia o efeito silenciosamente
+    # (mesmo bug que a âncora tinha antes de profile["anchor_sample"] existir).
+    skin_texture = getattr(face, "skin_texture", None)
+    if skin_texture is not None:
+        fields.update(
+            skin_texture=skin_texture["texture"].astype(np.float32),
+            skin_texture_mask=skin_texture["mask"].astype(np.float32),
+            skin_texture_intensity=np.float32(skin_texture.get("intensity", 1.0)),
+        )
 
     samples = profile.get("samples")
     origin_summaries = None
@@ -1020,6 +1135,14 @@ def import_profile(npz_path):
             det_score=float(data["det_score"]),
         )
         face.embedding = data["embedding"].astype(np.float32)
+
+        skin_texture_keys = {"skin_texture", "skin_texture_mask", "skin_texture_intensity"}
+        if skin_texture_keys.issubset(data.files):
+            face.skin_texture = {
+                "texture": data["skin_texture"].astype(np.float32),
+                "mask": data["skin_texture_mask"].astype(np.float32),
+                "intensity": float(data["skin_texture_intensity"]),
+            }
 
         profile = {
             "name": str(data["name"]),
@@ -1098,7 +1221,11 @@ def merge_imported_profile(imported_profile, new_samples, name=None, new_discard
       origens legadas (mesma limitação de sempre: sem amostras individuais).
       Aplicar âncora precisa ser feito ANTES de exportar novamente, sobre as
       novas amostras via apply_anchor_to_profile de um perfil comum, ou
-      tratado como uma etapa separada — não coberto por esta função.
+      tratado como uma etapa separada — não coberto por esta função. Pela
+      mesma razão, uma textura de pele transplantada (ver
+      app.apply_identity_anchor/_reattach_anchor_extras) TAMBÉM não
+      sobrevive a este fluxo — precisa ser reaplicada manualmente depois,
+      sobre a candidata resultante, antes de reexportar.
 
     Levanta ValueError se imported_profile não tiver "origins" (perfil v1,
     sem dados por origem — não há nada para continuar incrementalmente; a

@@ -680,6 +680,34 @@ _IDENTITY_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".heic",
 _IDENTITY_VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".gif"}
 _HEIF_EXTENSIONS = {".heic", ".heif"}
 
+
+def _reattach_anchor_extras(source_profile, target_profile):
+    """Copia anchor_sample/anchor_weight/skin_texture_intensity de
+    source_profile para target_profile e RE-ANEXA a textura de pele ao Face
+    de target_profile, se houver — usado por todo caminho que reconstrói o
+    Face do zero a partir de profile["samples"] (busca dirigida, merge de
+    sessão) para que essas propriedades não sumam silenciosamente, com o
+    status ainda dizendo "ativa" (mesmo bug que a âncora tinha antes de
+    anchor_sample/anchor_weight existirem no dict do perfil).
+
+    Sem anchor_sample em source_profile, é um no-op (nada para copiar).
+    """
+    anchor_sample = source_profile.get("anchor_sample")
+    if anchor_sample is None:
+        return target_profile
+
+    target_profile["anchor_sample"] = anchor_sample
+    target_profile["anchor_weight"] = source_profile.get("anchor_weight", ANCHOR_MAX_WEIGHT)
+
+    skin_texture_intensity = source_profile.get("skin_texture_intensity")
+    if skin_texture_intensity is not None and anchor_sample.get("skin_texture") is not None:
+        target_profile["skin_texture_intensity"] = skin_texture_intensity
+        target_profile["face"].skin_texture = {
+            **anchor_sample["skin_texture"],
+            "intensity": skin_texture_intensity,
+        }
+    return target_profile
+
 def _imread_identity(path):
     """cv2.imread para a maioria dos formatos; HEIC/HEIF (fotos de iPhone,
     não decodificadas nativamente pelo OpenCV) passam por Pillow+pillow-heif
@@ -943,8 +971,10 @@ def merge_selected_profiles(profiles, name_a, name_b, balance_by_origin=False):
         merged["face"].embedding = _apply_anchor(
             merged["face"].embedding, anchor_source["anchor_sample"]["embedding"], anchor_weight,
         )
-        merged["anchor_sample"] = anchor_source["anchor_sample"]
-        merged["anchor_weight"] = anchor_weight
+        # anchor_weight já foi aplicado ao embedding acima manualmente (não
+        # via _reattach_anchor_extras) — chamado só depois, para a parte de
+        # skin_texture_intensity/Face.skin_texture, que ele também cobre.
+        _reattach_anchor_extras(anchor_source, merged)
 
     remaining = [p for p in profiles if p["name"] not in (name_a, name_b)]
     new_profiles = remaining + [merged]
@@ -1066,9 +1096,7 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
         anchor_weight=profile.get("anchor_weight", ANCHOR_MAX_WEIGHT),
     )
     updated_profile["origin_hashes"] = {**profile.get("origin_hashes", {}), **new_origin_hashes}
-    if profile.get("anchor_sample") is not None:
-        updated_profile["anchor_sample"] = profile["anchor_sample"]
-        updated_profile["anchor_weight"] = profile.get("anchor_weight", ANCHOR_MAX_WEIGHT)
+    _reattach_anchor_extras(profile, updated_profile)
     new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
 
     n_new = len(new_matches)
@@ -1338,12 +1366,25 @@ def confirm_candidate_profile(candidate_profile):
     export_profile(candidate_profile, export_path, content_hashes=candidate_profile.get("origin_hashes"))
     return gr.update(value=export_path, visible=True)
 
-def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_weight, balance_by_origin=False, weight_by_sharpness=False):
+def apply_identity_anchor(
+    profiles, selected_name, anchor_image_file, anchor_weight, balance_by_origin=False, weight_by_sharpness=False,
+    transplant_skin_texture=False, skin_texture_intensity=1.0,
+):
     """Aplica (ou remove, se anchor_image_file estiver vazio) uma foto âncora
     manual sobre o perfil ativo — upload separado e opcional, processado
     pelos mesmos filtros de qualidade do resto do pipeline (ver
     identity_profile.build_anchor_sample). Nunca escolhida entre as amostras
     já coletadas do perfil.
+
+    transplant_skin_texture (opt-in, default False): além de deslocar o
+    centroide de identidade (o que a âncora sempre faz), anexa a textura de
+    pele (rugas, olheiras, poros — ver identity_profile._extract_skin_texture)
+    extraída da MESMA foto âncora ao Face sintético do perfil, para
+    transplante no pós-swap (ver refacer.Refacer._apply_skin_texture).
+    Existe como opção separada porque muda pixels do resultado final, não só
+    o vetor de identidade — precisa de validação visual antes de confiar,
+    diferente do deslocamento de centroide (que é sempre a mesma operação
+    matemática, só a magnitude varia).
     """
     profile = _get_selected_profile(profiles, selected_name)
     if profile is None:
@@ -1379,6 +1420,28 @@ def apply_identity_anchor(profiles, selected_name, anchor_image_file, anchor_wei
     # silenciosamente enquanto o status ainda diz "Âncora ativa".
     updated_profile["anchor_sample"] = anchor_sample
     updated_profile["anchor_weight"] = float(anchor_weight)
+
+    if transplant_skin_texture and anchor_sample.get("skin_texture") is not None:
+        updated_profile["face"].skin_texture = {
+            **anchor_sample["skin_texture"],
+            "intensity": float(skin_texture_intensity),
+        }
+        # A intensidade escolhida também é guardada no PERFIL (não só no
+        # Face) — profile["anchor_sample"]["skin_texture"] (persistido acima)
+        # não carrega a intensidade, então sem isso qualquer recálculo que
+        # reconstrua o Face do zero (merge, busca dirigida) reaplicaria a
+        # âncora mas perderia a intensidade escolhida, mesmo se tentasse
+        # re-anexar a textura (ver _reattach_anchor_extras).
+        updated_profile["skin_texture_intensity"] = float(skin_texture_intensity)
+    else:
+        # Reaplicar a âncora sem o checkbox marcado (ou desligá-lo depois de
+        # tê-lo ligado) não deve deixar uma textura anexada anteriormente
+        # sobrevivendo — o Face é reconstruído do zero por
+        # apply_anchor_to_profile, então isso só importa se algum caminho
+        # futuro passar a reaproveitar o mesmo objeto Face.
+        updated_profile["face"].skin_texture = None
+        updated_profile["skin_texture_intensity"] = None
+
     new_profiles = [updated_profile if p["name"] == selected_name else p for p in profiles]
 
     # Deslocamento efetivo: compara o centroide ancorado com o mesmo perfil
@@ -1680,6 +1743,26 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
                 step=0.01,
             )
             identity_anchor_status = gr.Textbox(label="", interactive=False, show_label=False)
+            identity_transplant_skin_texture = gr.Checkbox(
+                label="Transplantar textura de pele da âncora (experimental, muda pixels do resultado)",
+                value=False,
+                info=(
+                    "Opcional, desligado por padrão. A influência de 35% acima só move a IDENTIDADE "
+                    "(o vetor que o ArcFace reconhece) — maquiagem e textura de pele fina não fazem "
+                    "parte disso por design do modelo, então uma âncora sem maquiagem pode não mudar "
+                    "nada visível mesmo no teto. Esta opção extra pega a textura de pele (rugas, "
+                    "olheiras, poros) da MESMA foto âncora e soma sobre o resultado do swap, sem "
+                    "alterar o tom de pele/iluminação do vídeo de destino. Ainda não validada "
+                    "visualmente em todos os casos — compare o resultado antes de confiar."
+                ),
+            )
+            identity_skin_texture_intensity = gr.Slider(
+                label="Intensidade da textura de pele transplantada",
+                minimum=0.0,
+                maximum=2.0,
+                value=1.0,
+                step=0.1,
+            )
 
         with gr.Row():
             identity_rename_input = gr.Textbox(label="Novo nome para o perfil ativo", placeholder="ex.: João")
@@ -1931,21 +2014,33 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             outputs=[identity_merge_b],
         )
 
+        _anchor_apply_inputs = [
+            identity_profile_state, identity_selected_profile, identity_anchor_image,
+            identity_anchor_weight, identity_balance_by_origin, identity_weight_by_sharpness,
+            identity_transplant_skin_texture, identity_skin_texture_intensity,
+        ]
+
         identity_anchor_image.change(
             fn=apply_identity_anchor,
-            inputs=[
-                identity_profile_state, identity_selected_profile, identity_anchor_image,
-                identity_anchor_weight, identity_balance_by_origin, identity_weight_by_sharpness,
-            ],
+            inputs=_anchor_apply_inputs,
             outputs=[identity_anchor_status, identity_profile_state],
         )
 
         identity_anchor_weight.release(
             fn=apply_identity_anchor,
-            inputs=[
-                identity_profile_state, identity_selected_profile, identity_anchor_image,
-                identity_anchor_weight, identity_balance_by_origin, identity_weight_by_sharpness,
-            ],
+            inputs=_anchor_apply_inputs,
+            outputs=[identity_anchor_status, identity_profile_state],
+        )
+
+        identity_transplant_skin_texture.change(
+            fn=apply_identity_anchor,
+            inputs=_anchor_apply_inputs,
+            outputs=[identity_anchor_status, identity_profile_state],
+        )
+
+        identity_skin_texture_intensity.release(
+            fn=apply_identity_anchor,
+            inputs=_anchor_apply_inputs,
             outputs=[identity_anchor_status, identity_profile_state],
         )
 
