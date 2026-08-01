@@ -14,6 +14,7 @@ import random
 import multiprocessing as mp
 from concurrent.futures import ThreadPoolExecutor
 from insightface.model_zoo.inswapper import INSwapper
+from insightface.model_zoo.landmark import Landmark
 import psutil
 from enum import Enum
 from insightface.app.common import Face
@@ -46,6 +47,36 @@ if sys.platform in ("win32", "win64"):
 
     if hasattr(rt, "preload_dlls"):
         rt.preload_dlls()
+
+# FEATURE FLAG — correção experimental de boca muito aberta/língua para fora
+# (ver _restore_original_mouth_if_open, MELHORIAS.md secção "Boca aberta/
+# língua no swap"). Troca: quando a boca abre além de OPEN_MOUTH_RATIO_MAX, a
+# boca ORIGINAL do frame de destino é colada por cima do resultado do swap
+# (evita a geometria deformada que o inswapper_128 produz nesses casos), ao
+# custo de perder a identidade trocada só naquela região, só nesses frames —
+# risco avaliado e aceito conscientemente (ver MELHORIAS.md), não validado
+# ainda com vídeo real.
+#
+# Para REVERTER por completo: mude esta constante para False. Todo o código
+# novo (import Landmark, __init_apps, _swap_one) já checa essa flag e vira
+# no-op quando desligada, sem precisar apagar nada.
+OPEN_MOUTH_FIX_ENABLED = True
+
+# FEATURE FLAG — fallback de rotação para pose "deitada" (ver
+# _detect_with_rotation_fallback, MELHORIAS.md seção "Pose lateral/deitada").
+# Troca: quando a detecção no frame original vem com score baixo (ou não acha
+# rosto), tenta o frame rotacionado em 90°/180°/270° e fica com a rotação de
+# maior confiança, desfazendo a rotação nas coordenadas antes de retornar —
+# custo extra só nos frames onde a detecção frontal já falhou, mitigação não
+# validada ainda com vídeo real (só testes sintéticos). Diferente do
+# OPEN_MOUTH_FIX acima: aqui é roll (rotação no plano da imagem, ex.: cabeça
+# no travesseiro), não geometria de boca.
+#
+# Para REVERTER por completo: mude esta constante para False.
+ROTATE_FACE_FALLBACK_ENABLED = True
+ROTATE_FACE_FALLBACK_MIN_SCORE = 0.5
+ROTATE_FACE_FALLBACK_ANGLES = (90, 180, 270)
+
 
 class RefacerMode(Enum):
     CPU, CUDA, COREML, TENSORRT = range(1, 5)
@@ -335,6 +366,87 @@ class Refacer:
         self._analysis_cache_key = None
         self._analysis_cache_result = None
 
+    @staticmethod
+    def _rotate_frame(frame, angle):
+        """Rotaciona o frame em graus (90/180/270, sentido horário) para
+        tentar a detecção numa orientação diferente. cv2.ROTATE_* só cobre
+        múltiplos de 90° — suficiente para o caso de uso (pessoa deitada de
+        lado ou de cabeça para baixo), não pretende cobrir ângulos finos."""
+        if angle == 90:
+            return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if angle == 180:
+            return cv2.rotate(frame, cv2.ROTATE_180)
+        if angle == 270:
+            return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+        return frame
+
+    @staticmethod
+    def _unrotate_point(x, y, angle, orig_w, orig_h):
+        """Inverso de _rotate_frame para um ponto (x, y) detectado no frame
+        rotacionado — devolve as coordenadas no referencial do frame
+        ORIGINAL (não rotacionado), para o resto do pipeline nunca precisar
+        saber que uma rotação aconteceu."""
+        if angle == 90:
+            # rotated frame is (orig_w x orig_h) -> (orig_h x orig_w)
+            return y, orig_h - 1 - x
+        if angle == 180:
+            return orig_w - 1 - x, orig_h - 1 - y
+        if angle == 270:
+            return orig_w - 1 - y, x
+        return x, y
+
+    def _detect_with_rotation_fallback(self, frame, max_num=0, metric='default'):
+        """Detecta rosto tentando primeiro o frame original (0°, custo igual
+        ao de hoje); só se o melhor score vier abaixo de
+        ROTATE_FACE_FALLBACK_MIN_SCORE (ou nenhum rosto for achado) tenta
+        rotações candidatas (90°/180°/270°) e fica com a de maior score,
+        desfazendo a rotação no bbox/kps antes de retornar.
+
+        Mitigação para pose "deitada" (roll ~90-180°, cabeça no travesseiro)
+        — ver ROTATE_FACE_FALLBACK_ENABLED. Diferente de yaw/pitch (virar a
+        cabeça para o lado olhando para outro ponto), que é perda real de
+        profundidade 3D sem correção 2D possível.
+        """
+        bboxes, kpss = self.face_detector.detect(frame, max_num=max_num, metric=metric)
+        if not ROTATE_FACE_FALLBACK_ENABLED:
+            return bboxes, kpss
+
+        best_score = bboxes[:, 4].max() if bboxes.shape[0] > 0 else -1.0
+        if best_score >= ROTATE_FACE_FALLBACK_MIN_SCORE:
+            return bboxes, kpss
+
+        orig_h, orig_w = frame.shape[:2]
+        best_bboxes, best_kpss, best_angle = bboxes, kpss, 0
+
+        for angle in ROTATE_FACE_FALLBACK_ANGLES:
+            rotated_frame = self._rotate_frame(frame, angle)
+            cand_bboxes, cand_kpss = self.face_detector.detect(rotated_frame, max_num=max_num, metric=metric)
+            cand_score = cand_bboxes[:, 4].max() if cand_bboxes.shape[0] > 0 else -1.0
+            if cand_score > best_score:
+                best_score, best_bboxes, best_kpss, best_angle = cand_score, cand_bboxes, cand_kpss, angle
+
+        if best_angle == 0 or best_bboxes.shape[0] == 0:
+            return best_bboxes, best_kpss
+
+        unrotated_bboxes = best_bboxes.copy()
+        for i in range(best_bboxes.shape[0]):
+            x1, y1 = self._unrotate_point(best_bboxes[i, 0], best_bboxes[i, 1], best_angle, orig_w, orig_h)
+            x2, y2 = self._unrotate_point(best_bboxes[i, 2], best_bboxes[i, 3], best_angle, orig_w, orig_h)
+            unrotated_bboxes[i, 0], unrotated_bboxes[i, 2] = min(x1, x2), max(x1, x2)
+            unrotated_bboxes[i, 1], unrotated_bboxes[i, 3] = min(y1, y2), max(y1, y2)
+
+        unrotated_kpss = None
+        if best_kpss is not None:
+            unrotated_kpss = best_kpss.copy()
+            for i in range(best_kpss.shape[0]):
+                for j in range(best_kpss.shape[1]):
+                    px, py = self._unrotate_point(
+                        best_kpss[i, j, 0], best_kpss[i, j, 1], best_angle, orig_w, orig_h,
+                    )
+                    unrotated_kpss[i, j, 0], unrotated_kpss[i, j, 1] = px, py
+
+        return unrotated_bboxes, unrotated_kpss
+
     def __get_faces_with_light_cache(self, frame, video_hash, frame_idx, max_num=8):
         """Get faces with lightweight in-memory cache for detection only.
 
@@ -369,7 +481,7 @@ class Refacer:
 
         # Cache miss: do full detection and cache result
         start_detect = self._profile_start("face_detection")
-        bboxes, kpss = self.face_detector.detect(frame, max_num=max_num, metric='default')
+        bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num, metric='default')
         self._profile_end("face_detection", start_detect)
         
         # Cache detection result (bboxes + kpss only, no embeddings)
@@ -460,7 +572,7 @@ class Refacer:
                     return None
 
                 start_detect = self._profile_start("face_detection")
-                bboxes, kpss = self.face_detector.detect(frame, max_num=max_num_faces, metric='default')
+                bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num_faces, metric='default')
                 self._profile_end("face_detection", start_detect)
 
                 # Embeddings depend only on the frame, not on which source face a
@@ -1009,6 +1121,24 @@ class Refacer:
         print(f"Face Swapper providers: {sess_swap.get_providers()}")
         self.face_swapper = INSwapper(model_path, sess_swap)
 
+        # Landmark de 106 pontos (opt-in, ver OPEN_MOUTH_FIX_ENABLED/
+        # _restore_original_mouth_if_open): já vem no mesmo pacote buffalo_l
+        # baixado acima para detector/reconhecedor, então não é download
+        # extra — só uma sessão ONNX a mais, carregada sob demanda. Falha
+        # silenciosa (self.landmark_106 = None) se o arquivo não existir
+        # nessa versão do pacote: a correção de boca aberta simplesmente
+        # fica indisponível, sem quebrar o resto do pipeline.
+        self.landmark_106 = None
+        if OPEN_MOUTH_FIX_ENABLED:
+            landmark_path = os.path.join(assets_dir, '2d106det.onnx')
+            try:
+                sess_landmark = rt.InferenceSession(landmark_path, self.sess_options, providers=self.providers)
+                self.landmark_106 = Landmark(landmark_path, sess_landmark)
+                self.landmark_106.prepare(0)
+                print(f"Landmark 106pt providers: {sess_landmark.get_providers()}")
+            except Exception as e:
+                print(f"[WARNING] landmark_2d_106 unavailable ({e}); open-mouth fix disabled for this run.")
+
     def _compute_video_hash(self, video_path):
         """Fast video fingerprinting using first and last 1MB plus file size.
 
@@ -1154,7 +1284,7 @@ class Refacer:
                     break
                 
                 # Detect faces
-                bboxes, kpss = self.face_detector.detect(frame, max_num=max_num_faces)
+                bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num_faces)
                 
                 frame_data = {
                     "bboxes": bboxes,
@@ -1238,11 +1368,121 @@ class Refacer:
         area_b = (b[2] - b[0]) * (b[3] - b[1])
         return float(inter / (area_a + area_b - inter))
 
+    # Índices do contorno labial no esquema de 106 pontos do InsightFace
+    # (landmark_2d_106/2d106det.onnx) — confirmados contra implementações de
+    # referência (roop-unleashed, iRoopDeepFaceCam) que usam o mesmo modelo:
+    # 52-64 contorno externo do lábio, 65-70 contorno interno (abertura real
+    # da boca, o que importa para medir "quão aberta"), 65/71 cantos.
+    _MOUTH_OUTER_IDX = list(range(52, 65))
+    _MOUTH_INNER_IDX = list(range(65, 71))
+    # Ponto do meio do lábio superior/inferior no contorno INTERNO — usados
+    # para a razão de abertura (distância vertical interna / largura da
+    # boca): o contorno interno fecha em ~0 quando a boca está fechada
+    # (lábios encostados), diferente do externo (que sempre tem alguma
+    # espessura de lábio visível mesmo de boca fechada).
+    _MOUTH_INNER_TOP_IDX = 67
+    _MOUTH_INNER_BOTTOM_IDX = 70
+
+    def _mouth_open_ratio(self, landmarks_106):
+        """Razão de abertura de boca: distância vertical entre o meio do
+        lábio superior e inferior (contorno INTERNO), normalizada pela
+        largura da boca (canto a canto) — invariante à escala do rosto na
+        tela (rosto longe vs. perto da câmera).
+
+        ~0 com boca fechada (lábios internos encostados), cresce conforme
+        abre. Não há um "boca muito aberta = X" universalmente documentado;
+        OPEN_MOUTH_RATIO_MAX (ver _restore_original_mouth_if_open) é o
+        limiar que decide a partir de qual valor a correção age.
+        """
+        top = landmarks_106[self._MOUTH_INNER_TOP_IDX]
+        bottom = landmarks_106[self._MOUTH_INNER_BOTTOM_IDX]
+        left = landmarks_106[52]
+        right = landmarks_106[64]
+        mouth_width = np.linalg.norm(right - left)
+        if mouth_width <= 1e-3:
+            return 0.0
+        return float(np.linalg.norm(bottom - top) / mouth_width)
+
+    def _mouth_polygon_mask(self, frame_shape, landmarks_106, feather_px=12):
+        """Máscara suave (float32, mesma shape de frame_shape[:2]) do
+        polígono real do contorno EXTERNO da boca (pontos 52-64 + 0-6 do
+        lábio inferior externo — ver _MOUTH_OUTER_IDX), com um blur gaussiano
+        para feathering — mesma técnica de create_lower_mouth_mask do
+        iRoopDeepFaceCam, mas usando só o contorno externo (mais estável que
+        recalcular índices de queixo/mandíbula que a versão original também
+        mistura).
+
+        Retorna valores em [0, 1]: 1 dentro do polígono (onde a boca ORIGINAL
+        deve aparecer), suavizando para 0 na borda.
+        """
+        h, w = frame_shape[:2]
+        mask = np.zeros((h, w), dtype=np.uint8)
+        polygon = landmarks_106[self._MOUTH_OUTER_IDX].astype(np.int32)
+        cv2.fillConvexPoly(mask, cv2.convexHull(polygon), 255)
+        feather_px = max(1, int(feather_px) | 1)  # ímpar, exigido pelo GaussianBlur
+        mask = cv2.GaussianBlur(mask.astype(np.float32), (feather_px, feather_px), 0)
+        return np.clip(mask / 255.0, 0.0, 1.0)[:, :, np.newaxis]
+
+    # Abaixo de OPEN_MOUTH_RATIO_MAX, sem correção nenhuma (mantém 100% swap,
+    # comportamento de sempre). Entre MIN e MAX, alpha cresce suavemente de 0
+    # a 1 — evita um corte abrupto entre frames consecutivos com aberturas
+    # parecidas (flicker "boca original aparece/desaparece de repente").
+    # Valores por observação da faixa de _mouth_open_ratio em fala normal
+    # (tipicamente < 0.15) vs. boca bem aberta (> 0.35) — não validado com
+    # vídeo real, ajustar aqui se a transição disparar cedo/tarde demais.
+    OPEN_MOUTH_RATIO_MIN = 0.20
+    OPEN_MOUTH_RATIO_MAX = 0.35
+
+    def _restore_original_mouth_if_open(self, frame, swapped, face):
+        """Cola a boca ORIGINAL (frame de destino) por cima do resultado do
+        swap quando a boca está muito aberta — mitigação para a limitação
+        conhecida do inswapper_128 com boca muito aberta/língua para fora
+        (rede treinada majoritariamente em boca fechada/semiaberta; boca bem
+        aberta sai com geometria interna deformada). Ver MELHORIAS.md.
+
+        TRADE-OFF ACEITO CONSCIENTEMENTE (não é bug, é a natureza da técnica
+        — mesma usada por roop-unleashed/iRoopDeepFaceCam): a boca colada é
+        da pessoa do frame de DESTINO, não da identidade trocada — perde-se a
+        identidade nova só nessa região, só nesses frames. Se o rosto de
+        destino for muito diferente do de origem (tom de pele, formato de
+        lábio), pode ficar visível como um "remendo" por um instante. Câmbio
+        aceito no lugar de uma língua/boca claramente deformada. `alpha`
+        gradual (ver OPEN_MOUTH_RATIO_MIN/MAX) suaviza a transição espacial e
+        temporal, mas não elimina a diferença de identidade dentro da área.
+
+        Não faz nada (retorna `swapped` intocado) se o landmark 106pt não
+        estiver disponível (ver OPEN_MOUTH_FIX_ENABLED) ou se a face não
+        tiver bbox utilizável.
+        """
+        if self.landmark_106 is None or face.bbox is None:
+            return swapped
+        try:
+            landmarks_106 = self.landmark_106.get(frame, face)
+        except Exception as e:
+            print(f"[WARNING] landmark_2d_106 inference failed ({e}); skipping open-mouth fix for this frame.")
+            return swapped
+
+        ratio = self._mouth_open_ratio(landmarks_106)
+        if ratio <= self.OPEN_MOUTH_RATIO_MIN:
+            return swapped
+
+        alpha_scale = np.clip(
+            (ratio - self.OPEN_MOUTH_RATIO_MIN) / (self.OPEN_MOUTH_RATIO_MAX - self.OPEN_MOUTH_RATIO_MIN),
+            0.0, 1.0,
+        )
+        mask = self._mouth_polygon_mask(swapped.shape, landmarks_106) * alpha_scale
+        blended = swapped.astype(np.float32) * (1.0 - mask) + frame.astype(np.float32) * mask
+        return blended.astype(np.uint8)
+
     def _swap_one(self, frame, face, dest_face):
         swapped = self.face_swapper.get(frame, face, dest_face, paste_back=True)
         skin_texture = getattr(dest_face, "skin_texture", None)
         if skin_texture is not None:
             swapped = self._apply_skin_texture(swapped, face, skin_texture)
+        if OPEN_MOUTH_FIX_ENABLED:
+            # Reverter: mude OPEN_MOUTH_FIX_ENABLED para False no topo do
+            # arquivo — não precisa tocar nesta função.
+            swapped = self._restore_original_mouth_if_open(frame, swapped, face)
         if self._should_partial_blend():
             self.blend_height_ratio = self.partial_reface_ratio
             return self._partial_face_blend(frame, swapped, face)
@@ -1586,7 +1826,7 @@ class Refacer:
     def __get_faces(self, frame, max_num=8):
         # Limit max_num to avoid detecting unnecessary faces (default 8 from app.py)
         start_detect = self._profile_start("face_detection")
-        bboxes, kpss = self.face_detector.detect(frame, max_num=max_num, metric='default')
+        bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num, metric='default')
         self._profile_end("face_detection", start_detect)
         
         if bboxes.shape[0] == 0:

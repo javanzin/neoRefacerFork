@@ -114,11 +114,21 @@ def _install_cv2_stub():
         col_idx = np.clip((np.arange(w) * src_w / w).astype(int), 0, src_w - 1)
         return src[row_idx][:, col_idx]
 
+    _COLOR_BGR2YCRCB = 36  # matches real cv2.COLOR_BGR2YCrCb value
+
     def _cvt_color(src, code):
         import numpy as np
+        if code == _COLOR_BGR2YCRCB:
+            # Same coefficients as real OpenCV's BGR<->YCrCb (ITU-R BT.601,
+            # full range): Y = 0.299R + 0.587G + 0.114B; Cr/Cb centered at 128.
+            b, g, r = src[..., 0].astype(np.float64), src[..., 1].astype(np.float64), src[..., 2].astype(np.float64)
+            y = 0.299 * r + 0.587 * g + 0.114 * b
+            cr = (r - y) * 0.713 + 128.0
+            cb = (b - y) * 0.564 + 128.0
+            return np.stack([y, cr, cb], axis=-1).astype(np.uint8 if src.dtype == np.uint8 else np.float64)
         if src.ndim == 2:
             return src
-        # BGR2GRAY (code value irrelevant to this stub — only one path used).
+        # BGR2GRAY (any other code falls back to this — only path used besides YCrCb above).
         weights = np.array([0.114, 0.587, 0.299])  # B, G, R
         return (src.astype(np.float64) * weights).sum(axis=-1)
 
@@ -184,6 +194,63 @@ def _install_cv2_stub():
         out[valid] = src[src_yi[valid], src_xi[valid]]
         return out
 
+    def _convex_hull(points):
+        # Monotone chain — standard O(n log n) convex hull, good enough for
+        # the small point sets (mouth contour, ~13 points) exercised in tests.
+        import numpy as np
+        pts = sorted({(int(p[0]), int(p[1])) for p in points})
+        if len(pts) <= 2:
+            return np.array(pts, dtype=np.int32).reshape(-1, 1, 2)
+
+        def cross(o, a, b):
+            return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+        lower = []
+        for p in pts:
+            while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+                lower.pop()
+            lower.append(p)
+        upper = []
+        for p in reversed(pts):
+            while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+                upper.pop()
+            upper.append(p)
+        hull = lower[:-1] + upper[:-1]
+        return np.array(hull, dtype=np.int32).reshape(-1, 1, 2)
+
+    def _fill_convex_poly(img, points, color):
+        # Point-in-polygon via matplotlib-free even-odd rule — fine for test
+        # fixtures, not meant to match cv2's exact rasterization pixel-for-pixel.
+        import numpy as np
+        poly = np.asarray(points).reshape(-1, 2)
+        h, w = img.shape[:2]
+        yy, xx = np.mgrid[0:h, 0:w]
+        inside = np.zeros((h, w), dtype=bool)
+        n = len(poly)
+        for i in range(n):
+            x1, y1 = poly[i]
+            x2, y2 = poly[(i + 1) % n]
+            crosses = ((y1 > yy) != (y2 > yy))
+            denom = (y2 - y1) if (y2 - y1) != 0 else 1e-9
+            x_intersect = x1 + (yy - y1) * (x2 - x1) / denom
+            inside ^= crosses & (xx < x_intersect)
+        img[inside] = color
+        return img
+
+    _ROTATE_90_CLOCKWISE = 0
+    _ROTATE_180 = 1
+    _ROTATE_90_COUNTERCLOCKWISE = 2
+
+    def _rotate(src, rotate_code):
+        import numpy as np
+        if rotate_code == _ROTATE_90_CLOCKWISE:
+            return np.rot90(src, k=-1).copy()
+        if rotate_code == _ROTATE_180:
+            return np.rot90(src, k=2).copy()
+        if rotate_code == _ROTATE_90_COUNTERCLOCKWISE:
+            return np.rot90(src, k=1).copy()
+        raise ValueError(f"unsupported rotate_code: {rotate_code}")
+
     cv2 = _install_stub(
         "cv2",
         CAP_FFMPEG=0,
@@ -195,8 +262,12 @@ def _install_cv2_stub():
         VideoCapture=_DummyCap,
         VideoWriter=lambda *a, **k: None,
         COLOR_BGR2GRAY=6,
+        COLOR_BGR2YCrCb=_COLOR_BGR2YCRCB,
         CV_64F=6,
         INTER_LINEAR=1,
+        ROTATE_90_CLOCKWISE=_ROTATE_90_CLOCKWISE,
+        ROTATE_180=_ROTATE_180,
+        ROTATE_90_COUNTERCLOCKWISE=_ROTATE_90_COUNTERCLOCKWISE,
         GaussianBlur=_gaussian_blur,
         Laplacian=_laplacian,
         resize=_resize,
@@ -204,6 +275,9 @@ def _install_cv2_stub():
         warpAffine=_warp_affine,
         invertAffineTransform=_invert_affine_transform,
         bilateralFilter=_bilateral_filter,
+        convexHull=_convex_hull,
+        fillConvexPoly=_fill_convex_poly,
+        rotate=_rotate,
     )
     cv2.VideoWriter_fourcc = staticmethod(lambda *a, **k: 0)
     return cv2
@@ -252,8 +326,9 @@ def _install_insightface_stub():
     _make_submodule("insightface", "app", common=None)
     _make_submodule("insightface.app", "common", Face=_Face)
 
-    _make_submodule("insightface", "model_zoo", inswapper=None)
+    _make_submodule("insightface", "model_zoo", inswapper=None, landmark=None)
     _make_submodule("insightface.model_zoo", "inswapper", INSwapper=object)
+    _make_submodule("insightface.model_zoo", "landmark", Landmark=object)
 
     _make_submodule("insightface", "utils", storage=None)
     _make_submodule(
