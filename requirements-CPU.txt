@@ -3,7 +3,7 @@ imageio[ffmpeg]==2.37.0
 imagecodecs==2025.3.30
 gradio==5.22.0
 insightface==0.7.3
-numpy==1.26.4
+numpy>=2
 onnx==1.14.0
 onnxruntime==1.23.2
 opencv_python==4.13.0.92
