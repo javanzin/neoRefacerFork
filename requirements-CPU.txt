@@ -5,7 +5,7 @@ gradio==5.22.0
 insightface==0.7.3
 numpy==1.26.4
 onnx==1.14.0
-onnxruntime==1.26.0
+onnxruntime==1.23.2
 opencv_python==4.13.0.92
 opencv_python_headless==4.13.0.92
 pillow_heif
