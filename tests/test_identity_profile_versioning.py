@@ -407,6 +407,117 @@ def test_extract_skin_texture_mask_excludes_landmarks_and_borders():
     assert mask[76, 34] == pytest.approx(1.0, abs=1e-4)
 
 
+def test_detect_hairline_top_finds_asymmetric_hairline():
+    # Linha de cabelo assimétrica (nasce mais cedo à esquerda do crop que à
+    # direita — o caso relatado como "vaza para a esquerda"): a detecção por
+    # coluna deve acompanhar essa inclinação, não usar um topo fixo.
+    from identity_profile import _detect_hairline_top
+
+    size = 112
+    skin_bgr = np.array([150, 170, 200], dtype=np.uint8)  # B, G, R
+    hair_bgr = np.array([30, 25, 20], dtype=np.uint8)
+    hairline_left, hairline_right = 15, 40
+    frame = np.tile(skin_bgr, (size, size, 1))
+    for x in range(size):
+        t = x / size
+        hairline_y = int(hairline_left + t * (hairline_right - hairline_left))
+        frame[:hairline_y, x] = hair_bgr
+
+    center = np.array([56.0, 60.0])
+    axes = np.array([46.0, 52.0])
+    top = _detect_hairline_top(frame, center, axes)
+
+    # Compara só nas colunas onde o teto NOMINAL da elipse já fica bem acima
+    # da linha de cabelo simulada (senão o topo detectado reflete a forma da
+    # elipse, não a linha de cabelo — comportamento correto por design, "nunca
+    # sobe além do topo nominal", mas não é o que este teste quer isolar).
+    x_left, x_right = 40, 70
+    assert top[x_left] < top[x_right]
+    real_at_left = hairline_left + (x_left / size) * (hairline_right - hairline_left)
+    real_at_right = hairline_left + (x_right / size) * (hairline_right - hairline_left)
+    assert abs(top[x_left] - real_at_left) < 5.0
+    assert abs(top[x_right] - real_at_right) < 5.0
+
+
+def test_detect_hairline_top_keeps_nominal_top_without_hair():
+    # Testa totalmente exposta (sem cabelo, franja para trás/careca): não
+    # deve haver corte artificial — o topo detectado fica no teto nominal da
+    # elipse original (nunca alarga além dele, mas também não deve encolher
+    # sem motivo).
+    from identity_profile import _detect_hairline_top
+
+    size = 112
+    skin_bgr = np.array([150, 170, 200], dtype=np.uint8)
+    frame = np.tile(skin_bgr, (size, size, 1))
+
+    center = np.array([56.0, 60.0])
+    axes = np.array([46.0, 52.0])
+    top = _detect_hairline_top(frame, center, axes)
+
+    nominal_top = center[1] - axes[1]
+    assert top[56] == pytest.approx(nominal_top, abs=1.0)
+
+
+def test_detect_hairline_top_ignores_moderate_shadow_not_hair():
+    # Sombra MODERADA na testa (20% mais escura, dentro de
+    # _HAIRLINE_Y_JUMP_THRESHOLD — uma sombra facial leve/média real) não deve
+    # ser confundida com nascimento de cabelo. Sombras muito fortes (>30% mais
+    # escuras) podem disparar o corte por design — ver docstring dos limiares
+    # sobre o trade-off aceito (nenhum canal sozinho separa perfeitamente
+    # cabelo escuro neutro de sombra forte).
+    from identity_profile import _detect_hairline_top
+
+    size = 112
+    skin_bgr = np.array([150, 170, 200], dtype=np.float64)
+    hair_bgr = np.array([30, 25, 20], dtype=np.uint8)
+    shadow_bgr = (skin_bgr * 0.8).astype(np.uint8)
+    frame = np.tile(skin_bgr.astype(np.uint8), (size, size, 1))
+    frame[35:40, :] = shadow_bgr  # sombra moderada dentro da região de pele
+    frame[:20, :] = hair_bgr  # cabelo real bem acima
+
+    center = np.array([56.0, 60.0])
+    axes = np.array([46.0, 52.0])
+    top = _detect_hairline_top(frame, center, axes)
+
+    # Deve ignorar a sombra em y=35-40 e continuar subindo até perto do
+    # cabelo real em y=20 — não parar na sombra.
+    assert top[56] < 30.0
+
+
+def test_skin_region_mask_adaptive_never_exceeds_fixed_ellipse():
+    # A máscara adaptativa só pode ENCOLHER a região de pele em relação à
+    # elipse fixa original, nunca alargá-la para fora dela (mesmo se a
+    # detecção de cabelo falhar/não encontrar nenhum salto de crominância).
+    from identity_profile import _SKIN_REGION_MASK_112, _skin_region_mask_adaptive
+
+    size = 112
+    skin_bgr = np.array([150, 170, 200], dtype=np.uint8)
+    frame = np.tile(skin_bgr, (size, size, 1))
+
+    adaptive = _skin_region_mask_adaptive(frame)
+    assert np.all(adaptive <= _SKIN_REGION_MASK_112 + 1e-6)
+
+
+def test_skin_region_mask_adaptive_shrinks_when_hairline_is_lower():
+    # Com uma linha de cabelo bem abaixo do topo nominal da elipse (testa
+    # curta), a máscara adaptativa deve zerar a área correspondente na testa
+    # — o caso relatado como "textura vazando para o cabelo".
+    from identity_profile import _skin_region_mask_adaptive
+
+    size = 112
+    skin_bgr = np.array([150, 170, 200], dtype=np.uint8)
+    hair_bgr = np.array([30, 25, 20], dtype=np.uint8)
+    frame = np.tile(skin_bgr, (size, size, 1))
+    frame[:35, :] = hair_bgr  # cabelo cobrindo até y=35, bem abaixo do topo nominal (~8)
+
+    adaptive = _skin_region_mask_adaptive(frame)
+    # Um ponto que a elipse fixa cobriria (perto do topo nominal, y=10) deve
+    # ficar zerado na máscara adaptativa, pois ali é cabelo real.
+    assert adaptive[10, 56] == pytest.approx(0.0, abs=1e-3)
+    # Um ponto de bochecha, bem abaixo da linha de cabelo, continua coberto.
+    assert adaptive[76, 34] == pytest.approx(1.0, abs=1e-2)
+
+
 def test_skin_region_mask_has_smooth_feathered_edges():
     # A máscara não pode ser binária: uma borda 0→1 em 1px vira um contorno
     # circular visível quando a textura é somada ao frame. Deve existir uma

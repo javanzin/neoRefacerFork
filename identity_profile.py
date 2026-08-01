@@ -316,6 +316,124 @@ def _skin_region_mask(crop_size=112):
 
 _SKIN_REGION_MASK_112 = _skin_region_mask(112)
 
+# Linha de referência (y, no crop 112x112) usada como "pele confirmada" pela
+# detecção adaptativa de nascimento de cabelo abaixo — mesma altura usada como
+# start da varredura por coluna. 75 fica na bochecha inferior/queixo, região
+# que a elipse já cobre com folga em qualquer rosto (bem abaixo dos olhos, em
+# y≈51.7) e nunca é tocada por cabelo, só por pele.
+_HAIRLINE_SKIN_REFERENCE_Y = 75
+
+# Saltos (em Y/Cr/Cb do YCrCb) a partir dos quais uma coluna deixa de ser
+# considerada pele ao subir a partir de _HAIRLINE_SKIN_REFERENCE_Y — ver
+# _detect_hairline_top. Qualquer um dos três passar do limiar já conta como
+# "achou cabelo" (OR, não AND): cabelo escuro NEUTRO (preto/castanho, o caso
+# mais comum) pode ter crominância (Cr/Cb) quase idêntica à de várias peles —
+# só muda MUITO em luminância (Y) — enquanto cabelo LOIRO pode ter luminância
+# parecida com a pele, mudando sobretudo em crominância. Nenhum canal sozinho
+# cobre os dois casos (confirmado empiricamente: Cr sozinho falhava em
+# cabelo preto/castanho neutro, testado com pele clara vs. cabelo escuro
+# neutro — diferença de Cr de só 19, abaixo de qualquer limiar que não
+# dispare em ruído).
+#
+# Trade-off aceito: Y_THRESHOLD baixo o bastante para pegar cabelo escuro
+# sutil também dispara em sombra facial real muito forte (>50% de queda de
+# luminância) — nesse caso a máscara perde um pouco de área de testa em troca
+# de nunca vazar visivelmente sobre cabelo. Efeito colateral é perda de
+# detalhe de textura numa faixa pequena, não uma mancha nova — assimetria de
+# risco aceitável frente ao bug relatado (contorno visível sobre cabelo).
+_HAIRLINE_Y_JUMP_THRESHOLD = 45.0
+_HAIRLINE_CR_JUMP_THRESHOLD = 12.0
+_HAIRLINE_CB_JUMP_THRESHOLD = 12.0
+
+# Sigma do blur horizontal aplicado ao perfil de linha-de-cabelo detectado
+# por coluna — a linha de cabelo real é contínua (não pula pixel a pixel), e
+# sem suavização uma única coluna ruidosa (reflexo, fio solto) criaria um
+# entalhe pontudo na máscara.
+_HAIRLINE_SMOOTH_SIGMA_PX = 3.0
+
+
+def _detect_hairline_top(aligned_bgr, center, axes):
+    """Para cada coluna dentro do envelope horizontal da elipse de pele,
+    varre de baixo (_HAIRLINE_SKIN_REFERENCE_Y, pele confirmada) para cima e
+    para no primeiro salto de luminância OU crominância (Y/Cr/Cb do YCrCb,
+    ver limiares acima) — ou seja, a borda real de pele-para-cabelo naquela
+    coluna, em vez do topo fixo da elipse (que assume uma testa mais
+    alta/larga do que a de muitos rostos, deixando a textura vazar sobre
+    cabelo — reportado visualmente como um contorno/"triângulo" na testa).
+
+    Nunca sobe além do topo nominal da elipse (`center`/`axes`, mesmo formato
+    de _skin_region_mask): a detecção só pode ENCOLHER a região de pele em
+    relação à elipse original, nunca alargá-la para fora do envelope já
+    validado (evita, por exemplo, vazar para dentro do fundo caso a franja
+    seja muito clara e passe despercebida pelo limiar).
+
+    Retorna um array (crop_size,) de floats — y do limite superior de pele
+    por coluna, já suavizado horizontalmente. Colunas fora do eixo X da
+    elipse mantêm o topo nominal (irrelevantes: a elipse já as exclui).
+    """
+    ycrcb = cv2.cvtColor(aligned_bgr, cv2.COLOR_BGR2YCrCb).astype(np.float32)
+    luma, cr, cb = ycrcb[:, :, 0], ycrcb[:, :, 1], ycrcb[:, :, 2]
+    h, w = luma.shape
+    cx, cy = center
+    ax, ay = axes
+    nominal_top = cy - ay
+    top_limit = np.full(w, nominal_top, dtype=np.float32)
+
+    ref_y = _HAIRLINE_SKIN_REFERENCE_Y
+    for x in range(w):
+        dx_ratio_sq = ((x - cx) / ax) ** 2
+        if dx_ratio_sq >= 1.0:
+            continue
+        dy = ay * np.sqrt(max(0.0, 1.0 - dx_ratio_sq))
+        ellipse_top = int(max(0, cy - dy))
+
+        luma_col, cr_col, cb_col = luma[:, x], cr[:, x], cb[:, x]
+        ref_luma, ref_cr, ref_cb = luma_col[ref_y], cr_col[ref_y], cb_col[ref_y]
+        y = ref_y
+        while y > ellipse_top:
+            jumped = (
+                abs(float(luma_col[y - 1]) - ref_luma) > _HAIRLINE_Y_JUMP_THRESHOLD
+                or abs(float(cr_col[y - 1]) - ref_cr) > _HAIRLINE_CR_JUMP_THRESHOLD
+                or abs(float(cb_col[y - 1]) - ref_cb) > _HAIRLINE_CB_JUMP_THRESHOLD
+            )
+            if jumped:
+                break
+            y -= 1
+        top_limit[x] = y
+
+    return cv2.GaussianBlur(
+        top_limit.reshape(1, -1), (0, 0), _HAIRLINE_SMOOTH_SIGMA_PX,
+    ).flatten()
+
+
+def _skin_region_mask_adaptive(aligned_bgr, crop_size=112):
+    """Variante de _skin_region_mask que recorta a borda superior da elipse
+    pela linha de nascimento de cabelo REAL do rosto em `aligned_bgr` (ver
+    _detect_hairline_top), em vez de assumir a mesma testa alta/larga para
+    todo mundo. Mantém as mesmas exclusões de olhos/nariz/boca e o mesmo
+    feathering (_smoothstep) de _skin_region_mask — só a fronteira externa
+    superior passa a variar por rosto.
+
+    Implementada como uma segunda passada de smoothstep sobre a distância
+    vertical até a linha detectada (em vez de reconstruir a máscara do zero):
+    reaproveita _SKIN_REGION_MASK_112 como teto (nunca alarga a região em
+    relação a ela) e só reduz onde a linha detectada estiver ABAIXO do topo
+    nominal da elipse naquela coluna.
+    """
+    center = np.array([56.0, 60.0])
+    axes = np.array([46.0, 52.0])
+    hairline_top = _detect_hairline_top(aligned_bgr, center, axes)
+
+    yy, xx = np.mgrid[0:crop_size, 0:crop_size].astype(np.float32)
+    feather = _SKIN_TEXTURE_MASK_FEATHER_PX
+    # Mesma rampa smoothstep de _skin_region_mask (ver _smoothstep), agora
+    # medida a partir da linha de cabelo detectada por coluna em vez de uma
+    # elipse fixa: 0 em cima da linha, 1 a partir de `feather` px abaixo dela.
+    dist_below_hairline = yy - hairline_top[np.newaxis, :]
+    hairline_mask = _smoothstep(dist_below_hairline / feather)
+
+    return np.clip(_SKIN_REGION_MASK_112 * hairline_mask, 0.0, 1.0).astype(np.float32)
+
 
 def _extract_skin_texture(frame_bgr, kps):
     """Extrai a textura de pele (frequência alta — rugas, olheiras, poros) de
@@ -350,10 +468,21 @@ def _extract_skin_texture(frame_bgr, kps):
     rugas/olheiras/poros sem o ringing que um filtro linear produziria ao
     redor de uma mancha localizada de alto contraste (uma olheira).
 
+    MÁSCARA ADAPTATIVA (_skin_region_mask_adaptive): a elipse fixa de
+    _SKIN_REGION_MASK_112 assume uma testa mais alta/larga do que a de muitos
+    rostos — como o template arcface_src é o mesmo para qualquer pessoa
+    (normaliza olhos/nariz/boca, não a linha do cabelo, que não é um
+    landmark), a mesma elipse serve de teto para todo mundo mas não se ajusta
+    a testa curta/franja baixa, deixando a textura vazar sobre cabelo
+    (reportado visualmente como um contorno/"triângulo" na testa). A variante
+    adaptativa detecta a linha real de pele-para-cabelo por crominância (ver
+    _detect_hairline_top) e só ENCOLHE a elipse onde necessário — nunca a
+    alarga além dela.
+
     Retorna um dict {"texture": array float32 (112,112) — delta de LUMINÂNCIA
-    já mascarado pela região de pele, "mask": _SKIN_REGION_MASK_112} —
-    "mask" viaja junto para quem for aplicar não precisar reimportar a
-    constante.
+    já mascarado pela região de pele, "mask": a máscara adaptativa usada
+    (varia por rosto, não é mais sempre _SKIN_REGION_MASK_112)} — "mask"
+    viaja junto para quem for aplicar não precisar recalculá-la.
     """
     aligned = face_align.norm_crop(frame_bgr, kps, image_size=112)
     gray = cv2.cvtColor(aligned, cv2.COLOR_BGR2GRAY).astype(np.float32)
@@ -362,8 +491,9 @@ def _extract_skin_texture(frame_bgr, kps):
         gray, diameter, _SKIN_TEXTURE_BILATERAL_SIGMA_COLOR, _SKIN_TEXTURE_BILATERAL_SIGMA_SPACE,
     )
     band = gray - smooth
-    masked_texture = band * _SKIN_REGION_MASK_112
-    return {"texture": masked_texture.astype(np.float32), "mask": _SKIN_REGION_MASK_112}
+    mask = _skin_region_mask_adaptive(aligned)
+    masked_texture = band * mask
+    return {"texture": masked_texture.astype(np.float32), "mask": mask}
 
 
 def _downscale_gray(frame_bgr):
@@ -504,25 +634,42 @@ def _group_samples_by_origin(samples):
 
 
 def _origin_centroids_as_pseudo_samples(samples, weight_by_sharpness=False):
-    """Um "pseudo-sample" (dict só com `embedding`) por origem distinta,
-    cada um sendo o centroide simples (sem supressão de outlier) daquela
-    origem — reaproveita _simple_mean_centroid em vez de duplicar a lógica de
-    normalização. Alimentar isso de volta em _compute_centroid faz a
-    supressão de outlier operar sobre origens, não sobre frames individuais.
+    """Um "pseudo-sample" (dict com `embedding` e `origin_weight`) por origem
+    distinta, cada um sendo o centroide simples (sem supressão de outlier)
+    daquela origem — reaproveita _simple_mean_centroid em vez de duplicar a
+    lógica de normalização. Alimentar isso de volta em _compute_centroid faz
+    a supressão de outlier operar sobre origens, não sobre frames
+    individuais.
+
+    `origin_weight` = sqrt(n_frames_da_origem) (ver _origin_weights): uma
+    origem com 1 amostra (foto avulsa) pesa 1; um vídeo com 200 frames pesa
+    ~14, não 1 (peso igual = vídeo com várias expressões/poses vale o mesmo
+    que uma única foto, subrepresentando a diversidade real que ele capturou)
+    nem 200 (frame bruto = vídeo dominando o centroide sobre o conjunto de
+    fotos). sqrt comprime a escala pelo mesmo motivo de _sharpness_weights.
 
     weight_by_sharpness (default False): pondera as amostras DENTRO de cada
-    origem pela nitidez (ver _sharpness_weights). Entre origens o peso segue
-    igual (1 pseudo-sample cada) — a ponderação por nitidez não deve desfazer
-    o balanceamento por origem.
+    origem pela nitidez (ver _sharpness_weights). Não interfere no
+    `origin_weight` — nitidez é relativa dentro da origem, volume é relativo
+    entre origens, os dois pesos são ortogonais.
     """
     groups = _group_samples_by_origin(samples)
     return [
-        {"embedding": _simple_mean_centroid(
-            group_samples,
-            weights=_sharpness_weights(group_samples) if weight_by_sharpness else None,
-        )}
+        {
+            "embedding": _simple_mean_centroid(
+                group_samples,
+                weights=_sharpness_weights(group_samples) if weight_by_sharpness else None,
+            ),
+            "origin_weight": np.sqrt(len(group_samples)),
+        }
         for group_samples in groups.values()
     ]
+
+
+def _origin_weights(pseudo_samples):
+    """Extrai `origin_weight` dos pseudo-samples de _origin_centroids_as_pseudo_samples
+    como array, para uso como base_weights em _compute_centroid."""
+    return np.array([s["origin_weight"] for s in pseudo_samples], dtype=np.float64)
 
 
 def _origin_summaries(samples, content_hashes=None):
@@ -556,33 +703,39 @@ def _origin_summaries(samples, content_hashes=None):
 def _compute_balanced_centroid(samples, weight_by_sharpness=False):
     """Centroide robusto (mesma supressão de outlier de _compute_centroid),
     mas operando sobre um centroide por origem em vez das amostras cruas —
-    um vídeo de centenas de frames vira 1 pseudo-sample, equalizando sua
-    contribuição à de uma foto avulsa (que já é, por definição, sua própria
-    origem com 1 amostra).
+    um vídeo de centenas de frames vira 1 pseudo-sample com peso
+    sqrt(n_frames), equalizando sua contribuição à de uma foto avulsa (peso 1,
+    por ser sua própria origem com 1 amostra) sem reduzi-la a "vale o mesmo
+    que 1 foto" nem deixá-la voltar a dominar por volume bruto — ver
+    _origin_centroids_as_pseudo_samples para a motivação do sqrt.
 
     Com uma única origem, o resultado é a MESMA DIREÇÃO dominante de
-    _compute_centroid(samples), mas não necessariamente bit-a-bit idêntico:
-    com 1 pseudo-sample (a origem única), a função cai no atalho "<=3
-    amostras" e retorna a média simples direto, sem as iterações de
-    reponderação que _compute_centroid(samples) aplicaria caso houvesse mais
-    de 3 amostras cruas — reponderar 1 pseudo-sample contra si mesmo não
-    mudaria o resultado de qualquer forma (toda amostra teria peso 1), então
-    a única diferença observável é de arredondamento de ponto flutuante
-    (ver test_single_origin_matches_current_behavior), não de direção.
+    _compute_centroid(samples) (o peso de uma origem única não muda direção,
+    só escala, e é normalizado na média), mas não necessariamente bit-a-bit
+    idêntico: com 1 pseudo-sample, a função cai no atalho "<=3 amostras" e
+    retorna a média simples ponderada direto, sem as iterações de
+    reponderação por similaridade que _compute_centroid(samples) aplicaria
+    caso houvesse mais de 3 amostras cruas — a única diferença observável é
+    de arredondamento de ponto flutuante (ver
+    test_single_origin_matches_current_behavior), não de direção.
 
     weight_by_sharpness: ver _origin_centroids_as_pseudo_samples — pondera
-    por nitidez dentro de cada origem, mantendo o peso igual entre origens.
+    por nitidez dentro de cada origem, ortogonal ao peso por volume entre
+    origens.
     """
-    return _compute_centroid(_origin_centroids_as_pseudo_samples(samples, weight_by_sharpness=weight_by_sharpness))
+    pseudo_samples = _origin_centroids_as_pseudo_samples(samples, weight_by_sharpness=weight_by_sharpness)
+    return _compute_centroid(pseudo_samples, base_weights=_origin_weights(pseudo_samples))
 
 
 def _compute_balanced_mean(samples):
     """Variante de _compute_balanced_centroid SEM supressão de outlier —
     usada por merge_profiles, que deliberadamente evita suprimir qualquer
     amostra (ver docstring de merge_profiles). Ainda assim equaliza a
-    contribuição por origem antes da média final.
+    contribuição por origem antes da média final, com o mesmo peso
+    sqrt(n_frames) por origem (ver _origin_centroids_as_pseudo_samples).
     """
-    return _simple_mean_centroid(_origin_centroids_as_pseudo_samples(samples))
+    pseudo_samples = _origin_centroids_as_pseudo_samples(samples)
+    return _simple_mean_centroid(pseudo_samples, weights=_origin_weights(pseudo_samples))
 
 
 def _apply_anchor(base_centroid, anchor_embedding, anchor_weight):

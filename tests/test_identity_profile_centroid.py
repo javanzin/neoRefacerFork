@@ -20,6 +20,7 @@ from identity_profile import (
     _compute_balanced_mean,
     _compute_centroid,
     _group_samples_by_origin,
+    _origin_centroids_as_pseudo_samples,
     _simple_mean_centroid,
     ROBUST_CENTROID_SIMILARITY_FLOOR,
     apply_anchor_to_profile,
@@ -185,6 +186,50 @@ def test_balanced_centroid_equalizes_origin_contribution():
     # o cálculo não-balanceado, que é dominado pela origem A (500 amostras).
     assert np.linalg.norm(balanced - midpoint) < np.linalg.norm(unbalanced - midpoint)
     assert np.linalg.norm(unbalanced - centroid_a) < np.linalg.norm(balanced - centroid_a)
+
+
+def test_origin_pseudo_sample_weight_is_sqrt_of_frame_count():
+    # Peso por origem deve ser sqrt(n_frames), não 1 (peso igual antigo) nem
+    # n_frames (dominância bruta antiga) — ver _origin_centroids_as_pseudo_samples.
+    samples_a = [_sample([1.0, 0.0], origin="video.mp4") for _ in range(200)]
+    samples_b = [_sample([0.0, 1.0], origin="foto.jpg") for _ in range(1)]
+    pseudo = _origin_centroids_as_pseudo_samples(samples_a + samples_b)
+    weights = {tuple(p["embedding"]): p["origin_weight"] for p in pseudo}
+    assert weights[(1.0, 0.0)] == pytest.approx(np.sqrt(200))
+    assert weights[(0.0, 1.0)] == pytest.approx(1.0)
+
+
+def test_balanced_centroid_video_outweighs_but_does_not_dominate_photos():
+    # Origem A: 1 vídeo com 200 amostras perto de [1, 0, 0].
+    # Origem B..F: 50 fotos avulsas perto de [0.6, 0.8, 0] (1 amostra cada).
+    # Com peso igual (comportamento antigo), o vídeo (peso 1) pesaria MENOS
+    # que o conjunto das 50 fotos (peso 50 combinado) — o vídeo quase não
+    # conta. Com sqrt(n), o vídeo pesa sqrt(200)=~14.1, mais que 1 foto
+    # isolada mas menos que as 50 fotos combinadas: nem domina, nem some.
+    rng = np.random.default_rng(7)
+    base_video = np.array([1.0, 0.0, 0.0])
+    base_photos = np.array([0.6, 0.8, 0.0])
+    samples_video = [_sample(base_video + rng.normal(scale=0.01, size=3), origin="video.mp4") for _ in range(200)]
+    samples_photos = [_sample(base_photos + rng.normal(scale=0.01, size=3), origin=f"foto_{i}.jpg") for i in range(50)]
+    all_samples = samples_video + samples_photos
+
+    balanced = _compute_balanced_centroid(all_samples)
+    centroid_video = _simple_mean_centroid(samples_video)
+    centroid_photos = _simple_mean_centroid(samples_photos)
+
+    # O vídeo pesa mais que a distância que o peso-igual (antigo) produziria:
+    # com peso 1 para o vídeo vs. 50 fotos com peso 1 cada, o resultado ficaria
+    # a ~1/51 do caminho entre as fotos e o vídeo. sqrt(200)=~14.1 contra 50
+    # fotos de peso 1 cada deve puxar o centroide bem mais para perto do vídeo
+    # do que isso.
+    old_equal_weight = (centroid_video + 50 * centroid_photos)
+    old_equal_weight = old_equal_weight / np.linalg.norm(old_equal_weight)
+    assert np.linalg.norm(balanced - centroid_video) < np.linalg.norm(old_equal_weight - centroid_video)
+
+    # Mas ainda não domina como o cálculo bruto por frame (peso 200 vs 50)
+    # dominaria: o vídeo não deve colapsar o centroide balanceado para cima
+    # dele mesmo.
+    assert np.linalg.norm(balanced - centroid_video) > 1e-3
 
 
 def test_origin_grouping_uses_origin_field_not_source_string():
