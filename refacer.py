@@ -60,7 +60,7 @@ if sys.platform in ("win32", "win64"):
 # Para REVERTER por completo: mude esta constante para False. Todo o código
 # novo (import Landmark, __init_apps, _swap_one) já checa essa flag e vira
 # no-op quando desligada, sem precisar apagar nada.
-OPEN_MOUTH_FIX_ENABLED = True
+OPEN_MOUTH_FIX_ENABLED = False
 
 # FEATURE FLAG — fallback de rotação para pose "deitada" (ver
 # _detect_with_rotation_fallback, MELHORIAS.md seção "Pose lateral/deitada").
