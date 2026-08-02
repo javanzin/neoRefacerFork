@@ -20,11 +20,18 @@ ficar com a rotação de maior score, e desfazer a rotação nas coordenadas
 (bbox/kps) antes de retornar — o resto do pipeline nunca precisa saber que
 uma rotação aconteceu.
 
-Escopo desta primeira versão (decisão consciente): sem cache/memória da
-última rotação "boa" entre frames — testa sempre do zero. Otimização
-(lembrar a rotação do frame anterior) fica para depois, se o custo de
-CPU/GPU em cenas longas de "deitado" se mostrar um problema real.
+Histerese entre frames (video_hash): a v1 não guardava memória da última
+rotação "boa" entre frames — decisão consciente para simplicidade. Validação
+com vídeo real mostrou o custo dessa escolha: quando o score oscila perto de
+ROTATE_FACE_FALLBACK_MIN_SCORE de um frame para o outro, o ângulo escolhido
+também oscilava, produzindo tremor/flicker visível no rosto trocado. A
+mitigação (ver ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN) guarda o último ângulo
+por vídeo (self._rotation_hysteresis, chaveado por video_hash como o resto
+dos caches da classe) e só troca de ângulo quando outro candidato vencer por
+uma margem clara — testada abaixo em test_hysteresis_*.
 """
+from collections import defaultdict
+
 import numpy as np
 import pytest
 
@@ -263,6 +270,160 @@ def test_rotate_frame_and_unrotate_point_are_mutually_consistent(refacer_stub):
         back_x, back_y = refacer_stub._unrotate_point(rot_x, rot_y, angle, orig_w, orig_h)
         assert back_x == pytest.approx(px, abs=1)
         assert back_y == pytest.approx(py, abs=1)
+
+
+class _SequencedFakeDetector:
+    """Como _FakeDetector, mas o score de cada ângulo pode variar a cada
+    chamada — simula frames sucessivos de um vídeo real onde o score do
+    detector oscila perto do threshold em vez de ficar fixo."""
+
+    def __init__(self, score_by_angle_sequence):
+        # {angle: [score_frame0, score_frame1, ...]} — None = sem detecção.
+        self.score_by_angle_sequence = score_by_angle_sequence
+        self.call_counts = defaultdict(int)
+        self.calls = []
+
+    def detect(self, frame, max_num=0, metric='default'):
+        angle = getattr(frame, "_rotation_angle_marker", 0)
+        self.calls.append(angle)
+        seq = self.score_by_angle_sequence.get(angle, [])
+        idx = self.call_counts[angle]
+        self.call_counts[angle] += 1
+        score = seq[idx] if idx < len(seq) else (seq[-1] if seq else None)
+        if score is None:
+            return np.zeros((0, 5), dtype=np.float32), None
+        h, w = frame.shape[:2]
+        bbox, kps = _bbox_kps(w / 2, h / 2, det_score=score)
+        return bbox[np.newaxis, :], kps[np.newaxis, :]
+
+
+def test_hysteresis_keeps_previous_angle_when_new_winner_is_within_margin(monkeypatch, refacer_stub):
+    """Frame 1: 0° perde, 180° vence com folga (fica sticky em 180°).
+    Frame 2: score de 0° sobe um pouco, mas não o suficiente para superar
+    180° pela margem de histerese — deve continuar em 180°, não voltar
+    para 0° só porque virou numericamente maior no meio do caminho."""
+    from refacer import ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN
+
+    detector = _SequencedFakeDetector({
+        0: [0.1, 0.45],
+        180: [0.9, 0.5],
+    })
+    refacer_stub.face_detector = detector
+    refacer_stub._rotation_hysteresis = {}
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+    assert 0.5 - 0.45 < ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes1, _ = refacer_stub._detect_with_rotation_fallback(frame, video_hash="vid-a")
+    assert bboxes1[0, 4] == pytest.approx(0.9)
+    assert refacer_stub._rotation_hysteresis["vid-a"] == 180
+
+    bboxes2, _ = refacer_stub._detect_with_rotation_fallback(frame, video_hash="vid-a")
+    assert refacer_stub._rotation_hysteresis["vid-a"] == 180
+    assert bboxes2[0, 4] == pytest.approx(0.5)
+
+
+def test_hysteresis_switches_angle_when_new_winner_exceeds_margin(monkeypatch, refacer_stub):
+    """Depois de ficar sticky em 180°, se 90° passar a vencer por uma
+    margem clara (não só por uma fração), a histerese deve soltar o ângulo
+    antigo e migrar — não é um lock permanente, só amortecimento de ruído."""
+    detector = _SequencedFakeDetector({
+        0: [0.1, 0.1],
+        180: [0.9, 0.2],
+        90: [0.3, 0.95],
+    })
+    refacer_stub.face_detector = detector
+    refacer_stub._rotation_hysteresis = {}
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes1, _ = refacer_stub._detect_with_rotation_fallback(frame, video_hash="vid-b")
+    assert refacer_stub._rotation_hysteresis["vid-b"] == 180
+
+    bboxes2, _ = refacer_stub._detect_with_rotation_fallback(frame, video_hash="vid-b")
+    assert refacer_stub._rotation_hysteresis["vid-b"] == 90
+    assert bboxes2[0, 4] == pytest.approx(0.95)
+
+
+def test_hysteresis_is_scoped_per_video_hash(monkeypatch, refacer_stub):
+    """Dois vídeos processados na mesma instância (jobs sequenciais no
+    mesmo run()) não podem compartilhar o ângulo sticky um do outro."""
+    detector = _FakeDetector({0: 0.1, 180: 0.9})
+    refacer_stub.face_detector = detector
+    refacer_stub._rotation_hysteresis = {"vid-other": 270}
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, _ = refacer_stub._detect_with_rotation_fallback(frame, video_hash="vid-new")
+
+    assert refacer_stub._rotation_hysteresis["vid-new"] == 180
+    assert refacer_stub._rotation_hysteresis["vid-other"] == 270
+    assert bboxes[0, 4] == pytest.approx(0.9)
+
+
+def test_no_hysteresis_when_video_hash_is_not_passed(monkeypatch, refacer_stub):
+    """Caminho paralelo (reface_group, frames fora de ordem) não passa
+    video_hash — deve se comportar exatamente como antes da histerese
+    (decisão pura por maior score, sem estado entre chamadas)."""
+    detector = _FakeDetector({0: 0.15, 90: 0.4, 180: 0.3, 270: 0.6})
+    refacer_stub.face_detector = detector
+    refacer_stub._rotation_hysteresis = {}
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, _ = refacer_stub._detect_with_rotation_fallback(frame, max_num=8, metric='default')
+
+    assert bboxes[0, 4] == pytest.approx(0.6)
+    assert refacer_stub._rotation_hysteresis == {}
+
+
+def test_instance_override_disables_fallback_even_if_global_flag_is_on(monkeypatch, refacer_stub):
+    """UI checkbox desligado: reface() seta self.rotate_face_fallback_enabled
+    = False, que deve vencer sobre ROTATE_FACE_FALLBACK_ENABLED = True."""
+    detector = _FakeDetector({0: 0.1, 180: 0.9})
+    refacer_stub.face_detector = detector
+    refacer_stub.rotate_face_fallback_enabled = False
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, kpss = refacer_stub._detect_with_rotation_fallback(frame, max_num=8, metric='default')
+
+    assert detector.calls == [0]
+    assert bboxes.shape[0] == 1
+    assert bboxes[0, 4] == pytest.approx(0.1)
+
+
+def test_instance_override_none_falls_back_to_global_flag(monkeypatch, refacer_stub):
+    """Sem override explícito (None, default), comportamento é o mesmo de
+    antes: segue ROTATE_FACE_FALLBACK_ENABLED."""
+    detector = _FakeDetector({0: 0.1, 180: 0.9})
+    refacer_stub.face_detector = detector
+    refacer_stub.rotate_face_fallback_enabled = None
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, kpss = refacer_stub._detect_with_rotation_fallback(frame, max_num=8, metric='default')
+
+    assert 180 in detector.calls
+    assert bboxes[0, 4] == pytest.approx(0.9)
 
 
 def test_disabled_by_feature_flag_skips_rotation_entirely(monkeypatch, refacer_stub):

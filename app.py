@@ -506,12 +506,27 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
     destinations = vars[(num_faces+1):(num_faces*2)+1]
     thresholds = vars[(num_faces*2)+1:(num_faces*3)+1]
     identity_profiles = vars[(num_faces*3)+1:(num_faces*4)+1]
-    identity_profile_selections = vars[(num_faces*4)+1:-5]
-    preview = vars[-5]
-    face_mode = vars[-4]
-    partial_reface_ratio = vars[-3]
-    mouth_rect_mask = vars[-2]
-    use_cache = vars[-1]
+
+    # Video tab passes one extra trailing checkbox (rotate_face_fallback_video)
+    # that GIF tab doesn't have — tell the two apart by how many fixed
+    # trailing args follow identity_profile_selections (num_faces items),
+    # instead of assuming a single fixed layout shared by both tabs.
+    fixed_prefix = (num_faces*4)+1
+    trailing = len(vars) - fixed_prefix - num_faces
+    is_video_tab = trailing == 6
+    trailing_count = 6 if is_video_tab else 4
+    identity_profile_selections = vars[fixed_prefix:-trailing_count]
+    preview = vars[-trailing_count]
+    face_mode = vars[-trailing_count+1]
+    partial_reface_ratio = vars[-trailing_count+2]
+    if is_video_tab:
+        mouth_rect_mask = vars[-3]
+        use_cache = vars[-2]
+        rotate_face_fallback_enabled = vars[-1]
+    else:
+        mouth_rect_mask = False
+        use_cache = vars[-1]
+        rotate_face_fallback_enabled = False
     partial_blend_shape = "mouth_rect" if mouth_rect_mask else "rect"
 
     disable_similarity = (face_mode in ["Single Face", "Multiple Faces"])
@@ -555,7 +570,8 @@ def run(progress=gr.Progress(track_tqdm=True), *vars):
                 partial_reface_ratio=partial_reface_ratio,
                 partial_blend_shape=partial_blend_shape,
                 use_cache=use_cache,
-                precomputed=precomputed
+                precomputed=precomputed,
+                rotate_face_fallback_enabled=rotate_face_fallback_enabled
             )
         except Exception as e:
             # A bad destination image (or any per-job failure) must not
@@ -2080,6 +2096,11 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             )
             partial_reface_ratio_video = gr.Slider(label="Reface Ratio (0 = Full Face, 0.5 = Half Face)", minimum=0.0, maximum=0.5, value=0.0, step=0.1)
             mouth_rect_mask_video = gr.Checkbox(label="Mouth Rect Mask (lip-to-chin, preserves cheeks)", value=False)
+            rotate_face_fallback_video = gr.Checkbox(
+                label="Rosto deitado/de cabeça para baixo (tenta rotações 90/180/270°)",
+                value=False,
+                info="Só ligue se você sabe que há rosto girado no vídeo — evita custo extra de detecção quando não há."
+            )
             video_btn = gr.Button("Reface Video", variant="primary")
             cancel_video_btn = gr.Button("⏹ Cancelar Tudo", variant="stop")
 
@@ -2259,7 +2280,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
 
         video_event = video_btn.click(
             fn=run_with_history_update,
-            inputs=[video_input] + origin_video + destination_video + thresholds_video + identity_profile_video + identity_profile_selection_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, mouth_rect_mask_video, use_cache_video],
+            inputs=[video_input] + origin_video + destination_video + thresholds_video + identity_profile_video + identity_profile_selection_video + [preview_checkbox_video, face_mode_video, partial_reface_ratio_video, mouth_rect_mask_video, use_cache_video, rotate_face_fallback_video],
             outputs=[video_output, gr.File(visible=False), history_display]
         )
 

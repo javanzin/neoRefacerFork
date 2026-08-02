@@ -77,6 +77,16 @@ ROTATE_FACE_FALLBACK_ENABLED = True
 ROTATE_FACE_FALLBACK_MIN_SCORE = 0.5
 ROTATE_FACE_FALLBACK_ANGLES = (90, 180, 270)
 
+# Histerese entre frames para o fallback acima: sem isso, quando o score do
+# frame original oscila perto de ROTATE_FACE_FALLBACK_MIN_SCORE de um frame
+# para o outro, o ângulo escolhido também oscila (0/90/180/270), produzindo
+# tremor/flicker visível no rosto trocado em vídeo real (não aparecia nos
+# testes sintéticos, que não têm essa oscilação frame a frame). Mitigação:
+# lembrar o último ângulo "bom" por vídeo e só trocar de ângulo quando o novo
+# candidato vencer por uma margem clara, não apenas por ser numericamente
+# maior — o ângulo já em uso tem preferência (inclusive o próprio 0°).
+ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN = 0.15
+
 
 class RefacerMode(Enum):
     CPU, CUDA, COREML, TENSORRT = range(1, 5)
@@ -229,7 +239,17 @@ class Refacer:
         # was silently repeated every time. Only one video is kept at a time.
         self._analysis_cache_key = None
         self._analysis_cache_result = None
-    
+
+        # Último ângulo "bom" escolhido por _detect_with_rotation_fallback,
+        # por vídeo — ver ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN.
+        self._rotation_hysteresis = {}  # {video_hash: angle}
+
+        # Override de instância para ROTATE_FACE_FALLBACK_ENABLED, setado por
+        # reface() a partir do checkbox da UI ("Rotate Fallback (deitado)").
+        # None = segue a constante global (comportamento antigo, ex.: scripts
+        # que chamam Refacer diretamente sem passar pela UI).
+        self.rotate_face_fallback_enabled = None
+
     def _profile_start(self, name):
         """Start profiling a section."""
         if self.profiling_enabled:
@@ -365,6 +385,7 @@ class Refacer:
         self._clear_frame_cache()
         self._analysis_cache_key = None
         self._analysis_cache_result = None
+        self._rotation_hysteresis = {}
 
     @staticmethod
     def _rotate_frame(frame, angle):
@@ -395,7 +416,7 @@ class Refacer:
             return orig_w - 1 - y, x
         return x, y
 
-    def _detect_with_rotation_fallback(self, frame, max_num=0, metric='default'):
+    def _detect_with_rotation_fallback(self, frame, max_num=0, metric='default', video_hash=None):
         """Detecta rosto tentando primeiro o frame original (0°, custo igual
         ao de hoje); só se o melhor score vier abaixo de
         ROTATE_FACE_FALLBACK_MIN_SCORE (ou nenhum rosto for achado) tenta
@@ -406,24 +427,55 @@ class Refacer:
         — ver ROTATE_FACE_FALLBACK_ENABLED. Diferente de yaw/pitch (virar a
         cabeça para o lado olhando para outro ponto), que é perda real de
         profundidade 3D sem correção 2D possível.
+
+        video_hash (opcional) ativa a histerese entre frames: o ângulo já em
+        uso no vídeo (self._rotation_hysteresis[video_hash]) só é trocado se
+        outro candidato vencer por ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN de
+        score, evitando o ângulo "piscar" quando o score oscila perto do
+        threshold de um frame para o outro. Chamadores que processam frames
+        fora de ordem (ex.: reface_group via ThreadPoolExecutor) devem
+        continuar sem passar video_hash — a histerese só é válida quando os
+        frames chegam em ordem sequencial.
         """
         bboxes, kpss = self.face_detector.detect(frame, max_num=max_num, metric=metric)
-        if not ROTATE_FACE_FALLBACK_ENABLED:
+        fallback_enabled = getattr(self, 'rotate_face_fallback_enabled', None)
+        if fallback_enabled is None:
+            fallback_enabled = ROTATE_FACE_FALLBACK_ENABLED
+        if not fallback_enabled:
             return bboxes, kpss
 
+        sticky_angle = self._rotation_hysteresis.get(video_hash, 0) if video_hash else 0
+
         best_score = bboxes[:, 4].max() if bboxes.shape[0] > 0 else -1.0
-        if best_score >= ROTATE_FACE_FALLBACK_MIN_SCORE:
+        if best_score >= ROTATE_FACE_FALLBACK_MIN_SCORE and sticky_angle == 0:
             return bboxes, kpss
 
         orig_h, orig_w = frame.shape[:2]
         best_bboxes, best_kpss, best_angle = bboxes, kpss, 0
 
+        candidates = {0: best_score}
         for angle in ROTATE_FACE_FALLBACK_ANGLES:
             rotated_frame = self._rotate_frame(frame, angle)
             cand_bboxes, cand_kpss = self.face_detector.detect(rotated_frame, max_num=max_num, metric=metric)
             cand_score = cand_bboxes[:, 4].max() if cand_bboxes.shape[0] > 0 else -1.0
+            candidates[angle] = cand_score
             if cand_score > best_score:
                 best_score, best_bboxes, best_kpss, best_angle = cand_score, cand_bboxes, cand_kpss, angle
+
+        if sticky_angle != 0 and sticky_angle != best_angle:
+            sticky_score = candidates.get(sticky_angle, -1.0)
+            if sticky_score >= 0 and best_score - sticky_score < ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN:
+                # Candidato vencedor não superou o ângulo já em uso por margem
+                # suficiente — mantém o ângulo anterior para não "piscar".
+                if sticky_angle == 0:
+                    best_bboxes, best_kpss, best_angle = bboxes, kpss, 0
+                else:
+                    sticky_frame = self._rotate_frame(frame, sticky_angle)
+                    best_bboxes, best_kpss = self.face_detector.detect(sticky_frame, max_num=max_num, metric=metric)
+                    best_angle = sticky_angle
+
+        if video_hash:
+            self._rotation_hysteresis[video_hash] = best_angle
 
         if best_angle == 0 or best_bboxes.shape[0] == 0:
             return best_bboxes, best_kpss
@@ -481,9 +533,9 @@ class Refacer:
 
         # Cache miss: do full detection and cache result
         start_detect = self._profile_start("face_detection")
-        bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num, metric='default')
+        bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num, metric='default', video_hash=video_hash)
         self._profile_end("face_detection", start_detect)
-        
+
         # Cache detection result (bboxes + kpss only, no embeddings)
         self._set_light_cache(video_hash, frame_idx, bboxes, kpss)
 
@@ -572,7 +624,7 @@ class Refacer:
                     return None
 
                 start_detect = self._profile_start("face_detection")
-                bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num_faces, metric='default')
+                bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num_faces, metric='default', video_hash=video_hash)
                 self._profile_end("face_detection", start_detect)
 
                 # Embeddings depend only on the frame, not on which source face a
@@ -1284,7 +1336,7 @@ class Refacer:
                     break
                 
                 # Detect faces
-                bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num_faces)
+                bboxes, kpss = self._detect_with_rotation_fallback(frame, max_num=max_num_faces, video_hash=video_hash)
                 
                 frame_data = {
                     "bboxes": bboxes,
@@ -1881,7 +1933,8 @@ class Refacer:
                     output.write(result)
 
     def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False,
-               partial_reface_ratio=0.0, partial_blend_shape="rect", use_cache=False, precomputed=None):
+               partial_reface_ratio=0.0, partial_blend_shape="rect", use_cache=False, precomputed=None,
+               rotate_face_fallback_enabled=None):
         """Reface video with optional caching for faster subsequent runs.
 
         Args:
@@ -1893,6 +1946,12 @@ class Refacer:
             partial_reface_ratio: Ratio for partial face blending (0-0.5). Only used
                 when partial_blend_shape="rect"; ignored in "mouth_rect" mode, which
                 sizes itself from the mouth keypoints instead.
+            rotate_face_fallback_enabled: Overrides ROTATE_FACE_FALLBACK_ENABLED for
+                this call (None = usa a constante global). Ligado explicitamente pelo
+                usuário na UI só quando ele sabe que o vídeo tem rosto deitado/de
+                cabeça para baixo — evita o custo de detecção extra (até 4x nos
+                frames com score baixo) em vídeos onde isso nunca vai disparar de
+                verdade.
             partial_blend_shape: "rect" (default, straight horizontal cutoff) or
                 "mouth_rect" (opt-in narrow rectangle from upper lip to chin,
                 preserving cheeks — see REVIEW_GERAL_VIDEO.md achado #discutido).
@@ -1901,6 +1960,8 @@ class Refacer:
                 multiple faces/jobs for the same video within the same run. When
                 given, takes priority over use_cache — no hash-keyed cache involved.
         """
+        self.rotate_face_fallback_enabled = rotate_face_fallback_enabled
+
         if precomputed is not None:
             original_name = osp.splitext(osp.basename(video_path))[0]
             timestamp = str(int(time.time()))
