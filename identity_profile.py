@@ -958,26 +958,38 @@ class IdentityProfileBuilder:
         origem (ver _build_profile_from_samples/balance_by_origin). Se
         omitido, a própria imagem é sua origem (source_label já é o nome cru
         neste caso — não há sufixo a remover).
+
+        Detecta TODOS os rostos do frame (max_num=0), não só o mais
+        proeminente — uma foto de grupo/com mais gente ao fundo tem o rosto
+        do alvo descartado por completo se só o mais central/maior fosse
+        extraído (o extra nunca chegava nem a virar amostra, silenciosamente
+        perdido). Cada rosto vira um candidato próprio, e cluster_samples()
+        já existe justamente para separar por pessoa depois — reaproveita a
+        mesma extração N-rostos que find_match_in_frame usa para busca
+        dirigida (ver docstring lá), só sem o filtro por identidade-alvo.
         """
         if frame_bgr is None:
             self.discarded.append({"source": source_label, "reason": "imagem inválida"})
             return
 
-        bboxes, kpss = self._detector.detect(frame_bgr, max_num=1, metric="max")
+        bboxes, kpss = self._detector.detect(frame_bgr, max_num=0)
         if bboxes.shape[0] == 0:
             self.discarded.append({"source": source_label, "reason": "nenhum rosto detectado"})
             return
 
-        bbox = bboxes[0, 0:4]
-        det_score = float(bboxes[0, 4])
-        kps = kpss[0] if kpss is not None else None
-        self._add_face_candidate(frame_bgr, bbox, kps, det_score, source_label, origin=origin if origin is not None else source_label)
+        origin = origin if origin is not None else source_label
+        for i in range(bboxes.shape[0]):
+            bbox = bboxes[i, 0:4]
+            det_score = float(bboxes[i, 4])
+            kps = kpss[i] if kpss is not None else None
+            label = f"{source_label} (rosto {i + 1})" if bboxes.shape[0] > 1 else source_label
+            self._add_face_candidate(frame_bgr, bbox, kps, det_score, label, origin=origin)
 
     def _add_face_candidate(self, frame_bgr, bbox, kps, det_score, source_label, origin):
         """Núcleo de validação de qualidade + montagem de amostra
-        compartilhado entre add_image (1 rosto por frame, o mais proeminente)
-        e find_match_in_frame (N rostos por frame, todos os candidatos que
-        baterem com um perfil-alvo).
+        compartilhado entre add_image (todos os rostos do frame, sem filtro
+        de identidade) e find_match_in_frame (todos os rostos do frame, só os
+        candidatos que baterem com um perfil-alvo).
 
         origin identifica a origem "crua" da amostra (nome do arquivo/vídeo,
         sem os sufixos de exibição que source_label pode carregar como
