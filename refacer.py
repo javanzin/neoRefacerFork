@@ -87,6 +87,21 @@ ROTATE_FACE_FALLBACK_ANGLES = (90, 180, 270)
 # maior — o ângulo já em uso tem preferência (inclusive o próprio 0°).
 ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN = 0.15
 
+# Roll (graus) máximo tolerado no candidato de 0° para aceitá-lo direto, sem
+# comparar com as rotações candidatas — ver _estimate_roll_degrees/
+# _nearest_right_angle_offset. Só entra em jogo com o fallback já habilitado
+# (ROTATE_FACE_FALLBACK_ENABLED/checkbox da UI); com o fallback desligado,
+# _detect_with_rotation_fallback retorna antes de qualquer cálculo de roll —
+# zero custo extra. Valor bem abaixo de 45° (o ponto de ambiguidade total
+# entre dois múltiplos de 90° vizinhos): um rosto real raramente tem roll
+# exatamente 0°, então o limiar precisa de folga para não gerar comparação
+# extra em todo frame; 45° é o valor MÁXIMO possível de
+# _nearest_right_angle_offset (nunca filtraria nada, já que o candidato
+# "vence" 0° por score de qualquer forma) — o corte real de decisão (roll
+# ~45-50° "puxa" para o múltiplo de 90° vizinho) só existe se este limiar for
+# claramente menor que 45.
+ROTATE_FACE_FALLBACK_MAX_ROLL_DEGREES = 25.0
+
 
 class RefacerMode(Enum):
     CPU, CUDA, COREML, TENSORRT = range(1, 5)
@@ -416,12 +431,52 @@ class Refacer:
             return orig_w - 1 - y, x
         return x, y
 
+    @staticmethod
+    def _estimate_roll_degrees(kps):
+        """Estima o roll (graus, sentido horário) do rosto a partir dos dois
+        keypoints do olho (índices 0=esquerdo, 1=direito — convenção SCRFD/
+        insightface, ver face_align). Um rosto "em pé" tem os olhos na mesma
+        altura (roll≈0°); cabeça inclinada de lado desloca essa linha.
+
+        Só cobre o range onde atan2 é geometricamente ambíguo por natureza
+        (uma linha olho-olho de +45° é indistinguível de -135°, já que os
+        dois pontos não têm identidade fixa de "qual lado está pra cima" sem
+        outro ponto de referência) — para o uso aqui (decidir entre 0/90/
+        180/270° de rotação JÁ aplicada ao frame antes de detectar), isso
+        basta: o objetivo não é o roll absoluto, é o quão perto de 0° (linha
+        de base) o candidato já detectado está.
+        """
+        (lx, ly), (rx, ry) = kps[0], kps[1]
+        return np.degrees(np.arctan2(ry - ly, rx - lx))
+
+    @staticmethod
+    def _nearest_right_angle_offset(roll_degrees):
+        """Distância (graus, sempre em [0, 45]) do roll estimado até o
+        múltiplo de 90° mais próximo — 0 = perfeitamente alinhado ao
+        referencial atual (0/90/180/270°, dependendo de qual candidato já
+        rotacionado gerou este keypoint), 45 = exatamente a meio caminho
+        entre dois múltiplos vizinhos (ambiguidade máxima, nenhuma rotação
+        fixa é claramente "a certa"). Comparado contra
+        ROTATE_FACE_FALLBACK_MAX_ROLL_DEGREES (bem menor que 45) para decidir
+        se o candidato de 0° pode ser aceito sem custo extra de comparação."""
+        return abs(((roll_degrees + 45) % 90) - 45)
+
     def _detect_with_rotation_fallback(self, frame, max_num=0, metric='default', video_hash=None):
         """Detecta rosto tentando primeiro o frame original (0°, custo igual
-        ao de hoje); só se o melhor score vier abaixo de
-        ROTATE_FACE_FALLBACK_MIN_SCORE (ou nenhum rosto for achado) tenta
-        rotações candidatas (90°/180°/270°) e fica com a de maior score,
-        desfazendo a rotação no bbox/kps antes de retornar.
+        ao de hoje); tenta rotações candidatas (90°/180°/270°) sempre que o
+        candidato de 0° não tiver, ao mesmo tempo, bom score E roll estimado
+        próximo de 0° (ver _estimate_roll_degrees) — um rosto claramente
+        inclinado (ex.: ~45-90° de roll real) pode ainda receber score
+        aceitável do SCRFD em 0° (rede tolerante a roll moderado), mas seus
+        keypoints revelam que ele não está "em pé"; nesse caso vale a pena
+        comparar com as rotações candidatas antes de aceitar 0° de cara.
+        Decisão final entre os 4 candidatos: MAIOR score sempre vence — roll
+        só decide se vale a pena olhar os outros, não escolhe por si só (o
+        score já reflete indiretamente quão bem o detector "entendeu" aquela
+        orientação, e é a mesma métrica usada nos 4 candidatos, portanto
+        comparável entre si; roll estimado por candidatos diferentes não é
+        comparável da mesma forma, porque cada um foi calculado sobre um
+        frame já pré-rotacionado por ângulos diferentes).
 
         Mitigação para pose "deitada" (roll ~90-180°, cabeça no travesseiro)
         — ver ROTATE_FACE_FALLBACK_ENABLED. Diferente de yaw/pitch (virar a
@@ -447,7 +502,13 @@ class Refacer:
         sticky_angle = self._rotation_hysteresis.get(video_hash, 0) if video_hash else 0
 
         best_score = bboxes[:, 4].max() if bboxes.shape[0] > 0 else -1.0
-        if best_score >= ROTATE_FACE_FALLBACK_MIN_SCORE and sticky_angle == 0:
+        best_idx = int(bboxes[:, 4].argmax()) if bboxes.shape[0] > 0 else -1
+        roll_ok = (
+            best_idx >= 0 and kpss is not None
+            and self._nearest_right_angle_offset(self._estimate_roll_degrees(kpss[best_idx]))
+            <= ROTATE_FACE_FALLBACK_MAX_ROLL_DEGREES
+        )
+        if best_score >= ROTATE_FACE_FALLBACK_MIN_SCORE and sticky_angle == 0 and roll_ok:
             return bboxes, kpss
 
         orig_h, orig_w = frame.shape[:2]
@@ -1908,29 +1969,47 @@ class Refacer:
         self._profile_end("face_swap", start_swap)
         return frame
 
-    def reface_group(self, faces, frames, output):
+    def reface_group(self, faces, frames, output, pbar=None):
+        """pbar (opcional): barra tqdm externa, já aberta pelo chamador,
+        atualizada incrementalmente aqui em vez de cada chamada criar a sua
+        própria — o caminho não-cacheado de reface() processa o vídeo em
+        lotes fixos (RAM budget, ver _calculate_optimal_batch_size), e uma
+        tqdm nova por lote aparecia para o usuário (via gr.Progress(
+        track_tqdm=True)) como várias barras "Processing frames" reiniciando
+        em sequência, em vez de uma única barra contínua do início ao fim do
+        vídeo. Se omitido (chamada direta/testes), mantém uma tqdm própria.
+        """
         worker_fn = self.process_faces
+        owns_pbar = pbar is None
+        if owns_pbar:
+            pbar = tqdm(total=len(frames), desc="Processing frames")
 
-        # Write each processed frame to disk as soon as it's ready instead of
-        # materializing the whole batch (list(executor.map(...))) in RAM first —
-        # with batch sizes up to 1000 Full HD frames that peak was ~6GB just for
-        # the output list, on top of the input `frames` batch already in memory.
-        if self.mode == RefacerMode.CUDA:
-            # In CUDA mode all three models (detector/embedding/swapper) share one
-            # GPU via an ONNX session pinned to intra_op_num_threads=1, so a frame
-            # is fully GPU-serialized regardless of how many Python threads submit
-            # work. A ThreadPoolExecutor here only adds GIL contention and
-            # scheduling overhead on top of that serialization — worse the fewer
-            # vCPUs are available (Colab/Lightning free tiers). Run serially instead.
-            for frame in tqdm(frames, desc="Processing frames"):
-                output.write(worker_fn(frame))
-        else:
-            # Other modes (CPU/COREML/TensorRT) split ONNX intra-op threads across
-            # use_num_cpus, so overlapping frame-level Python work with threads can
-            # still help hide I/O/preprocessing latency.
-            with ThreadPoolExecutor(max_workers=self.use_num_cpus) as executor:
-                for result in tqdm(executor.map(worker_fn, frames), total=len(frames), desc="Processing frames"):
-                    output.write(result)
+        try:
+            # Write each processed frame to disk as soon as it's ready instead of
+            # materializing the whole batch (list(executor.map(...))) in RAM first —
+            # with batch sizes up to 1000 Full HD frames that peak was ~6GB just for
+            # the output list, on top of the input `frames` batch already in memory.
+            if self.mode == RefacerMode.CUDA:
+                # In CUDA mode all three models (detector/embedding/swapper) share one
+                # GPU via an ONNX session pinned to intra_op_num_threads=1, so a frame
+                # is fully GPU-serialized regardless of how many Python threads submit
+                # work. A ThreadPoolExecutor here only adds GIL contention and
+                # scheduling overhead on top of that serialization — worse the fewer
+                # vCPUs are available (Colab/Lightning free tiers). Run serially instead.
+                for frame in frames:
+                    output.write(worker_fn(frame))
+                    pbar.update()
+            else:
+                # Other modes (CPU/COREML/TensorRT) split ONNX intra-op threads across
+                # use_num_cpus, so overlapping frame-level Python work with threads can
+                # still help hide I/O/preprocessing latency.
+                with ThreadPoolExecutor(max_workers=self.use_num_cpus) as executor:
+                    for result in executor.map(worker_fn, frames):
+                        output.write(result)
+                        pbar.update()
+        finally:
+            if owns_pbar:
+                pbar.close()
 
     def reface(self, video_path, faces, preview=False, disable_similarity=False, multiple_faces_mode=False,
                partial_reface_ratio=0.0, partial_blend_shape="rect", use_cache=False, precomputed=None,
@@ -2092,7 +2171,14 @@ class Refacer:
             frame_index = 0
             skip_rate = 10 if preview else 1
 
-            with tqdm(total=total_frames, desc="Extracting frames") as pbar:
+            # Uma única barra cobrindo o processamento real (swap), não a
+            # leitura/decode do vídeo — reface_group recebe esta mesma pbar e
+            # atualiza incrementalmente a cada lote, em vez de cada chamada
+            # criar sua própria tqdm (isso fazia a UI mostrar várias barras
+            # "Processing frames" reiniciando em sequência, uma por lote de
+            # até batch_size frames, mesmo para um único vídeo/face).
+            expected_frames = -(-total_frames // skip_rate)  # ceil division
+            with tqdm(total=expected_frames, desc="Processing frames") as pbar:
                 while cap.isOpened():
                     flag, frame = cap.read()
                     if not flag:
@@ -2100,14 +2186,13 @@ class Refacer:
                     if frame_index % skip_rate == 0:
                         frames.append(frame)
                         if len(frames) > batch_size:
-                            self.reface_group(faces, frames, output)
+                            self.reface_group(faces, frames, output, pbar=pbar)
                             frames = []
                     frame_index += 1
-                    pbar.update()
-        
-            cap.release()
-            if frames:
-                self.reface_group(faces, frames, output)
+
+                cap.release()
+                if frames:
+                    self.reface_group(faces, frames, output, pbar=pbar)
             output.release()
         
             converted_path = self.__convert_video(video_path, output_video_path, preview=preview, already_encoded=already_encoded)

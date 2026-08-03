@@ -53,16 +53,42 @@ def _bbox_kps(cx, cy, half=20.0, det_score=0.9):
     return bbox, kps
 
 
+def _bbox_kps_rolled(cx, cy, roll_degrees, half=20.0, det_score=0.9, eye_half_dist=8.0):
+    """Como _bbox_kps, mas com os keypoints do olho rotacionados em torno do
+    centro por roll_degrees (sentido horário) — usado para simular um rosto
+    com roll intermediário (não alinhado a nenhum múltiplo de 90°) chegando
+    ao detector, ver _estimate_roll_degrees/ROTATE_FACE_FALLBACK_MAX_ROLL_DEGREES."""
+    bbox = np.array([cx - half, cy - half, cx + half, cy + half, det_score], dtype=np.float32)
+    theta = np.radians(roll_degrees)
+    cos_t, sin_t = np.cos(theta), np.sin(theta)
+
+    def _rot(dx, dy):
+        return cx + dx * cos_t - dy * sin_t, cy + dx * sin_t + dy * cos_t
+
+    left_eye = _rot(-eye_half_dist, 0)
+    right_eye = _rot(eye_half_dist, 0)
+    nose = _rot(0, 13)
+    mouth_l = _rot(-6, 13)
+    mouth_r = _rot(6, 13)
+    kps = np.array([left_eye, right_eye, nose, mouth_l, mouth_r], dtype=np.float32)
+    return bbox, kps
+
+
 class _FakeDetector:
     """Substitui self.face_detector nos testes: retorna detecção configurada
     por ângulo de rotação testado (chave = graus de rotação do frame de
     ENTRADA que o detector recebeu), simulando um SCRFD real que só acha o
     rosto (ou só com boa confiança) numa orientação específica."""
 
-    def __init__(self, score_by_angle):
+    def __init__(self, score_by_angle, roll_by_angle=None):
         # score_by_angle: {0: 0.9, 90: 0.2, 180: 0.85, 270: 0.1} etc.
         # Ausência de chave = nenhum rosto detectado nesse ângulo.
+        # roll_by_angle (opcional): {angle: roll_degrees} — simula os
+        # keypoints do candidato daquele ângulo com o roll indicado (default
+        # 0°, ver _bbox_kps_rolled) em vez do rosto "perfeitamente em pé"
+        # de _bbox_kps.
         self.score_by_angle = score_by_angle
+        self.roll_by_angle = roll_by_angle or {}
         self.calls = []
 
     def detect(self, frame, max_num=0, metric='default'):
@@ -73,7 +99,11 @@ class _FakeDetector:
             empty = np.zeros((0, 5), dtype=np.float32)
             return empty, None
         h, w = frame.shape[:2]
-        bbox, kps = _bbox_kps(w / 2, h / 2, det_score=score)
+        roll = self.roll_by_angle.get(angle, 0.0)
+        if roll:
+            bbox, kps = _bbox_kps_rolled(w / 2, h / 2, roll, det_score=score)
+        else:
+            bbox, kps = _bbox_kps(w / 2, h / 2, det_score=score)
         return bbox[np.newaxis, :], kps[np.newaxis, :]
 
 
@@ -136,6 +166,68 @@ def test_uses_frontal_detection_when_score_is_already_good(monkeypatch, refacer_
     assert detector.calls == [0]
     assert bboxes.shape[0] == 1
     assert bboxes[0, 4] == pytest.approx(0.9)
+
+
+def test_intermediate_roll_with_good_score_still_compares_other_angles(monkeypatch, refacer_stub):
+    """Caso central do bug relatado: rosto com roll real ~50° (mais perto de
+    90° do que de 0°) ainda pode receber score aceitável (>= MIN_SCORE) do
+    detector em 0° — a rede tolera algum roll. Sem checar o roll dos
+    keypoints, o antigo gate aceitava 0° de cara e nunca comparava com 90°
+    (que tem score melhor E roll alinhado). Com a checagem de roll, o
+    candidato de 0° é descartado como "não genuinamente alinhado" e 90°
+    (melhor score) vence."""
+    detector = _FakeDetector(
+        {0: 0.6, 90: 0.85},
+        roll_by_angle={0: 50.0},  # 0°: score ok mas rosto claramente girado
+    )
+    refacer_stub.face_detector = detector
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, kpss = refacer_stub._detect_with_rotation_fallback(frame, max_num=8, metric='default')
+
+    assert 90 in detector.calls  # não parou em 0°, comparou com os outros
+    assert bboxes[0, 4] == pytest.approx(0.85)
+
+
+def test_small_roll_with_good_score_skips_other_angles(monkeypatch, refacer_stub):
+    """Rosto praticamente em pé (roll pequeno, dentro de
+    ROTATE_FACE_FALLBACK_MAX_ROLL_DEGREES) com score bom em 0°: deve aceitar
+    direto, sem custo extra de comparar com 90/180/270° — preserva o caminho
+    rápido para o caso comum (maioria dos frames)."""
+    detector = _FakeDetector({0: 0.9}, roll_by_angle={0: 5.0})
+    refacer_stub.face_detector = detector
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, kpss = refacer_stub._detect_with_rotation_fallback(frame, max_num=8, metric='default')
+
+    assert detector.calls == [0]
+    assert bboxes[0, 4] == pytest.approx(0.9)
+
+
+def test_estimate_roll_degrees_matches_expected_angle(refacer_stub):
+    """_estimate_roll_degrees deve recuperar o ângulo de roll usado para
+    gerar os keypoints via _bbox_kps_rolled, dentro de tolerância pequena."""
+    for roll in (0.0, 30.0, -40.0, 89.0):
+        _, kps = _bbox_kps_rolled(50, 50, roll)
+        estimated = refacer_stub._estimate_roll_degrees(kps)
+        assert estimated == pytest.approx(roll, abs=0.5)
+
+
+def test_nearest_right_angle_offset_peaks_at_45_between_multiples(refacer_stub):
+    """0°/90°/180°/270° têm offset 0 (perfeitamente alinhados); 45°/135°/...
+    têm offset máximo (45, ambiguidade total entre dois múltiplos vizinhos)."""
+    assert refacer_stub._nearest_right_angle_offset(0.0) == pytest.approx(0.0)
+    assert refacer_stub._nearest_right_angle_offset(90.0) == pytest.approx(0.0, abs=1e-5)
+    assert refacer_stub._nearest_right_angle_offset(45.0) == pytest.approx(45.0)
+    assert refacer_stub._nearest_right_angle_offset(50.0) == pytest.approx(40.0)
 
 
 def test_falls_back_to_180_when_frontal_score_is_low(monkeypatch, refacer_stub):
