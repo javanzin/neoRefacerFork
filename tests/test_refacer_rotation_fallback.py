@@ -32,6 +32,7 @@ uma margem clara — testada abaixo em test_hysteresis_*.
 """
 from collections import defaultdict
 
+import cv2
 import numpy as np
 import pytest
 
@@ -516,6 +517,157 @@ def test_instance_override_none_falls_back_to_global_flag(monkeypatch, refacer_s
 
     assert 180 in detector.calls
     assert bboxes[0, 4] == pytest.approx(0.9)
+
+
+class _FineFakeDetector:
+    """Simula o detector nos 3 estágios do refinamento fino: frame original
+    (0°), candidatos de 90°/180°/270° (via _rotate_frame) e o candidato fino
+    final (via _rotate_frame_free, marcado com um atributo próprio em vez de
+    _rotation_angle_marker, já que o ângulo fino não é um dos 4 fixos)."""
+
+    def __init__(self, coarse_score_by_angle, coarse_roll_by_angle, fine_score):
+        self.coarse_score_by_angle = coarse_score_by_angle
+        self.coarse_roll_by_angle = coarse_roll_by_angle
+        self.fine_score = fine_score
+        self.fine_calls = 0
+        self.calls = []
+
+    def detect(self, frame, max_num=0, metric='default'):
+        if getattr(frame, "_is_fine_candidate", False):
+            self.fine_calls += 1
+            self.calls.append("fine")
+            if self.fine_score is None:
+                return np.zeros((0, 5), dtype=np.float32), None
+            h, w = frame.shape[:2]
+            bbox, kps = _bbox_kps(w / 2, h / 2, det_score=self.fine_score)
+            return bbox[np.newaxis, :], kps[np.newaxis, :]
+
+        angle = getattr(frame, "_rotation_angle_marker", 0)
+        self.calls.append(angle)
+        score = self.coarse_score_by_angle.get(angle)
+        if score is None:
+            return np.zeros((0, 5), dtype=np.float32), None
+        h, w = frame.shape[:2]
+        roll = self.coarse_roll_by_angle.get(angle, 0.0)
+        if roll:
+            bbox, kps = _bbox_kps_rolled(w / 2, h / 2, roll, det_score=score)
+        else:
+            bbox, kps = _bbox_kps(w / 2, h / 2, det_score=score)
+        return bbox[np.newaxis, :], kps[np.newaxis, :]
+
+
+def _tag_fine(frame):
+    tagged = frame.view(_TaggedArray)
+    tagged._is_fine_candidate = True
+    return tagged
+
+
+def test_fine_refinement_kicks_in_when_residual_is_worst_case_45(monkeypatch, refacer_stub):
+    """Caso motivador: roll real de ~45° é o pior caso possível para os 4
+    candidatos fixos (0/90/180/270) — nenhum alinha bem o rosto, então o
+    vencedor entre eles ainda carrega um roll residual grande NAQUELE
+    referencial. O refinamento fino deve tentar mais uma rotação (pelo
+    ângulo residual exato) e, se ela tiver score melhor, usar o resultado
+    fino em vez do múltiplo de 90° vencedor."""
+    detector = _FineFakeDetector(
+        coarse_score_by_angle={0: 0.5, 90: 0.55, 180: 0.1, 270: 0.1},
+        coarse_roll_by_angle={0: 45.0, 90: -45.0},
+        fine_score=0.97,
+    )
+    refacer_stub.face_detector = detector
+    refacer_stub._rotation_hysteresis = {}
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame_free",
+        staticmethod(lambda frame, angle_degrees: (_tag_fine(frame), np.eye(2, 3, dtype=np.float32))),
+    )
+    monkeypatch.setattr(
+        "refacer.Refacer._unrotate_point_free",
+        staticmethod(lambda x, y, M_inv: (x, y)),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, kpss = refacer_stub._detect_with_rotation_fallback(frame, max_num=8, metric='default')
+
+    assert detector.fine_calls == 1
+    assert bboxes[0, 4] == pytest.approx(0.97)
+
+
+def test_fine_refinement_skipped_when_residual_is_small(monkeypatch, refacer_stub):
+    """Vencedor entre os 4 ângulos já está bem alinhado (roll residual
+    pequeno) — não deve gastar mais uma detecção com o candidato fino."""
+    detector = _FineFakeDetector(
+        coarse_score_by_angle={0: 0.9, 90: 0.1, 180: 0.1, 270: 0.1},
+        coarse_roll_by_angle={0: 3.0},
+        fine_score=0.99,
+    )
+    refacer_stub.face_detector = detector
+    refacer_stub._rotation_hysteresis = {}
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame_free",
+        staticmethod(lambda frame, angle_degrees: (_tag_fine(frame), np.eye(2, 3, dtype=np.float32))),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, kpss = refacer_stub._detect_with_rotation_fallback(frame, max_num=8, metric='default')
+
+    assert detector.fine_calls == 0
+    assert bboxes[0, 4] == pytest.approx(0.9)
+
+
+def test_fine_refinement_discarded_when_it_does_not_improve_score(monkeypatch, refacer_stub):
+    """Se o candidato fino não superar o score do vencedor entre os 4
+    ângulos fixos, mantém o resultado original (o refinamento é só um
+    "tentar melhorar", nunca piora o resultado)."""
+    detector = _FineFakeDetector(
+        coarse_score_by_angle={0: 0.6, 90: 0.65, 180: 0.1, 270: 0.1},
+        coarse_roll_by_angle={0: 45.0, 90: -45.0},
+        fine_score=0.5,
+    )
+    refacer_stub.face_detector = detector
+    refacer_stub._rotation_hysteresis = {}
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame",
+        staticmethod(lambda frame, angle: _tag(frame, angle)),
+    )
+    monkeypatch.setattr(
+        "refacer.Refacer._rotate_frame_free",
+        staticmethod(lambda frame, angle_degrees: (_tag_fine(frame), np.eye(2, 3, dtype=np.float32))),
+    )
+
+    frame = _tag(_marked_frame(), 0)
+    bboxes, kpss = refacer_stub._detect_with_rotation_fallback(frame, max_num=8, metric='default')
+
+    assert detector.fine_calls == 1
+    assert bboxes[0, 4] == pytest.approx(0.65)
+
+
+def test_rotate_frame_free_and_unrotate_point_free_are_mutually_consistent(refacer_stub):
+    """Testa _rotate_frame_free/_unrotate_point_free reais (sem mock): um
+    ponto no frame original, levado ao frame rotacionado por um ângulo
+    arbitrário (45°) e desfeito de volta, deve retornar próximo da posição
+    original — valida a composição de matriz afim direta/inversa."""
+    frame = np.zeros((300, 300, 3), dtype=np.uint8)
+    px, py = 150.0, 100.0
+
+    rotated, M = Refacer._rotate_frame_free(frame, 45.0)
+    M_inv = cv2.invertAffineTransform(M)
+
+    # aplica a mesma transformação direta ao ponto, simulando "detecção" no
+    # frame rotacionado
+    fx = M[0, 0] * px + M[0, 1] * py + M[0, 2]
+    fy = M[1, 0] * px + M[1, 1] * py + M[1, 2]
+
+    back_x, back_y = refacer_stub._unrotate_point_free(fx, fy, M_inv)
+    assert back_x == pytest.approx(px, abs=1e-3)
+    assert back_y == pytest.approx(py, abs=1e-3)
 
 
 def test_disabled_by_feature_flag_skips_rotation_entirely(monkeypatch, refacer_stub):

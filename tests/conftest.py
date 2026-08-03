@@ -251,6 +251,22 @@ def _install_cv2_stub():
             return np.rot90(src, k=1).copy()
         raise ValueError(f"unsupported rotate_code: {rotate_code}")
 
+    def _get_rotation_matrix_2d(center, angle, scale):
+        # Same convention as real cv2.getRotationMatrix2D: angle in degrees,
+        # COUNTERCLOCKWISE positive, rotating around `center` in image
+        # coordinates (y axis points down, so this matches OpenCV's actual
+        # rotation direction on-screen, not the mathematical CCW-in-standard-
+        # axes convention).
+        import numpy as np
+        cx, cy = center
+        theta = np.radians(angle)
+        alpha = scale * np.cos(theta)
+        beta = scale * np.sin(theta)
+        return np.array([
+            [alpha, beta, (1 - alpha) * cx - beta * cy],
+            [-beta, alpha, beta * cx + (1 - alpha) * cy],
+        ], dtype=np.float64)
+
     cv2 = _install_stub(
         "cv2",
         CAP_FFMPEG=0,
@@ -278,6 +294,7 @@ def _install_cv2_stub():
         convexHull=_convex_hull,
         fillConvexPoly=_fill_convex_poly,
         rotate=_rotate,
+        getRotationMatrix2D=_get_rotation_matrix_2d,
     )
     cv2.VideoWriter_fourcc = staticmethod(lambda *a, **k: 0)
     return cv2

@@ -102,6 +102,18 @@ ROTATE_FACE_FALLBACK_HYSTERESIS_MARGIN = 0.15
 # claramente menor que 45.
 ROTATE_FACE_FALLBACK_MAX_ROLL_DEGREES = 25.0
 
+# Refinamento fino: depois de escolher o melhor candidato entre os múltiplos
+# de 90° (ROTATE_FACE_FALLBACK_ANGLES), se o roll residual do rosto NAQUELE
+# referencial ainda estiver acima deste limiar, tenta mais um candidato
+# rotacionado pelo ângulo residual exato (ex.: 45°), via _rotate_frame_free —
+# em vez de aceitar o múltiplo de 90° mais próximo, que é o pior caso possível
+# de ambiguidade quando o roll real cai bem no meio de dois candidatos
+# vizinhos (ver _nearest_right_angle_offset). Escolhido por score, igual aos
+# outros candidatos — só entra em jogo quando o fallback já rodou (custo
+# extra de mais uma detecção só nos frames onde os 4 ângulos fixos já não
+# bastaram).
+ROTATE_FACE_FALLBACK_FINE_MIN_RESIDUAL_DEGREES = 15.0
+
 
 class RefacerMode(Enum):
     CPU, CUDA, COREML, TENSORRT = range(1, 5)
@@ -432,6 +444,40 @@ class Refacer:
         return x, y
 
     @staticmethod
+    def _rotate_frame_free(frame, angle_degrees):
+        """Rotaciona o frame por um ângulo arbitrário (graus, sentido
+        horário), ao contrário de _rotate_frame (só múltiplos de 90° via
+        cv2.rotate, sem interpolação). Usada só no refinamento fino do
+        fallback de rotação, quando o roll residual do melhor candidato de
+        90° ainda é alto (ex.: rosto a ~45°, ponto de ambiguidade máxima
+        entre dois múltiplos de 90° vizinhos — nenhum dos dois alinha bem o
+        rosto). Expande o canvas para não cortar o rosto nos cantos; retorna
+        também a matriz de rotação (M) para desfazer depois via
+        _unrotate_point_free."""
+        h, w = frame.shape[:2]
+        cx, cy = w / 2.0, h / 2.0
+        M = cv2.getRotationMatrix2D((cx, cy), -angle_degrees, 1.0)
+
+        cos, sin = abs(M[0, 0]), abs(M[0, 1])
+        new_w = int(h * sin + w * cos)
+        new_h = int(h * cos + w * sin)
+        M[0, 2] += (new_w / 2.0) - cx
+        M[1, 2] += (new_h / 2.0) - cy
+
+        rotated = cv2.warpAffine(frame, M, (new_w, new_h))
+        return rotated, M
+
+    @staticmethod
+    def _unrotate_point_free(x, y, M_inv):
+        """Inverso de _rotate_frame_free para um ponto (x, y) detectado no
+        frame rotacionado por ângulo arbitrário — devolve as coordenadas no
+        referencial do frame ORIGINAL, usando a inversa da matriz afim
+        retornada por _rotate_frame_free."""
+        px = M_inv[0, 0] * x + M_inv[0, 1] * y + M_inv[0, 2]
+        py = M_inv[1, 0] * x + M_inv[1, 1] * y + M_inv[1, 2]
+        return px, py
+
+    @staticmethod
     def _estimate_roll_degrees(kps):
         """Estima o roll (graus, sentido horário) do rosto a partir dos dois
         keypoints do olho (índices 0=esquerdo, 1=direito — convenção SCRFD/
@@ -460,6 +506,15 @@ class Refacer:
         ROTATE_FACE_FALLBACK_MAX_ROLL_DEGREES (bem menor que 45) para decidir
         se o candidato de 0° pode ser aceito sem custo extra de comparação."""
         return abs(((roll_degrees + 45) % 90) - 45)
+
+    @staticmethod
+    def _signed_right_angle_residual(roll_degrees):
+        """Como _nearest_right_angle_offset, mas com sinal e sempre em
+        [-45, 45] — o quanto (e para que lado) o roll estimado se desvia do
+        múltiplo de 90° mais próximo. Usado para saber POR QUANTOS GRAUS
+        girar no refinamento fino (_rotate_frame_free), diferente de
+        _nearest_right_angle_offset (só a magnitude, usada como filtro)."""
+        return ((roll_degrees + 45) % 90) - 45
 
     def _detect_with_rotation_fallback(self, frame, max_num=0, metric='default', video_hash=None):
         """Detecta rosto tentando primeiro o frame original (0°, custo igual
@@ -538,7 +593,50 @@ class Refacer:
         if video_hash:
             self._rotation_hysteresis[video_hash] = best_angle
 
-        if best_angle == 0 or best_bboxes.shape[0] == 0:
+        if best_bboxes.shape[0] == 0:
+            return best_bboxes, best_kpss
+
+        # Refinamento fino: mesmo com o melhor múltiplo de 90° escolhido, o
+        # rosto pode continuar com roll residual alto NAQUELE referencial
+        # (ex.: roll real de 45° é o pior caso — fica exatamente a meio
+        # caminho entre dois candidatos fixos vizinhos, nenhum alinha bem).
+        # Tenta mais uma rotação, pelo ângulo residual exato, sobre o frame
+        # já rotacionado pelo múltiplo de 90° vencedor.
+        fine_idx = int(best_bboxes[:, 4].argmax())
+        fine_residual = (
+            self._signed_right_angle_residual(self._estimate_roll_degrees(best_kpss[fine_idx]))
+            if best_kpss is not None else 0.0
+        )
+        if best_kpss is not None and abs(fine_residual) >= ROTATE_FACE_FALLBACK_FINE_MIN_RESIDUAL_DEGREES:
+            discrete_frame = self._rotate_frame(frame, best_angle)
+            fine_frame, M = self._rotate_frame_free(discrete_frame, fine_residual)
+            fine_bboxes, fine_kpss = self.face_detector.detect(fine_frame, max_num=max_num, metric=metric)
+            fine_score = fine_bboxes[:, 4].max() if fine_bboxes.shape[0] > 0 else -1.0
+            if fine_score > best_score:
+                M_inv = cv2.invertAffineTransform(M)
+                disc_h, disc_w = discrete_frame.shape[:2]
+                unrotated_bboxes = fine_bboxes.copy()
+                for i in range(fine_bboxes.shape[0]):
+                    x1, y1 = self._unrotate_point_free(fine_bboxes[i, 0], fine_bboxes[i, 1], M_inv)
+                    x2, y2 = self._unrotate_point_free(fine_bboxes[i, 2], fine_bboxes[i, 3], M_inv)
+                    x1, x2 = np.clip([x1, x2], 0, disc_w - 1)
+                    y1, y2 = np.clip([y1, y2], 0, disc_h - 1)
+                    unrotated_bboxes[i, 0], unrotated_bboxes[i, 2] = min(x1, x2), max(x1, x2)
+                    unrotated_bboxes[i, 1], unrotated_bboxes[i, 3] = min(y1, y2), max(y1, y2)
+
+                unrotated_kpss = None
+                if fine_kpss is not None:
+                    unrotated_kpss = fine_kpss.copy()
+                    for i in range(fine_kpss.shape[0]):
+                        for j in range(fine_kpss.shape[1]):
+                            px, py = self._unrotate_point_free(
+                                fine_kpss[i, j, 0], fine_kpss[i, j, 1], M_inv,
+                            )
+                            unrotated_kpss[i, j, 0], unrotated_kpss[i, j, 1] = px, py
+
+                best_bboxes, best_kpss = unrotated_bboxes, unrotated_kpss
+
+        if best_angle == 0:
             return best_bboxes, best_kpss
 
         unrotated_bboxes = best_bboxes.copy()
