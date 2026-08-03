@@ -73,19 +73,93 @@ MIN_SHARPNESS = 60.0  # variância do Laplaciano no crop alinhado
 
 # Rostos pequenos são sempre upscaled para 112x112 antes de embedding/nitidez
 # (ver alignment abaixo), então um corte binário único por área descartava
-# rostos pequenos "bons" (nítidos, bem detectados) só por serem pequenos. Um
-# piso absoluto continua existindo (MIN_FACE_AREA_RATIO_HARD) porque nitidez
-# pós-upscale não captura tudo: o ArcFace foi treinado majoritariamente com
-# rostos que já nasciam próximos de 112x112, não upscaled agressivamente de
-# poucos pixels — abaixo do piso, o embedding tende a ficar pouco
-# discriminativo mesmo quando o crop "parece" nítido (upscale pode gerar
-# ringing/artefatos de compressão que o Laplaciano lê como borda real). Entre
-# o piso e MIN_FACE_AREA_RATIO, o rosto pequeno só é aceito com evidência
-# dupla de qualidade (score e nitidez bem acima do mínimo padrão) — uma
-# régua mais alta para compensar a menor quantidade de informação disponível.
-MIN_FACE_AREA_RATIO_HARD = 0.0025  # abaixo disso, descarta sempre, sem exceção
+# rostos pequenos "bons" (nítidos, bem detectados) só por serem pequenos.
+# Abaixo do piso (MIN_FACE_AREA_RATIO_HARD), o upscale pode gerar
+# ringing/artefatos de compressão que o Laplaciano lê como borda real, então o
+# corte é mais rígido — mas não absoluto: uma foto de origem excelente
+# (score e nitidez bem acima até do patamar "compensado" já exigido na faixa
+# intermediária) ainda entra, porque nesse caso a imagem de origem tem
+# resolução/qualidade suficiente para o upscale não comprometer o embedding.
+# Entre o piso e MIN_FACE_AREA_RATIO, o corte é o padrão "compensado": um
+# único sinal de qualidade bem acima do mínimo (score OU nitidez) já basta.
+MIN_FACE_AREA_RATIO_HARD = 0.0025  # abaixo disso, só entra com qualidade excepcional
 MIN_DET_SCORE_COMPENSATED = 0.75  # exigido p/ rosto pequeno na faixa intermediária
 MIN_SHARPNESS_COMPENSATED = 90.0  # idem, ~1.5x o mínimo padrão
+MIN_DET_SCORE_EXCEPTIONAL = 0.85  # exigido p/ rosto abaixo do piso absoluto
+MIN_SHARPNESS_EXCEPTIONAL = 120.0  # idem, ~2x o mínimo padrão
+
+# face_area_ratio pune injustamente fotos de alta resolução: um rosto de
+# 200x200px numa foto 4K ocupa uma fração minúscula do frame mas tem pixels
+# reais de sobra para o embedding e pros traços finos de expressão (olheiras,
+# sulcos, pés de galinha) sobreviverem ao upscale para 112x112 exigido pelo
+# ArcFace. MIN_FACE_SIDE_PX é um piso alternativo em pixels reais do bbox
+# (antes do upscale): se o lado mais curto do rosto já tem essa contagem de
+# pixels, a exceção "excepcional" acima do piso de área é liberada mesmo sem
+# bater score/nitidez elevados — a informação de origem já é suficiente por
+# si só, o upscale não está inventando detalhe.
+MIN_FACE_SIDE_PX = 90
+
+# Piso permissivo de cada constante acima, usado quando quality_strictness=0
+# (slider de rigor todo pra permissivo — ver IdentityProfileBuilder.__init__).
+# Escolhidos para ainda rejeitar lixo óbvio (rosto irreconhecível, blur
+# extremo) sem impor a régua elevada pensada para o caso comum; a régua real
+# em cada extração é uma interpolação linear entre este piso e o valor de
+# módulo acima, de acordo com quality_strictness.
+MIN_DET_SCORE_FLOOR = 0.2
+MIN_SHARPNESS_FLOOR = 15.0
+MIN_FACE_AREA_RATIO_FLOOR = 0.003
+MIN_FACE_AREA_RATIO_HARD_FLOOR = 0.0005
+MIN_DET_SCORE_COMPENSATED_FLOOR = 0.5
+MIN_SHARPNESS_COMPENSATED_FLOOR = 60.0
+MIN_DET_SCORE_EXCEPTIONAL_FLOOR = 0.5
+MIN_SHARPNESS_EXCEPTIONAL_FLOOR = 60.0
+
+
+def _scaled_threshold(strictness, floor, default):
+    """Interpola linearmente entre floor (strictness=0) e default
+    (strictness=1) — ver quality_strictness em IdentityProfileBuilder."""
+    return floor + (default - floor) * strictness
+
+
+def _would_pass_at_strictness(metrics, strictness):
+    """Reavalia offline se uma amostra descartada por qualidade (ver
+    quality_metrics em IdentityProfileBuilder.discarded) passaria com outro
+    quality_strictness, sem reprocessar a imagem original — usado para dar
+    uma prévia de "quantos descartes o slider resgataria" antes do usuário
+    reprocessar de fato (ver preview_quality_strictness/app.py).
+
+    Reimplementa a mesma árvore de decisão de _add_face_candidate a partir
+    dos valores brutos já salvos; qualquer mudança de regra lá precisa ser
+    espelhada aqui.
+    """
+    det_score = metrics["det_score"]
+    band = metrics.get("band")
+    if band is None:
+        # Descarte por confiança de detecção antes de qualquer outro cálculo
+        # (bbox/nitidez/área nunca chegaram a ser computados).
+        return det_score >= _scaled_threshold(strictness, MIN_DET_SCORE_FLOOR, MIN_DET_SCORE)
+
+    sharpness = metrics["sharpness"]
+    face_area_ratio = metrics["face_area_ratio"]
+    face_side_px = metrics["face_side_px"]
+
+    min_sharpness = _scaled_threshold(strictness, MIN_SHARPNESS_FLOOR, MIN_SHARPNESS)
+    min_face_area_ratio = _scaled_threshold(strictness, MIN_FACE_AREA_RATIO_FLOOR, MIN_FACE_AREA_RATIO)
+    min_face_area_ratio_hard = _scaled_threshold(strictness, MIN_FACE_AREA_RATIO_HARD_FLOOR, MIN_FACE_AREA_RATIO_HARD)
+    min_det_score_compensated = _scaled_threshold(strictness, MIN_DET_SCORE_COMPENSATED_FLOOR, MIN_DET_SCORE_COMPENSATED)
+    min_sharpness_compensated = _scaled_threshold(strictness, MIN_SHARPNESS_COMPENSATED_FLOOR, MIN_SHARPNESS_COMPENSATED)
+    min_det_score_exceptional = _scaled_threshold(strictness, MIN_DET_SCORE_EXCEPTIONAL_FLOOR, MIN_DET_SCORE_EXCEPTIONAL)
+    min_sharpness_exceptional = _scaled_threshold(strictness, MIN_SHARPNESS_EXCEPTIONAL_FLOOR, MIN_SHARPNESS_EXCEPTIONAL)
+
+    if face_area_ratio < min_face_area_ratio_hard:
+        has_enough_real_pixels = face_side_px >= MIN_FACE_SIDE_PX
+        has_exceptional_quality = det_score >= min_det_score_exceptional and sharpness >= min_sharpness_exceptional
+        return has_enough_real_pixels or has_exceptional_quality
+    if sharpness < min_sharpness:
+        return False
+    if face_area_ratio < min_face_area_ratio:
+        return not (det_score < min_det_score_compensated and sharpness < min_sharpness_compensated)
+    return True
 
 # Threshold para separar pessoas distintas no clustering (não confundir com o
 # 0.2 default do slider "Faces By Match" — aquele é deliberadamente permissivo
@@ -138,9 +212,22 @@ ROBUST_CENTROID_SIMILARITY_FLOOR = 0.30
 ANCHOR_MAX_WEIGHT = 0.35
 
 
-def _face_sharpness(aligned_crop_bgr):
+def _face_sharpness(aligned_crop_bgr, upscale_factor=1.0):
+    """Variância do Laplaciano no crop alinhado (112x112).
+
+    upscale_factor (>=1.0): fator de ampliação aplicado ao crop ORIGINAL do
+    bbox para chegar em 112x112 — ver _add_face_candidate. Upscale suaviza
+    bordas proporcionalmente ao fator (bordas reais do rosto pequeno ficam
+    "esticadas" no resize), então a variância do Laplaciano cai de forma
+    artificial mesmo quando a foto de origem é nítida, punindo injustamente
+    rostos pequenos. Multiplicar pelo quadrado do fator compensa essa queda,
+    aproximando a leitura da nitidez que o crop teria se já nascesse em
+    112x112 — sem essa correção, o piso MIN_SHARPNESS_EXCEPTIONAL fica
+    praticamente inatingível para qualquer rosto que precise de upscale
+    relevante, mesmo com boa qualidade de origem.
+    """
     gray = cv2.cvtColor(aligned_crop_bgr, cv2.COLOR_BGR2GRAY)
-    return cv2.Laplacian(gray, cv2.CV_64F).var()
+    return cv2.Laplacian(gray, cv2.CV_64F).var() * (upscale_factor ** 2)
 
 
 # Template fixo de alinhamento 112x112 do ArcFace (insightface.utils.face_align.
@@ -836,25 +923,34 @@ class IdentityProfileBuilder:
     cluster.
     """
 
-    def __init__(self, detector, recognizer):
+    def __init__(self, detector, recognizer, quality_strictness=1.0):
         """Accepts the detector/recognizer directly (SCRFD.detect-compatible
         and ArcFaceONNX.get/compute_sim-compatible objects) rather than a
         live Refacer instance — decouples this module from Refacer's
         internals (see from_refacer() for the app.py call site) and lets
         tests pass simple fakes exposing only .detect/.get/.compute_sim.
+
+        quality_strictness escala os thresholds de qualidade (MIN_DET_SCORE,
+        MIN_SHARPNESS etc., ver módulo) linearmente a partir de um piso
+        permissivo até o valor de módulo original: 1.0 reproduz exatamente o
+        comportamento padrão (mínimo mais rigoroso), 0.0 usa o piso mínimo
+        (mais permissivo). Um único fator para todos os critérios em vez de
+        expor 8 sliders — a UI expõe só um slider de "rigor" (ver
+        extract_identity_profile em app.py).
         """
         self._detector = detector
         self._recognizer = recognizer
+        self.quality_strictness = max(0.0, min(1.0, quality_strictness))
         self.samples = []  # list of dict: embedding, face, sharpness, source
         self.discarded = []  # list of dict: source, reason
 
     @classmethod
-    def from_refacer(cls, refacer):
+    def from_refacer(cls, refacer, quality_strictness=1.0):
         """Convenience constructor for the real app: pulls the already-loaded
         detector/recognizer off a live Refacer instance (refacer.py loads no
         new models for this — see module docstring).
         """
-        return cls(refacer.face_detector, refacer.rec_app)
+        return cls(refacer.face_detector, refacer.rec_app, quality_strictness=quality_strictness)
 
     def add_image(self, frame_bgr, source_label, origin=None):
         """origin (opcional): identificador cru da origem (ex. nome do
@@ -892,26 +988,36 @@ class IdentityProfileBuilder:
             self.discarded.append({"source": source_label, "reason": "sem landmarks (kps)"})
             return None
 
-        if det_score < MIN_DET_SCORE:
+        strictness = self.quality_strictness
+        min_det_score = _scaled_threshold(strictness, MIN_DET_SCORE_FLOOR, MIN_DET_SCORE)
+        min_sharpness = _scaled_threshold(strictness, MIN_SHARPNESS_FLOOR, MIN_SHARPNESS)
+        min_face_area_ratio = _scaled_threshold(strictness, MIN_FACE_AREA_RATIO_FLOOR, MIN_FACE_AREA_RATIO)
+        min_face_area_ratio_hard = _scaled_threshold(strictness, MIN_FACE_AREA_RATIO_HARD_FLOOR, MIN_FACE_AREA_RATIO_HARD)
+        min_det_score_compensated = _scaled_threshold(strictness, MIN_DET_SCORE_COMPENSATED_FLOOR, MIN_DET_SCORE_COMPENSATED)
+        min_sharpness_compensated = _scaled_threshold(strictness, MIN_SHARPNESS_COMPENSATED_FLOOR, MIN_SHARPNESS_COMPENSATED)
+        min_det_score_exceptional = _scaled_threshold(strictness, MIN_DET_SCORE_EXCEPTIONAL_FLOOR, MIN_DET_SCORE_EXCEPTIONAL)
+        min_sharpness_exceptional = _scaled_threshold(strictness, MIN_SHARPNESS_EXCEPTIONAL_FLOOR, MIN_SHARPNESS_EXCEPTIONAL)
+
+        if det_score < min_det_score:
             self.discarded.append({
                 "source": source_label,
                 "reason": f"confiança de detecção baixa ({det_score:.2f})",
+                "quality_metrics": {"det_score": det_score},
             })
             return None
 
         frame_area = frame_bgr.shape[0] * frame_bgr.shape[1]
         bbox_area = max(0.0, (bbox[2] - bbox[0])) * max(0.0, (bbox[3] - bbox[1]))
         face_area_ratio = bbox_area / frame_area if frame_area > 0 else 0.0
-        if frame_area <= 0 or face_area_ratio < MIN_FACE_AREA_RATIO_HARD:
+        if frame_area <= 0:
             self.discarded.append({"source": source_label, "reason": "rosto pequeno demais no quadro"})
             return None
 
         embedding = self._recognizer.get(frame_bgr, kps)
 
-        aligned = cv2.resize(
-            frame_bgr[max(0, int(bbox[1])):int(bbox[3]), max(0, int(bbox[0])):int(bbox[2])],
-            (112, 112),
-        ) if bbox[3] > bbox[1] and bbox[2] > bbox[0] else None
+        face_side_px = min(bbox[2] - bbox[0], bbox[3] - bbox[1])
+        crop_bgr = frame_bgr[max(0, int(bbox[1])):int(bbox[3]), max(0, int(bbox[0])):int(bbox[2])]
+        aligned = cv2.resize(crop_bgr, (112, 112)) if bbox[3] > bbox[1] and bbox[2] > bbox[0] else None
 
         if aligned is None:
             # Degenerate bbox — no crop to judge sharpness on or show as a
@@ -920,22 +1026,69 @@ class IdentityProfileBuilder:
             self.discarded.append({"source": source_label, "reason": "bbox inválida (sem crop)"})
             return None
 
-        sharpness = _face_sharpness(aligned)
-        if sharpness < MIN_SHARPNESS:
+        # upscale_factor > 1 só quando o crop original é menor que 112px (o
+        # caso comum de rosto pequeno) — crops já maiores que 112px são
+        # DOWNSCALED por cv2.resize, o que não sofre da mesma suavização
+        # artificial, então o fator fica travado em 1.0 (sem correção) nesse
+        # caso, evitando inflar a nitidez de fotos que já eram grandes.
+        upscale_factor = max(1.0, 112.0 / face_side_px) if face_side_px > 0 else 1.0
+        sharpness = _face_sharpness(aligned, upscale_factor=upscale_factor)
+
+        if face_area_ratio < min_face_area_ratio_hard:
+            # Abaixo do piso absoluto, entra por qualquer uma de duas portas:
+            # (a) pixels reais de sobra no bbox original (face_side_px), sinal
+            # direto de que o upscale não está inventando detalhe — não
+            # depende de score/nitidez, já que a informação de origem já
+            # basta por si só; ou (b) qualidade excepcional (score e nitidez
+            # bem acima do padrão), para o caso de rosto realmente pequeno em
+            # pixels mas ainda assim bem capturado. face_area_ratio pune
+            # injustamente fotos de alta resolução (ver MIN_FACE_SIDE_PX) —
+            # por isso a porta (a) existe.
+            has_enough_real_pixels = face_side_px >= MIN_FACE_SIDE_PX
+            has_exceptional_quality = det_score >= min_det_score_exceptional and sharpness >= min_sharpness_exceptional
+            if not has_enough_real_pixels and not has_exceptional_quality:
+                self.discarded.append({
+                    "source": source_label,
+                    "reason": (
+                        f"rosto pequeno demais no quadro ({face_area_ratio * 100:.2f}% da área, "
+                        f"{face_side_px:.0f}px/{MIN_FACE_SIDE_PX}px exigidos; "
+                        f"score {det_score:.2f}/{min_det_score_exceptional:.2f}, "
+                        f"nitidez {sharpness:.0f}/{min_sharpness_exceptional:.0f} exigidos p/ exceção)"
+                    ),
+                    "quality_metrics": {
+                        "det_score": det_score, "sharpness": sharpness,
+                        "face_area_ratio": face_area_ratio, "face_side_px": face_side_px,
+                        "band": "hard",
+                    },
+                })
+                return None
+        elif sharpness < min_sharpness:
             self.discarded.append({
                 "source": source_label,
                 "reason": f"imagem desfocada (nitidez {sharpness:.0f})",
+                "quality_metrics": {
+                    "det_score": det_score, "sharpness": sharpness,
+                    "face_area_ratio": face_area_ratio, "face_side_px": face_side_px,
+                    "band": "normal",
+                },
             })
             return None
-
-        if face_area_ratio < MIN_FACE_AREA_RATIO:
-            # Faixa intermediária: rosto pequeno só entra com evidência dupla
-            # de qualidade (score e nitidez bem acima do mínimo padrão), já
-            # que o upscale pro embedding tem menos margem de erro.
-            if det_score < MIN_DET_SCORE_COMPENSATED or sharpness < MIN_SHARPNESS_COMPENSATED:
+        elif face_area_ratio < min_face_area_ratio:
+            # Faixa intermediária: rosto pequeno entra com UM sinal de
+            # qualidade bem acima do mínimo padrão (score OU nitidez) — exigir
+            # os dois simultaneamente descartava fotos de retrato comuns
+            # (nítidas, mas com score de detecção só "normal", ou bem
+            # detectadas mas com nitidez só "normal") que já eram boas o
+            # bastante, sem ganho real de robustez do embedding.
+            if det_score < min_det_score_compensated and sharpness < min_sharpness_compensated:
                 self.discarded.append({
                     "source": source_label,
                     "reason": "rosto pequeno sem compensação suficiente de nitidez/confiança",
+                    "quality_metrics": {
+                        "det_score": det_score, "sharpness": sharpness,
+                        "face_area_ratio": face_area_ratio, "face_side_px": face_side_px,
+                        "band": "intermediate",
+                    },
                 })
                 return None
 
@@ -1157,6 +1310,20 @@ class IdentityProfileBuilder:
                 })
 
         return [c["samples"] for c in clusters]
+
+    def preview_quality_strictness(self, strictness):
+        """Estima, sem reprocessar nenhuma imagem, quantos dos descartes
+        atuais por qualidade teriam passado com outro quality_strictness —
+        usado pela UI para orientar o usuário antes de rodar a extração de
+        novo com o slider em outra posição (ver identity_quality_strictness
+        em app.py). Só considera descartes com quality_metrics (os por
+        confiança/nitidez/área); descartes de outra natureza (arquivo
+        inválido, nenhum rosto detectado, duplicata) nunca são resgatáveis
+        por rigor e ficam de fora da contagem.
+        """
+        eligible = [d for d in self.discarded if "quality_metrics" in d]
+        rescued = sum(1 for d in eligible if _would_pass_at_strictness(d["quality_metrics"], strictness))
+        return {"eligible": len(eligible), "rescued": rescued}
 
     def build_profiles(self, threshold=CLUSTER_SIMILARITY_THRESHOLD, balance_by_origin=False, weight_by_sharpness=False):
         """Separa as amostras em clusters por pessoa e constrói um perfil

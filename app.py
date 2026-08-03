@@ -832,7 +832,13 @@ def _populate_builder_from_files(builder, source_files, progress=None):
     if progress is not None:
         progress(1.0, desc="Agrupando por pessoa...")
 
-def _format_extraction_status(profiles):
+def _format_extraction_status(profiles, quality_preview=None):
+    """quality_preview (opcional): dict {strictness: {"eligible", "rescued"}}
+    de IdentityProfileBuilder.preview_quality_strictness, um por nível de
+    rigor testado — mostra quantos descartes por qualidade seriam resgatados
+    antes do usuário precisar reprocessar tudo de novo com o slider em outra
+    posição (ver identity_quality_strictness em app.py).
+    """
     status_lines = [
         f"{len(profiles)} pessoa(s) detectada(s), separada(s) automaticamente por similaridade facial.",
         "Se a mesma pessoa foi dividida em dois perfis, use \"Mesclar Perfis\" abaixo. "
@@ -846,9 +852,17 @@ def _format_extraction_status(profiles):
     if profiles[0]["discarded"]:
         status_lines.append(f"Descartes ({profiles[0]['n_discarded']}):")
         status_lines.extend(f"  - {d['source']}: {d['reason']}" for d in profiles[0]["discarded"])
+    if quality_preview:
+        rescuable = {s: p for s, p in quality_preview.items() if p["rescued"] > 0}
+        if rescuable:
+            status_lines.append("Reduzindo o rigor do filtro de qualidade (slider acima), sem reprocessar:")
+            status_lines.extend(
+                f"  - rigor {s:.2f}: recuperaria {p['rescued']} de {p['eligible']} descarte(s) por qualidade"
+                for s, p in sorted(rescuable.items())
+            )
     return "\n".join(status_lines)
 
-def extract_identity_profile(source_files, folder_files, balance_by_origin=False, weight_by_sharpness=False, progress=gr.Progress()):
+def extract_identity_profile(source_files, folder_files, balance_by_origin=False, weight_by_sharpness=False, quality_strictness=1.0, progress=gr.Progress()):
     """Builds one reusable identity profile (Face + centroid embedding) per
     person detected in the uploaded images/videos (greedy clustering by
     cosine similarity — see identity_profile.cluster_samples). Video mode
@@ -864,13 +878,15 @@ def extract_identity_profile(source_files, folder_files, balance_by_origin=False
     chosen folder, not just its top level.
     balance_by_origin e weight_by_sharpness: opt-in (checkboxes), default off
     — see identity_profile._build_profile_from_samples for what changes.
+    quality_strictness: slider 0-1 (default 1, rigor padrão) que escala os
+    thresholds de qualidade da extração — ver IdentityProfileBuilder.
     """
     all_files = list(source_files or []) + list(folder_files or [])
     if not all_files:
         empty_dropdown = gr.update(choices=[], value=None)
         return "Nenhum arquivo enviado.", [], empty_dropdown, empty_dropdown, empty_dropdown, []
 
-    builder = IdentityProfileBuilder.from_refacer(refacer)
+    builder = IdentityProfileBuilder.from_refacer(refacer, quality_strictness=quality_strictness)
     origin_hashes = {}
     all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded, origin_hashes=origin_hashes)
     _populate_builder_from_files(builder, all_files, progress=progress)
@@ -886,7 +902,8 @@ def extract_identity_profile(source_files, folder_files, balance_by_origin=False
         # mas compartilhar o MESMO objeto entre N perfis é uma armadilha para
         # qualquer mutação futura (uma escrita num perfil vazaria para todos).
         profile["origin_hashes"] = dict(origin_hashes)
-    status = _format_extraction_status(profiles)
+    quality_preview = {s: builder.preview_quality_strictness(s) for s in (0.0, 0.25, 0.5, 0.75)}
+    status = _format_extraction_status(profiles, quality_preview=quality_preview)
     choices = [profile["name"] for profile in profiles]
 
     # A lista de perfis (cada um com seu Face sintético) fica só na gr.State
@@ -1048,7 +1065,7 @@ def export_selected_profile(profiles, selected_name):
     export_profile(profile, export_path, content_hashes=profile.get("origin_hashes"))
     return gr.update(value=export_path, visible=True)
 
-def find_profile_in_more_material(profiles, selected_name, source_files, folder_files, balance_by_origin=False, weight_by_sharpness=False, progress=gr.Progress()):
+def find_profile_in_more_material(profiles, selected_name, source_files, folder_files, balance_by_origin=False, weight_by_sharpness=False, quality_strictness=1.0, progress=gr.Progress()):
     """Busca dirigida: procura apenas a pessoa do perfil já selecionado em
     material novo (que pode ter várias pessoas), em vez de reextrair tudo e
     separar por clustering de novo — muito mais barato quando você já sabe
@@ -1066,7 +1083,7 @@ def find_profile_in_more_material(profiles, selected_name, source_files, folder_
     if not all_files:
         raise gr.Error("Nenhum arquivo enviado para buscar.")
 
-    builder = IdentityProfileBuilder.from_refacer(refacer)
+    builder = IdentityProfileBuilder.from_refacer(refacer, quality_strictness=quality_strictness)
     new_origin_hashes = {}
     all_files = _dedupe_files_by_content(all_files, discarded=builder.discarded, origin_hashes=new_origin_hashes)
     target_face = profile["face"]
@@ -1716,6 +1733,20 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
                 "muda o equilíbrio entre arquivos). Compare os dois resultados antes de confiar."
             ),
         )
+        identity_quality_strictness = gr.Slider(
+            label="Rigor do filtro de qualidade",
+            minimum=0.0,
+            maximum=1.0,
+            value=1.0,
+            step=0.05,
+            info=(
+                "1.0 = padrão (mais rigoroso, descarta rostos pequenos/desfocados/com baixa "
+                "confiança de detecção). Reduza se muitas fotos boas estão sendo descartadas como "
+                "'rosto pequeno demais' ou 'sem compensação suficiente de nitidez/confiança' — o "
+                "rigor mínimo ainda rejeita lixo óbvio (rosto irreconhecível, blur extremo), mas "
+                "aceita mais fotos de retrato comuns (rosto não ocupando a maior parte do quadro)."
+            ),
+        )
         with gr.Accordion("Arquivos enviados", open=True) as identity_files_accordion:
             with gr.Row():
                 identity_images = gr.File(
@@ -1906,7 +1937,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
 
         identity_extract_btn.click(
             fn=extract_identity_profile,
-            inputs=[identity_images, identity_folder, identity_balance_by_origin, identity_weight_by_sharpness],
+            inputs=[identity_images, identity_folder, identity_balance_by_origin, identity_weight_by_sharpness, identity_quality_strictness],
             outputs=[
                 identity_status,
                 identity_gallery,
@@ -1939,7 +1970,7 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             fn=find_profile_in_more_material,
             inputs=[
                 identity_profile_state, identity_selected_profile, identity_search_files, identity_search_folder,
-                identity_balance_by_origin, identity_weight_by_sharpness,
+                identity_balance_by_origin, identity_weight_by_sharpness, identity_quality_strictness,
             ],
             outputs=[
                 identity_status,
