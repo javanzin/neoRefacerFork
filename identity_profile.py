@@ -321,6 +321,122 @@ _SKIN_TEXTURE_EXCLUSION_RADII = np.array([11.0, 12.0, 12.0], dtype=np.float32)  
 _SKIN_TEXTURE_EYE_EXCLUSION_AXES = np.array([16.0, 9.0], dtype=np.float32)
 _SKIN_TEXTURE_EYE_EXCLUSION_OFFSET_Y = -3.0
 
+# Regiões de INTERESSE (não de exclusão) para _expression_mark_sharpness:
+# onde marcas de expressão (olheira, sulco nasolabial/bigode chinês)
+# realmente aparecem, para medir nitidez SÓ ali em vez do crop inteiro (ver
+# _face_sharpness). Maquiagem/contorno em outra parte do rosto (boca, sombra
+# de olho) não deve conseguir inflar essa métrica — restringir a região é o
+# que garante isso, ao contrário de tentar detectar maquiagem por cor.
+#
+# Olheira: mesma faixa ~7-10px ABAIXO do centro do olho já documentada em
+# _SKIN_TEXTURE_EYE_EXCLUSION acima (região que a exclusão de olho, com seu
+# offset_y=-3, deliberadamente deixa de fora). Elipse achatada na horizontal
+# (eixo_x > eixo_y), acompanhando o formato alongado real de uma olheira.
+_EXPRESSION_MARK_UNDEREYE_AXES = np.array([12.0, 7.0], dtype=np.float32)
+_EXPRESSION_MARK_UNDEREYE_OFFSET_Y = 9.0
+
+# Sulco nasolabial: elipse alongada ligando a lateral do nariz (kps[2], raio
+# de exclusão 11px em _SKIN_TEXTURE_EXCLUSION_RADII) ao canto da boca
+# correspondente (kps[3]/kps[4], raio 12px) — o próprio sulco vive na faixa
+# de pele ENTRE esses dois pontos de exclusão, nunca dentro deles.
+# NASOLABIAL_WIDTH: meia-largura da faixa (eixo curto da elipse), estreita o
+# bastante para não invadir a bochecha nem o lábio ao lado.
+_EXPRESSION_MARK_NASOLABIAL_WIDTH = 6.0
+
+
+def _ellipse_region_mask(crop_size, center, axes, angle_rad=0.0):
+    """Máscara binária (bool, shape (crop_size, crop_size)): True dentro da
+    elipse de `center`/`axes` (mesmo grid/fórmula de _skin_region_mask, mas
+    como helper genérico reaproveitável — aquela função duplica esta lógica
+    inline por landmark em vez de chamar um helper comum).
+
+    angle_rad (opcional): rotaciona a elipse em torno de `center` — necessário
+    para uma faixa estreita alinhada a um segmento não-horizontal/vertical
+    (ex. sulco nasolabial), onde uma elipse alinhada aos eixos ficaria larga
+    demais na direção perpendicular ao segmento real."""
+    yy, xx = np.mgrid[0:crop_size, 0:crop_size].astype(np.float32)
+    dx, dy = xx - center[0], yy - center[1]
+    if angle_rad:
+        cos_a, sin_a = np.cos(-angle_rad), np.sin(-angle_rad)
+        dx, dy = dx * cos_a - dy * sin_a, dx * sin_a + dy * cos_a
+    dist_sq = (dx / axes[0]) ** 2 + (dy / axes[1]) ** 2
+    return dist_sq <= 1.0
+
+
+def _build_expression_marks_mask(crop_size=112):
+    """Máscara suave (float 0..1) da UNIÃO das regiões de marca de expressão
+    (olheira sob cada olho + sulco nasolabial de cada lado) — usada por
+    _expression_mark_sharpness para medir nitidez só onde essas marcas
+    aparecem, em vez do crop inteiro.
+
+    Fixa pelo mesmo motivo de _SKIN_REGION_MASK_112: o template de
+    alinhamento é fixo, então a posição relativa dessas marcas é sempre a
+    mesma entre amostras diferentes.
+
+    LIMITAÇÃO CONHECIDA: rugas de testa não são cobertas — os 5 landmarks do
+    ArcFace (_ARCFACE_LANDMARKS_112) não incluem nenhum ponto de testa, então
+    essa marca de expressão específica fica fora do escopo geométrico
+    possível sem um detector de landmarks mais denso.
+    """
+    binary_mask = np.zeros((crop_size, crop_size), dtype=bool)
+
+    eye_axes = _EXPRESSION_MARK_UNDEREYE_AXES
+    offset_y = _EXPRESSION_MARK_UNDEREYE_OFFSET_Y
+    for lx, ly in _ARCFACE_LANDMARKS_112[:2]:
+        center = (lx, ly + offset_y)
+        binary_mask |= _ellipse_region_mask(crop_size, center, eye_axes)
+
+    nose = _ARCFACE_LANDMARKS_112[2]
+    half_width = _EXPRESSION_MARK_NASOLABIAL_WIDTH
+    for mouth_corner in _ARCFACE_LANDMARKS_112[3:]:
+        delta = mouth_corner - nose
+        full_length = float(np.linalg.norm(delta))
+        angle = float(np.arctan2(delta[1], delta[0]))
+        # Faixa ROTACIONADA para acompanhar o segmento nariz→canto-de-boca
+        # (uma elipse alinhada aos eixos, com o mesmo comprimento nas duas
+        # direções, cobriria toda a região malar/labial ao redor em vez de só
+        # uma faixa estreita ao longo do sulco real — testado e descartado:
+        # ruído colocado deliberadamente NA BOCA, fora do sulco, ainda inflava
+        # o score). Encolhida ~30% em cada ponta (fator 0.35 de meio-
+        # comprimento) para não tocar os próprios landmarks de nariz/boca,
+        # que já têm exclusão própria em _SKIN_TEXTURE_EXCLUSION_RADII.
+        center = (nose[0] + delta[0] * 0.5, nose[1] + delta[1] * 0.5)
+        axes = (full_length * 0.35, half_width)
+        binary_mask |= _ellipse_region_mask(crop_size, center, axes, angle_rad=angle)
+
+    sigma = _SKIN_TEXTURE_MASK_FEATHER_PX / 4.0
+    mask = cv2.GaussianBlur(binary_mask.astype(np.float32), (0, 0), sigma)
+    return np.clip(mask, 0.0, 1.0).astype(np.float32)
+
+
+_EXPRESSION_MARKS_MASK_112 = _build_expression_marks_mask(112)
+
+
+def _expression_mark_sharpness(aligned_crop_bgr, upscale_factor=1.0):
+    """Variância do Laplaciano RESTRITA às regiões de marca de expressão
+    (olheira, sulco nasolabial — ver _build_expression_marks_mask), em vez do
+    crop 112x112 inteiro como em _face_sharpness.
+
+    Por quê: nitidez do crop inteiro é um proxy ruim para "marca de expressão
+    visível" — qualquer detalhe de alta frequência em OUTRA parte do rosto
+    (maquiagem, batom, contorno, sombra) infla o score global do mesmo jeito
+    que rugas/olheiras reais inflariam, mesmo que a região da marca em si
+    esteja coberta/atenuada. Restringir a métrica à região certa impede que
+    detalhe alheio a essas marcas específicas infle o peso da amostra.
+
+    Usada exclusivamente pela ponderação opcional do centroide (ver
+    _sharpness_weights/weight_by_sharpness) — os filtros de aceitação de
+    amostra (MIN_SHARPNESS*) continuam usando _face_sharpness (crop inteiro),
+    que mede um critério diferente: "a foto está em foco o bastante para ser
+    usável", não "a marca de expressão está visível".
+    """
+    gray = cv2.cvtColor(aligned_crop_bgr, cv2.COLOR_BGR2GRAY)
+    laplacian = cv2.Laplacian(gray, cv2.CV_64F)
+    mask = _EXPRESSION_MARKS_MASK_112
+    mean = np.average(laplacian, weights=mask)
+    weighted_var = np.average((laplacian - mean) ** 2, weights=mask)
+    return float(weighted_var) * (upscale_factor ** 2)
+
 
 def _smoothstep(t):
     """Rampa suave 0→1 (Hermite, C1-contínua) para t em [0,1]; clampada fora
@@ -602,23 +718,31 @@ def _is_near_duplicate(frame_bgr, last_accepted_downscaled):
 
 
 def _sharpness_weights(samples):
-    """Pesos relativos por nitidez para a ponderação opcional do centroide
-    (weight_by_sharpness): amostras mais nítidas carregam mais detalhe
-    estrutural do rosto (traços, marcas de expressão) no crop que gerou o
-    embedding, então pesam mais na média; amostras moles que passaram no
-    filtro de entrada diluem menos.
+    """Pesos relativos por nitidez LOCALIZADA para a ponderação opcional do
+    centroide (weight_by_sharpness): amostras onde a região de marca de
+    expressão (olheira, sulco nasolabial — ver _expression_mark_sharpness)
+    está mais nítida pesam mais na média; amostras onde essa região específica
+    está mole (desfocada, coberta) diluem menos.
+
+    Usa "expression_sharpness" (nitidez restrita a essas regiões), não
+    "sharpness" (nitidez do crop inteiro, usada só nos filtros de aceitação de
+    amostra) — nitidez do crop inteiro é um proxy ruim para "marca de
+    expressão visível": maquiagem/contorno em OUTRA parte do rosto (boca,
+    sombra de olho) infla o score global do mesmo jeito que rugas/olheiras
+    reais inflariam, mesmo com a marca em si coberta. Restringir à região
+    certa evita esse falso-positivo.
 
     - sqrt comprime a faixa dinâmica: a variância do Laplaciano varia ordens
       de magnitude entre fotos, e usar o valor cru deixaria uma única foto
       ultranítida dominar o centroide (o oposto do objetivo de ter várias
       referências).
-    - Amostra sem o campo "sharpness" (legada, anterior a este campo, ou
-      pseudo-sample de origem) recebe a mediana das que têm — neutra, nunca
-      quebra nem zera ninguém.
+    - Amostra sem o campo "expression_sharpness" (legada, anterior a este
+      campo, ou pseudo-sample de origem) recebe a mediana das que têm —
+      neutra, nunca quebra nem zera ninguém.
     - Sem nenhuma nitidez conhecida, todos os pesos são 1 (idêntico à média
       simples).
     """
-    values = np.array([float(s.get("sharpness") or 0.0) for s in samples])
+    values = np.array([float(s.get("expression_sharpness") or 0.0) for s in samples])
     known = values > 0
     if not np.any(known):
         return np.ones(len(samples))
@@ -873,10 +997,11 @@ def _build_profile_from_samples(
     nenhum efeito — nem o cálculo de _apply_anchor roda.
 
     weight_by_sharpness (default False, caminho idêntico ao de antes): pondera
-    as amostras pela nitidez do crop (ver _sharpness_weights) — amostras mais
-    nítidas, que preservam traços e marcas de expressão no crop de onde saiu
-    o embedding, pesam mais no centroide. Com balance_by_origin, a ponderação
-    acontece dentro de cada origem (não entre origens).
+    as amostras pela nitidez LOCALIZADA nas regiões de marca de expressão —
+    olheira, sulco nasolabial (ver _sharpness_weights/_expression_mark_sharpness),
+    não pela nitidez do crop inteiro — amostras onde essas regiões específicas
+    estão mais nítidas pesam mais no centroide. Com balance_by_origin, a
+    ponderação acontece dentro de cada origem (não entre origens).
     """
     if not samples:
         raise ValueError("Nenhuma amostra válida para construir o perfil de identidade.")
@@ -1045,6 +1170,7 @@ class IdentityProfileBuilder:
         # caso, evitando inflar a nitidez de fotos que já eram grandes.
         upscale_factor = max(1.0, 112.0 / face_side_px) if face_side_px > 0 else 1.0
         sharpness = _face_sharpness(aligned, upscale_factor=upscale_factor)
+        expression_sharpness = _expression_mark_sharpness(aligned, upscale_factor=upscale_factor)
 
         if face_area_ratio < min_face_area_ratio_hard:
             # Abaixo do piso absoluto, entra por qualquer uma de duas portas:
@@ -1114,9 +1240,16 @@ class IdentityProfileBuilder:
             "source": source_label,
             "origin": origin,
             # Nitidez do crop (variância do Laplaciano, a mesma já usada no
-            # filtro acima) — guardada para a ponderação opcional por nitidez
-            # do centroide (ver _sharpness_weights), não só passa/não-passa.
+            # filtro acima) — usada só nos filtros de aceitação (MIN_SHARPNESS*)
+            # e em _would_pass_at_strictness, não na ponderação por nitidez.
             "sharpness": sharpness,
+            # Nitidez restrita às regiões de marca de expressão (olheira,
+            # sulco nasolabial) — usada exclusivamente pela ponderação
+            # opcional do centroide (ver _sharpness_weights,
+            # weight_by_sharpness). Campo separado de "sharpness" porque mede
+            # um critério diferente: "a marca de expressão está visível
+            # aqui", não "a foto está em foco o bastante para ser usável".
+            "expression_sharpness": expression_sharpness,
         }
         self.samples.append(sample)
         return sample

@@ -565,6 +565,69 @@ def test_skin_region_mask_has_smooth_feathered_edges():
     assert any(0.0 < v < 1.0 for v in ramp_samples)
 
 
+def test_expression_marks_mask_covers_undereye_not_eye_or_mouth():
+    # A região de interesse (olheira) deve ficar ABAIXO do olho, sem invadir
+    # o próprio landmark do olho nem o da boca — senão cílio/sobrancelha ou
+    # batom/contorno labial contaminariam a métrica de nitidez. Tolerância
+    # pequena no olho: a borda da elipse de olheira fica só ~2px abaixo do
+    # landmark do olho (mesma ordem de grandeza do feather de 4px), então um
+    # resíduo baixo de rampa é esperado ali, não zero estrito absoluto.
+    from identity_profile import _EXPRESSION_MARKS_MASK_112, _ARCFACE_LANDMARKS_112
+
+    mask = _EXPRESSION_MARKS_MASK_112
+    left_eye = _ARCFACE_LANDMARKS_112[0]
+    mouth_left = _ARCFACE_LANDMARKS_112[3]
+
+    eye_row, eye_col = int(round(left_eye[1])), int(round(left_eye[0]))
+    assert mask[eye_row, eye_col] < 0.1
+
+    mouth_row, mouth_col = int(round(mouth_left[1])), int(round(mouth_left[0]))
+    assert mask[mouth_row, mouth_col] == pytest.approx(0.0, abs=1e-3)
+
+    # Olheira propriamente dita: alguns pixels abaixo do centro do olho.
+    undereye_row = eye_row + 8
+    assert mask[undereye_row, eye_col] > 0.5
+
+
+def test_expression_mark_sharpness_ignores_detail_outside_marks():
+    # Causa raiz do bug original (nitidez do crop INTEIRO): detalhe de alta
+    # frequência nos LÁBIOS (ex. batom/contorno de maquiagem) não pode inflar
+    # a nitidez medida nas regiões de marca de expressão. Retângulo colado ao
+    # centro/base da boca (y=93-104, entre os dois cantos), fora da faixa
+    # nasolabial estreita que passa ao LADO do nariz até cada canto.
+    from identity_profile import _expression_mark_sharpness
+
+    size = 112
+    base = np.full((size, size, 3), 150, dtype=np.uint8)
+
+    rng = np.random.default_rng(42)
+    mouth_only_noise = base.copy()
+    mouth_only_noise[93:104, 46:66] = rng.integers(0, 255, size=(11, 20, 3), dtype=np.uint8)
+
+    flat_score = _expression_mark_sharpness(base)
+    mouth_noise_score = _expression_mark_sharpness(mouth_only_noise)
+
+    assert mouth_noise_score == pytest.approx(flat_score, abs=1.0)
+
+
+def test_expression_mark_sharpness_reacts_to_detail_inside_marks():
+    # Controle positivo do teste acima: ruído DENTRO da região de olheira
+    # deve, sim, elevar o score — confirma que a máscara não zera tudo.
+    from identity_profile import _expression_mark_sharpness
+
+    size = 112
+    base = np.full((size, size, 3), 150, dtype=np.uint8)
+
+    rng = np.random.default_rng(42)
+    undereye_noise = base.copy()
+    undereye_noise[55:68, 28:50] = rng.integers(0, 255, size=(13, 22, 3), dtype=np.uint8)
+
+    flat_score = _expression_mark_sharpness(base)
+    undereye_noise_score = _expression_mark_sharpness(undereye_noise)
+
+    assert undereye_noise_score > flat_score + 1.0
+
+
 def test_extract_skin_texture_isolates_medium_band_only():
     from identity_profile import _extract_skin_texture
 

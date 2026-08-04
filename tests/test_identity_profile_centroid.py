@@ -363,12 +363,12 @@ def test_unset_anchor_restores_balanced_centroid():
 
 def test_sharpness_weighting_off_is_bitwise_identical():
     # Default desligado: caminho idêntico ao de antes da opção existir,
-    # mesmo com o campo "sharpness" presente nas amostras.
+    # mesmo com o campo "expression_sharpness" presente nas amostras.
     rng = np.random.default_rng(10)
     base = np.array([1.0, 0.0, 0.0])
     samples = [_full_sample(base + rng.normal(scale=0.05, size=3)) for _ in range(6)]
     for i, s in enumerate(samples):
-        s["sharpness"] = 100.0 + 50.0 * i
+        s["expression_sharpness"] = 100.0 + 50.0 * i
 
     with_field = _build_profile_from_samples(samples, "Pessoa 1")
     without_flag = _build_profile_from_samples(samples, "Pessoa 1", weight_by_sharpness=False)
@@ -385,11 +385,11 @@ def test_sharpness_weighting_pulls_centroid_toward_sharper_samples():
     samples = []
     for _ in range(5):
         s = _sample(soft_dir + rng.normal(scale=0.02, size=3))
-        s["sharpness"] = 60.0  # pouco acima do piso de aceitação
+        s["expression_sharpness"] = 60.0  # pouco acima do piso de aceitação
         samples.append(s)
     for _ in range(5):
         s = _sample(sharp_dir + rng.normal(scale=0.02, size=3))
-        s["sharpness"] = 1500.0
+        s["expression_sharpness"] = 1500.0
         samples.append(s)
 
     from identity_profile import _sharpness_weights
@@ -402,8 +402,8 @@ def test_sharpness_weighting_pulls_centroid_toward_sharper_samples():
 
 
 def test_sharpness_weighting_without_sharpness_field_equals_plain():
-    # Amostras legadas (sem "sharpness"): pesos todos 1 → mesmo resultado da
-    # média de sempre, nunca quebra.
+    # Amostras legadas (sem "expression_sharpness"): pesos todos 1 → mesmo
+    # resultado da média de sempre, nunca quebra.
     rng = np.random.default_rng(12)
     base = np.array([1.0, 0.0, 0.0])
     samples = [_sample(base + rng.normal(scale=0.05, size=3)) for _ in range(6)]
@@ -425,11 +425,11 @@ def test_sharpness_weighting_respects_origin_balance():
     samples = []
     for _ in range(4):
         s = _sample(dir_a + rng.normal(scale=0.01, size=3), origin="a.mp4")
-        s["sharpness"] = 5000.0
+        s["expression_sharpness"] = 5000.0
         samples.append(s)
     for _ in range(4):
         s = _sample(dir_b + rng.normal(scale=0.01, size=3), origin="b.jpg")
-        s["sharpness"] = 60.0
+        s["expression_sharpness"] = 60.0
         samples.append(s)
 
     balanced = _compute_balanced_centroid(samples, weight_by_sharpness=True)

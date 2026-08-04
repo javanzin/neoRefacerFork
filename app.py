@@ -1722,13 +1722,14 @@ with gr.Blocks(theme=theme, title="NeoRefacer - AI Refacer", css=_UPLOAD_PROGRES
             ),
         )
         identity_weight_by_sharpness = gr.Checkbox(
-            label="Ponderar amostras por nitidez (favorece traços e marcas de expressão)",
+            label="Ponderar amostras por nitidez de olheira/sulco nasolabial",
             value=False,
             info=(
-                "Opcional, desligado por padrão. Sem isso, toda amostra aprovada pesa igual — fotos "
-                "moles (que passaram no filtro mínimo de nitidez) diluem os traços finos do rosto. "
-                "Ligado: amostras mais nítidas pesam mais no centroide, favorecendo a versão do "
-                "rosto onde olheiras, pés de galinha e sulcos estão visíveis no crop. Com o "
+                "Opcional, desligado por padrão. Sem isso, toda amostra aprovada pesa igual. "
+                "Ligado: mede nitidez SÓ nas regiões de olheira e sulco nasolabial (bigode chinês) "
+                "de cada amostra — não no rosto inteiro — e amostras onde essas marcas estão mais "
+                "nítidas pesam mais no centroide. Não cobre rugas de testa (sem landmark ali) e não "
+                "distingue maquiagem cobrindo a marca de uma marca real ausente. Com o "
                 "balanceamento por origem ligado, a ponderação vale dentro de cada arquivo (não "
                 "muda o equilíbrio entre arquivos). Compare os dois resultados antes de confiar."
             ),
