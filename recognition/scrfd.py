@@ -273,6 +273,21 @@ class SCRFD:
                 kpss = kpss[bindex, :]
         return det, kpss
 
+    def _detectar_em_cpu(self, img, input_size, thresh):
+        """Detecta com uma sessão de CPU, criada sob demanda e reutilizada.
+
+        Usada quando o provider ativo rejeita uma entrada que a CPU processa
+        normalmente (ver autodetect). A sessão fica em cache porque criá-la
+        custa bem mais do que a própria inferência nesta escala.
+        """
+        if not hasattr(self, "_sessao_cpu_detector"):
+            sessao = onnxruntime.InferenceSession(
+                self.model_file, providers=["CPUExecutionProvider"]
+            )
+            self._sessao_cpu_detector = SCRFD(model_file=self.model_file, session=sessao)
+            self._sessao_cpu_detector.prepare(0, input_size=input_size)
+        return self._sessao_cpu_detector.detect(img, input_size=input_size, thresh=thresh)
+
     def autodetect(self, img, max_num=0, metric='max'):
         if self.session.get_providers()[0] == 'CoreMLExecutionProvider':
             # Cache the CPU-based detector
@@ -287,8 +302,21 @@ class SCRFD:
             detector = self  # Use the original GPU/CoreML session
 
         bboxes, kpss = detector.detect(img, input_size=(640, 640), thresh=0.5)
-        bboxes2, kpss2 = detector.detect(img, input_size=(128, 128), thresh=0.5)
-        
+        try:
+            bboxes2, kpss2 = detector.detect(img, input_size=(128, 128), thresh=0.5)
+        except RuntimeError as erro:
+            # O DirectML rejeita a passada de 128x128 em algumas imagens de
+            # origem, abortando o nó Reshape com E_INVALIDARG (0x80070057) —
+            # dimensão que CUDA e CPU aceitam sem reclamar. A passada de 640x640
+            # acima já concluiu, então refazer apenas esta na CPU preserva a
+            # detecção em escala pequena em vez de perder o rosto inteiro.
+            if "80070057" not in str(erro) and "Reshape" not in str(erro):
+                raise
+            print("[SCRFD] DirectML falhou na passada de 128x128; "
+                  "refazendo na CPU para esta imagem.")
+            bboxes2, kpss2 = self._detectar_em_cpu(img, input_size=(128, 128), thresh=0.5)
+
+
         bboxes_all = np.concatenate([bboxes, bboxes2], axis=0)
         kpss_all = np.concatenate([kpss, kpss2], axis=0)
         keep = self.nms(bboxes_all)
