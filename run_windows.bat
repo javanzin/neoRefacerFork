@@ -51,8 +51,18 @@ if not defined PY_LAUNCHER (
 
 echo Usando: %PY_LAUNCHER%
 
-REM --- venv existe? se nao, cria e instala ---
-if not exist "%PYTHON_EXE%" (
+REM --- venv completa? o marcador so e escrito ao final de uma instalacao bem
+REM     sucedida, entao uma venv interrompida no meio e refeita do zero em vez
+REM     de seguir para o app com dependencias faltando. ---
+set INSTALL_MARKER=%VENV_DIR%\.install-complete
+
+if exist "%VENV_DIR%" if not exist "%INSTALL_MARKER%" (
+    echo.
+    echo === Instalacao anterior incompleta: recriando o ambiente ===
+    rmdir /s /q "%VENV_DIR%"
+)
+
+if not exist "%INSTALL_MARKER%" (
     echo.
     echo === Primeira execucao: criando ambiente virtual ===
     %PY_LAUNCHER% -m venv "%VENV_DIR%"
@@ -65,6 +75,25 @@ if not exist "%PYTHON_EXE%" (
     echo.
     echo === Instalando dependencias ^(pode demorar alguns minutos^) ===
     "%PYTHON_EXE%" -m pip install --upgrade pip
+
+    REM  O insightface nao publica wheel para Windows em nenhuma versao: o PyPI
+    REM  so tem o .tar.gz, entao o pip tenta compilar a extensao Cython
+    REM  face3d/mesh_core e falha pedindo o Visual C++ Build Tools. Esse modulo
+    REM  nao e usado por este projeto, e instalar varios GB de compilador so
+    REM  para produzir codigo morto nao se justifica — por isso a wheel
+    REM  pre-compilada abaixo, a mesma usada pelo ecossistema Roop/FaceFusion.
+    for /f %%P in ('"%PYTHON_EXE%" -c "import sys;print(f\"cp{sys.version_info.major}{sys.version_info.minor}\")"') do set PYTAG=%%P
+    echo.
+    echo === Instalando insightface ^(wheel pre-compilada, !PYTAG!^) ===
+    "%PYTHON_EXE%" -m pip install "https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-!PYTAG!-!PYTAG!-win_amd64.whl"
+    if errorlevel 1 (
+        echo.
+        echo [ERRO] Falha ao instalar a wheel do insightface para !PYTAG!.
+        echo Verifique a conexao com a internet e rode o script de novo.
+        pause
+        exit /b 1
+    )
+
     "%PYTHON_EXE%" -m pip install -r requirements-DML.txt
     if errorlevel 1 (
         echo.
@@ -73,6 +102,8 @@ if not exist "%PYTHON_EXE%" (
         pause
         exit /b 1
     )
+
+    echo ok> "%INSTALL_MARKER%"
     echo.
     echo === Instalacao concluida ===
 )

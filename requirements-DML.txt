@@ -2,7 +2,10 @@ ffmpeg_python==0.2.0
 imageio[ffmpeg]==2.37.0
 imagecodecs==2025.3.30
 gradio==5.22.0
-insightface==0.7.3
+# insightface NAO entra aqui: não há wheel Windows publicada no PyPI (só o
+# .tar.gz, que exige o Visual C++ Build Tools para compilar face3d/mesh_core,
+# módulo que este projeto não usa). run_windows.bat instala a wheel
+# pré-compilada 0.7.3 — a mesma versão do Colab — antes deste arquivo.
 numpy>=2
 onnx==1.16.0
 # onnxruntime-directml não publica a 1.23.2 usada pelas outras variantes;
