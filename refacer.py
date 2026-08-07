@@ -979,8 +979,85 @@ class Refacer:
                 return torch.cuda.get_device_properties(0).total_memory / 1e9
         except:
             pass
+
+        # torch.cuda não enxerga GPUs AMD/Intel: no Windows a VRAM dedicada vem
+        # do WMI, que reporta o adaptador de vídeo sem depender de qual fabricante
+        # é. Sem isto o fallback de 8GB abaixo é usado mesmo em placas com mais
+        # (ou menos) memória, e o aviso de pressão de VRAM fica calibrado errado.
+        if sys.platform == "win32":
+            try:
+                saida = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command",
+                     "(Get-CimInstance Win32_VideoController | "
+                     "Sort-Object AdapterRAM -Descending | "
+                     "Select-Object -First 1).AdapterRAM"],
+                    capture_output=True, timeout=15,
+                )
+                texto = saida.stdout.decode("utf-8", errors="replace").strip()
+                if texto.isdigit():
+                    gb = int(texto) / 1e9
+                    # AdapterRAM é um uint32 e satura em 4GB; acima disso o valor
+                    # não é confiável e é melhor manter a estimativa conservadora.
+                    if 0 < gb < 4.2:
+                        return gb
+            except Exception:
+                pass
+
         # Conservative estimate if detection fails
         return 8.0  # Assume 8GB if unable to detect
+
+    def _vram_usada_gb(self):
+        """VRAM dedicada em uso no Windows, ou None se indisponível.
+
+        Lida do contador de performance do próprio processo, então mede o que
+        este app alocou na GPU — não o total do sistema.
+        """
+        if sys.platform != "win32":
+            return None
+        try:
+            saida = subprocess.run(
+                ["powershell", "-NoProfile", "-Command",
+                 "(Get-Counter '\\GPU Process Memory(*)\\Dedicated Usage' "
+                 "-ErrorAction Stop).CounterSamples | "
+                 "Where-Object {$_.InstanceName -like '*python*'} | "
+                 "Measure-Object -Property CookedValue -Sum | "
+                 "Select-Object -ExpandProperty Sum"],
+                capture_output=True, timeout=15,
+            )
+            texto = saida.stdout.decode("utf-8", errors="replace").strip()
+            if texto:
+                return float(texto.replace(",", ".")) / 1e9
+        except Exception:
+            pass
+        return None
+
+    # Fração da VRAM total a partir da qual o acúmulo do alocador do DirectML
+    # passa a ameaçar um reset de driver (TDR). Abaixo disso o aviso é ruído.
+    VRAM_LIMIAR_AVISO = 0.80
+
+    def _avisar_pressao_vram(self):
+        """Avisa quando a VRAM em uso se aproxima do limite, no modo DirectML.
+
+        O alocador do DirectML mantém buffers entre execuções e não os devolve
+        ao sistema, de modo que processar vários vídeos em sequência acumula
+        memória até o driver da GPU ser reiniciado pelo Windows — momento em que
+        toda sessão ONNX viva passa a falhar. Não há API para forçar essa
+        liberação, então o que resta é avisar a tempo de reiniciar o app.
+        Restrito ao DirectML: CUDA e ROCm não apresentam esse acúmulo.
+        """
+        if self.mode != RefacerMode.DIRECTML:
+            return
+        usada = self._vram_usada_gb()
+        if usada is None or not self.vram_gb:
+            return
+        fracao = usada / self.vram_gb
+        if fracao >= self.VRAM_LIMIAR_AVISO:
+            print(
+                f"[VRAM] {usada:.1f}GB de {self.vram_gb:.1f}GB em uso "
+                f"({fracao * 100:.0f}%). O DirectML não libera essa memória entre "
+                "vídeos: reinicie o aplicativo antes do próximo processamento "
+                "para evitar um reset do driver da GPU."
+            )
 
     def _calculate_optimal_batch_size(self, frame_width, frame_height, fps):
         """How many decoded frames to buffer before handing a group to
@@ -2392,6 +2469,7 @@ class Refacer:
             except OSError:
                 pass
         print(f"Refaced video saved at: {os.path.abspath(new_path)}")
+        self._avisar_pressao_vram()
         return new_path
 
     def reface_image(self, image_path, faces, disable_similarity=False, multiple_faces_mode=False,
