@@ -76,19 +76,16 @@ if not exist "%INSTALL_MARKER%" (
     echo === Instalando dependencias ^(pode demorar alguns minutos^) ===
     "%PYTHON_EXE%" -m pip install --upgrade pip
 
-    REM  O insightface nao publica wheel para Windows em nenhuma versao: o PyPI
-    REM  so tem o .tar.gz, entao o pip tenta compilar a extensao Cython
-    REM  face3d/mesh_core e falha pedindo o Visual C++ Build Tools. Esse modulo
-    REM  nao e usado por este projeto, e instalar varios GB de compilador so
-    REM  para produzir codigo morto nao se justifica — por isso a wheel
-    REM  pre-compilada abaixo, a mesma usada pelo ecossistema Roop/FaceFusion.
-    for /f %%P in ('"%PYTHON_EXE%" -c "import sys;print(f\"cp{sys.version_info.major}{sys.version_info.minor}\")"') do set PYTAG=%%P
+    REM  Wheel pre-compilada do insightface — ver scripts/install_insightface_win.py
+    REM  para o motivo. A montagem da URL fica no script Python porque depende da
+    REM  tag de ABI do interpretador, e resolver isso no batch exigiria um for /f
+    REM  sobre um comando entre aspas, cujo escape e fonte recorrente de erro.
     echo.
-    echo === Instalando insightface ^(wheel pre-compilada, !PYTAG!^) ===
-    "%PYTHON_EXE%" -m pip install "https://github.com/Gourieff/Assets/raw/main/Insightface/insightface-0.7.3-!PYTAG!-!PYTAG!-win_amd64.whl"
+    echo === Instalando insightface ^(wheel pre-compilada^) ===
+    "%PYTHON_EXE%" scripts\install_insightface_win.py
     if errorlevel 1 (
         echo.
-        echo [ERRO] Falha ao instalar a wheel do insightface para !PYTAG!.
+        echo [ERRO] Falha ao instalar o insightface.
         echo Verifique a conexao com a internet e rode o script de novo.
         pause
         exit /b 1
