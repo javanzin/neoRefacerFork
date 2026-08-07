@@ -79,6 +79,13 @@ def patch_mask_renderer(site_packages=None):
 
 
 def main():
+    # --patch-only corrige uma instalação existente sem reinstalar o pacote:
+    # o pip pode restaurar o módulo original ao resolver dependências de outro
+    # pacote, e venvs criadas antes desta correção nunca a receberam.
+    if "--patch-only" in sys.argv:
+        patch_mask_renderer()
+        return 0
+
     url = wheel_url()
     print(f"Instalando insightface {VERSION} de: {url}")
     resultado = subprocess.run(

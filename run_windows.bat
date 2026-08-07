@@ -105,6 +105,19 @@ if not exist "%INSTALL_MARKER%" (
     echo === Instalacao concluida ===
 )
 
+REM --- Correcao do mask_renderer, em toda execucao e nao apenas na instalacao:
+REM     o pip pode reinstalar o insightface ao resolver dependencias de outro
+REM     pacote, restaurando o modulo original, e venvs criadas por versoes
+REM     anteriores deste script nunca receberam a correcao. A funcao e
+REM     idempotente, entao repetir nao custa nada. ---
+"%PYTHON_EXE%" scripts\install_insightface_win.py --patch-only
+if errorlevel 1 (
+    echo.
+    echo [ERRO] Falha ao aplicar a correcao do insightface.
+    pause
+    exit /b 1
+)
+
 REM --- REFACER_PROFILE=1 imprime o tempo por estagio no fim do processamento
 REM     ^(deteccao / embedding / swap^), para comparar com o Colab. ---
 set REFACER_PROFILE=1
