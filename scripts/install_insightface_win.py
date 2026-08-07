@@ -56,12 +56,41 @@ def wheel_url(version_info=None):
     return f"{BASE_URL}/insightface-{VERSION}-{tag}-{tag}-win_amd64.whl"
 
 
+def find_insightface_dir():
+    """Localiza o pacote insightface sem importá-lo.
+
+    Importar seria circular: o import de insightface é justamente o que falha
+    quando mask_renderer ainda não foi corrigido, então o patch nunca chegaria
+    a rodar. sysconfig e sys.path dão o caminho sem executar o __init__.py.
+    """
+    import sysconfig
+
+    candidatos = []
+    for chave in ("purelib", "platlib"):
+        caminho = sysconfig.get_paths().get(chave)
+        if caminho:
+            candidatos.append(Path(caminho))
+    candidatos.extend(Path(p) for p in sys.path if p)
+
+    vistos = set()
+    for base in candidatos:
+        alvo = base / "insightface"
+        if alvo in vistos:
+            continue
+        vistos.add(alvo)
+        if (alvo / "app" / "mask_renderer.py").is_file():
+            return alvo
+    return None
+
+
 def patch_mask_renderer(site_packages=None):
     """Substitui insightface/app/mask_renderer.py pelo stub. Idempotente."""
     if site_packages is None:
-        import insightface
-
-        destino = Path(insightface.__file__).parent / "app" / "mask_renderer.py"
+        pacote = find_insightface_dir()
+        if pacote is None:
+            print("[AVISO] insightface não encontrado; nada a corrigir.")
+            return False
+        destino = pacote / "app" / "mask_renderer.py"
     else:
         destino = Path(site_packages) / "insightface" / "app" / "mask_renderer.py"
 
