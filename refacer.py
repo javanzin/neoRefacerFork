@@ -2492,7 +2492,19 @@ class Refacer:
         self.ffmpeg_video_bitrate = '0'
         pattern = r"encoders: ([a-zA-Z0-9_]+(?: [a-zA-Z0-9_]+)*)"
         command = ['ffmpeg', '-codecs', '--list-encoders']
-        commandout = subprocess.run(command, check=True, capture_output=True).stdout
+        try:
+            commandout = subprocess.run(command, check=True, capture_output=True).stdout
+        except FileNotFoundError:
+            # No Colab o ffmpeg já vem instalado; em máquinas locais não. Sem esta
+            # mensagem o erro chega como um FileNotFoundError cru vindo de
+            # subprocess, sem indicar qual executável falta.
+            raise RuntimeError(
+                "ffmpeg não encontrado no PATH. Ele é necessário para processar "
+                "vídeo.\n"
+                "  Windows: winget install Gyan.FFmpeg (e reabra o terminal)\n"
+                "  Linux:   sudo apt install ffmpeg\n"
+                "  macOS:   brew install ffmpeg"
+            ) from None
         result = commandout.decode('utf-8').split('\n')
         for r in result:
             if "264" in r or "265" in r:
@@ -2510,6 +2522,9 @@ class Refacer:
     VIDEO_CODECS = {
         'h264_nvenc': '0',      # NVIDIA GPU encoder (Tesla T4) - highest priority
         'hevc_nvenc': '0',      # NVIDIA H.265 encoder
+        'h264_amf': '0',        # AMD hardware encoder (VCE/VCN, Windows)
+        'h264_vaapi': '0',      # AMD/Intel hardware encoder (VA-API, Linux)
+        'h264_qsv': '0',        # Intel Quick Sync
         'h264_videotoolbox': '0',  # Apple hardware encoder
         'libx264': '0'          # Software encoder (fallback)
     }
