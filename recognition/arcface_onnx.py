@@ -11,6 +11,11 @@ import onnx
 import onnxruntime
 import face_align
 
+try:
+    from .ort_run import run_session
+except ImportError:  # execução como script solto, sem pacote
+    from ort_run import run_session
+
 # Opt-in experiment (REFACER_POSE_ALIGN=1): align the recognition crop against
 # the best of 5 pose templates (profile→frontal→profile) instead of the single
 # frontal arcface template. May give more stable embeddings (and thus matching)
@@ -88,12 +93,12 @@ class ArcFaceONNX:
         
         blob = cv2.dnn.blobFromImages(imgs, 1.0 / self.input_std, input_size,
                                       (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
-        net_out = self.session.run(self.output_names, {self.input_name: blob})[0]
+        net_out = run_session(self.session, self.output_names, {self.input_name: blob})[0]
         return net_out
 
     def forward(self, batch_data):
         blob = (batch_data - self.input_mean) / self.input_std
-        net_out = self.session.run(self.output_names, {self.input_name: blob})[0]
+        net_out = run_session(self.session, self.output_names, {self.input_name: blob})[0]
         return net_out
 
 

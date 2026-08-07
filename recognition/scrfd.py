@@ -6,6 +6,11 @@ import numpy as np
 import onnxruntime
 import os
 import os.path as osp
+
+try:
+    from .ort_run import run_session
+except ImportError:  # execução como script solto, sem pacote
+    from ort_run import run_session
 import cv2
 import sys
 
@@ -147,7 +152,7 @@ class SCRFD:
         kpss_list = []
         input_size = tuple(img.shape[0:2][::-1])
         blob = cv2.dnn.blobFromImage(img, 1.0/self.input_std, input_size, (self.input_mean, self.input_mean, self.input_mean), swapRB=True)
-        net_outs = self.session.run(self.output_names, {self.input_name : blob})
+        net_outs = run_session(self.session, self.output_names, {self.input_name : blob})
 
         input_height = blob.shape[2]
         input_width = blob.shape[3]

@@ -4,6 +4,7 @@ import sys
 sys.path.insert(1, './recognition')
 from scrfd import SCRFD
 from arcface_onnx import ArcFaceONNX
+from ort_run import run_session
 import face_align
 import os.path as osp
 import os
@@ -113,6 +114,23 @@ ROTATE_FACE_FALLBACK_MAX_ROLL_DEGREES = 25.0
 # extra de mais uma detecção só nos frames onde os 4 ângulos fixos já não
 # bastaram).
 ROTATE_FACE_FALLBACK_FINE_MIN_RESIDUAL_DEGREES = 15.0
+
+
+class _SessaoComErroLegivel:
+    """Envolve uma InferenceSession para preservar a mensagem de erro do provider.
+
+    Existe porque INSwapper chama session.run internamente e não aceita um
+    callable no lugar da sessão. Todo o resto é delegado sem alteração.
+    """
+
+    def __init__(self, sessao):
+        self._sessao = sessao
+
+    def run(self, output_names, input_feed, run_options=None):
+        return run_session(self._sessao, output_names, input_feed, run_options)
+
+    def __getattr__(self, nome):
+        return getattr(self._sessao, nome)
 
 
 class RefacerMode(Enum):
@@ -1433,7 +1451,10 @@ class Refacer:
 
         sess_swap = rt.InferenceSession(model_path, self.sess_options, providers=self.providers)
         print(f"Face Swapper providers: {sess_swap.get_providers()}")
-        self.face_swapper = INSwapper(model_path, sess_swap)
+        # INSwapper chama session.run internamente; o wrapper garante que um erro
+        # do provider em codificação não-UTF-8 chegue legível também por esse
+        # caminho, sem precisar alterar a biblioteca (ver recognition/ort_run.py).
+        self.face_swapper = INSwapper(model_path, _SessaoComErroLegivel(sess_swap))
 
         # Landmark de 106 pontos (opt-in, ver OPEN_MOUTH_FIX_ENABLED/
         # _restore_original_mouth_if_open): já vem no mesmo pacote buffalo_l
