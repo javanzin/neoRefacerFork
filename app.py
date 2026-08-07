@@ -1,3 +1,4 @@
+import atexit
 import hashlib
 import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -115,12 +116,25 @@ def cleanup_temp(folder_path):
     except Exception as e:
         print(f"Error: {e}")
 
+# Pastas voláteis (arquivos intermediários e vídeos processados) — não são
+# histórico útil entre sessões, só ocupam disco. Limpas no startup (cobre o
+# caso de fechamento anormal/crash da sessão anterior) e no shutdown, via
+# atexit — que não roda em SIGKILL, mas o cleanup no próximo startup cobre
+# esse resíduo.
+_VOLATILE_DIRS = ("./tmp", "./cache", "./output")
+
+def cleanup_volatile_dirs():
+    for folder_path in _VOLATILE_DIRS:
+        if os.path.exists(folder_path):
+            cleanup_temp(folder_path)
+
 # Prepare temp folder
 os.environ["GRADIO_TEMP_DIR"] = "./tmp"
-if os.path.exists("./tmp"):
-    cleanup_temp(os.environ['GRADIO_TEMP_DIR'])
-if not os.path.exists("./tmp"):
-    os.makedirs("./tmp")
+cleanup_volatile_dirs()
+for folder_path in _VOLATILE_DIRS:
+    os.makedirs(folder_path, exist_ok=True)
+open(os.path.join("./output", ".gitkeep"), "a").close()
+atexit.register(cleanup_volatile_dirs)
 
 # Parse arguments
 parser = argparse.ArgumentParser(description='Refacer')
