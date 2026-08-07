@@ -122,6 +122,14 @@ REM --- REFACER_PROFILE=1 imprime o tempo por estagio no fim do processamento
 REM     ^(deteccao / embedding / swap^), para comparar com o Colab. ---
 set REFACER_PROFILE=1
 
+REM --- Erros vindos do runtime do DirectML chegam na codificacao do Windows
+REM     ^(cp1252 em portugues^), e o onnxruntime tenta decodifica-los como UTF-8:
+REM     qualquer acento vira UnicodeDecodeError e a mensagem original se perde.
+REM     PYTHONUTF8/PYTHONIOENCODING mantem o texto legivel em vez de mascarar a
+REM     falha real. ---
+set PYTHONUTF8=1
+set PYTHONIOENCODING=utf-8:replace
+
 echo.
 echo === Iniciando NeoRefacer ===
 echo Abra no navegador: http://127.0.0.1:7860
