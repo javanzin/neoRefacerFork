@@ -5,7 +5,9 @@ gradio==5.22.0
 insightface==0.7.3
 numpy>=2
 onnx==1.16.0
-onnxruntime_directml==1.23.2
+# onnxruntime-directml não publica a 1.23.2 usada pelas outras variantes;
+# 1.24.1 é a versão mais antiga disponível para este pacote.
+onnxruntime_directml==1.24.1
 opencv_python==4.13.0.92
 opencv_python_headless==4.13.0.92
 pillow_heif
