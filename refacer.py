@@ -116,7 +116,17 @@ ROTATE_FACE_FALLBACK_FINE_MIN_RESIDUAL_DEGREES = 15.0
 
 
 class RefacerMode(Enum):
-    CPU, CUDA, COREML, TENSORRT = range(1, 5)
+    CPU, CUDA, COREML, TENSORRT, DIRECTML, ROCM = range(1, 7)
+
+
+# Modes where all ONNX sessions share a single GPU and inference is already
+# serialized on the device. Frames must be processed serially in these modes
+# (see reface_group) and frame-to-frame tracking is only valid there.
+SINGLE_GPU_MODES = frozenset({
+    RefacerMode.CUDA,
+    RefacerMode.DIRECTML,
+    RefacerMode.ROCM,
+})
 
 class _FfmpegVideoWriter:
     """Drop-in replacement for cv2.VideoWriter that pipes raw BGR frames
@@ -1250,9 +1260,14 @@ class Refacer:
         if self.force_cpu:
             self.providers = ['CPUExecutionProvider']
         else:
-            # Prioritize CUDA for Tesla T4 optimization
+            # Order matters: CUDA stays first so Colab/T4 behaviour is unchanged.
+            # ROCm (AMD on Linux) outranks DirectML (AMD on Windows) because it is
+            # a native backend, while DirectML is a compatibility layer that falls
+            # back to CPU for unsupported operators.
             self.providers = []
-            for p in ['CUDAExecutionProvider', 'CoreMLExecutionProvider', 'CPUExecutionProvider']:
+            for p in ['CUDAExecutionProvider', 'ROCMExecutionProvider',
+                      'DmlExecutionProvider', 'CoreMLExecutionProvider',
+                      'CPUExecutionProvider']:
                 if p in available_providers:
                     self.providers.append(p)
 
@@ -1280,6 +1295,17 @@ class Refacer:
         if active_provider == 'CUDAExecutionProvider':
             self.mode = RefacerMode.CUDA
             self.use_num_cpus = 2
+            self.sess_options.intra_op_num_threads = 1
+            self.sess_options.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
+        elif active_provider in ('DmlExecutionProvider', 'ROCMExecutionProvider'):
+            # Same single-GPU serialization as CUDA, so inference threads stay at 1.
+            # Unlike the CUDA branch (tuned for Colab's 2 throttled vCPUs), local AMD
+            # boxes have real cores available for the CPU-bound stages — crop, warp,
+            # blend and encode — so use_num_cpus is not clamped to 2 here.
+            self.mode = (RefacerMode.DIRECTML
+                         if active_provider == 'DmlExecutionProvider'
+                         else RefacerMode.ROCM)
+            self.use_num_cpus = max(mp.cpu_count() - 1, 1)
             self.sess_options.intra_op_num_threads = 1
             self.sess_options.execution_mode = rt.ExecutionMode.ORT_SEQUENTIAL
         elif active_provider == 'CoreMLExecutionProvider':
@@ -2087,8 +2113,8 @@ class Refacer:
             # materializing the whole batch (list(executor.map(...))) in RAM first —
             # with batch sizes up to 1000 Full HD frames that peak was ~6GB just for
             # the output list, on top of the input `frames` batch already in memory.
-            if self.mode == RefacerMode.CUDA:
-                # In CUDA mode all three models (detector/embedding/swapper) share one
+            if self.mode in SINGLE_GPU_MODES:
+                # In single-GPU modes all three models (detector/embedding/swapper) share one
                 # GPU via an ONNX session pinned to intra_op_num_threads=1, so a frame
                 # is fully GPU-serialized regardless of how many Python threads submit
                 # work. A ThreadPoolExecutor here only adds GIL contention and
@@ -2249,8 +2275,8 @@ class Refacer:
             # Use original non-cached implementation
             self.prepare_faces(faces, disable_similarity=disable_similarity, multiple_faces_mode=multiple_faces_mode)
             # reface_group processes frames concurrently (out of order) outside
-            # CUDA mode — frame-to-frame tracking is only valid when serialized.
-            self._tracking_enabled = (self.mode == RefacerMode.CUDA)
+            # single-GPU modes — frame-to-frame tracking is only valid when serialized.
+            self._tracking_enabled = (self.mode in SINGLE_GPU_MODES)
             self.partial_reface_ratio = partial_reface_ratio
             self.partial_blend_shape = partial_blend_shape
 

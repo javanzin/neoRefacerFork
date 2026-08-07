@@ -1,0 +1,24 @@
+ffmpeg_python==0.2.0
+imageio[ffmpeg]==2.37.0
+imagecodecs==2025.3.30
+gradio==5.22.0
+insightface==0.7.3
+numpy>=2
+onnx==1.16.0
+onnxruntime_directml==1.23.2
+opencv_python==4.13.0.92
+opencv_python_headless==4.13.0.92
+pillow_heif
+scikit-image>=0.21.0
+tqdm==4.67.1
+psutil==7.0.0
+ngrok==1.4.0
+pyfiglet==1.0.2
+# codeformer dependencies
+# CodeFormer only runs on the still-image path (reface_image), never on video.
+# Torch stays CPU-only here: it is not part of the video pipeline, so pulling a
+# GPU build would add multiple GB for nothing.
+torch==2.6.0
+torchvision==0.21.0
+gdown==5.2.0
+lpips==0.1.4
